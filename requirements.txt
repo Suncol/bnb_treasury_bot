@@ -1,0 +1,5 @@
+# Modular packages published by https://github.com/binance/binance-connector-python
+binance-sdk-spot==11.3.0
+binance-sdk-derivatives-trading-usds-futures==17.4.0
+binance-sdk-wallet==13.4.0
+binance-common==4.4.0

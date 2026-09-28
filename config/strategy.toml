@@ -1,0 +1,61 @@
+[exchange]
+symbol = "BNBUSDT"
+quote_asset = "USDT"
+strategy_id = "bnb-treasury"
+
+[thresholds]
+b_low = 25.0
+b_alert = 28.0
+b_target = 32.0
+b_high = 40.0
+b_spot_reserve = 0.5
+
+[risk]
+u_min = 500.0
+alpha_warn = 0.10
+alpha_crit = 0.25
+m_abs_min = 2000.0
+u_budget_24h = 3000.0
+slippage = 0.015
+u_spot_idle_max = 1000.0
+fee_reserve_rate = 0.001
+sweep_enabled = true
+max_account_age_seconds = 10
+margin_drop_limit = 500.0
+margin_target_reduction = 3.0
+
+[execution]
+watch_discounts = [0.005, 0.012, 0.025]
+accumulate_discounts = [0.003, 0.007, 0.015]
+layer_weights = [0.30, 0.40, 0.30]
+watch_reprice_hours = 6
+accumulate_reprice_hours = 2
+urgent_ioc_buffer = 0.002
+watch_batch_transfer_bnb = 2.0
+watch_ttl_hours = 24
+accumulate_ttl_hours = 8
+chase_return_limit = 0.03
+reprice_deviation = 0.05
+slice_threshold_bnb = 10.0
+slice_qty_bnb = 3.0
+slice_interval_seconds = 1800
+
+[scheduler]
+t_check_minutes = 30
+state_confirm_cycles = 2
+reconciliation_seconds = 30
+
+[crash_guard]
+drawdown_1m_enter = 0.008
+drawdown_5m_enter = 0.015
+drawdown_15m_enter = 0.03
+keep_price_discount = 0.01
+max_acquisition_bnb = 3.0
+max_keep_orders = 3
+cooldown_seconds = 300
+stable_seconds = 180
+drawdown_1m_exit = 0.003
+check_seconds = 1
+smooth_seconds = 3
+max_market_age_seconds = 5
+max_sample_gap_seconds = 3
