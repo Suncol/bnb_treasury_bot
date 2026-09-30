@@ -34,6 +34,7 @@ class TransitionReason(str, Enum):
     HIGH_BALANCE = "HIGH_BALANCE"
     HYSTERESIS_CONFIRMED = "HYSTERESIS_CONFIRMED"
     EXIT_URGENT_BUFFER = "EXIT_URGENT_BUFFER"
+    DATA_INVALID = "DATA_INVALID"
     RUN_MODE_BLOCK = "RUN_MODE_BLOCK"
     WAIT_RECONCILE = "WAIT_RECONCILE"
 
@@ -114,6 +115,7 @@ class StrategyConfig:
     symbol: str = "BNBUSDT"
     quote_asset: str = "USDT"
     strategy_id: str = "bnb-treasury"
+    spot_activity_symbols: tuple[str, ...] = ()
     crash_guard: CrashGuardConfig = field(default_factory=CrashGuardConfig)
 
 
@@ -127,6 +129,12 @@ class SymbolFilters:
     min_transfer_usd: Decimal = Decimal("0")
     max_qty: Decimal | None = None
     max_notional: Decimal | None = None
+    min_price: Decimal = Decimal("0")
+    max_price: Decimal | None = None
+    max_position: Decimal | None = None
+    max_open_orders: int | None = None
+    exchange_order_slots: int | None = None
+    observed_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -189,6 +197,9 @@ class MarketSnapshot:
     drawdown_1m: Decimal | None = None
     drawdown_5m: Decimal | None = None
     drawdown_15m: Decimal | None = None
+    sample_continuity: str | None = None
+    sample_stable_since: datetime | None = None
+    sampled_at: datetime | None = None
 
     @property
     def windows_ready(self) -> bool:
@@ -336,6 +347,7 @@ class CyclePlan:
     crash_guard: CrashGuardState = field(default_factory=lambda: CrashGuardState())
     slice_state: SliceState = field(default_factory=lambda: SliceState())
     active_buy_target: Decimal = Decimal("0")
+    inventory_valid: bool = True
 
 
 class OperationStatus(str, Enum):
@@ -425,6 +437,9 @@ class Fill:
     commission_asset: str = ""
     strategy_id: str | None = None
     quote_qty: Decimal | None = None
+    side: str = "BUY"
+    base_asset: str = "BNB"
+    quote_asset: str = ""
 
 
 @dataclass(frozen=True)
@@ -477,6 +492,9 @@ class RuntimeState:
     guard: CrashGuardState = field(default_factory=CrashGuardState)
     slice_state: SliceState = field(default_factory=SliceState)
     last_inventory_at: datetime | None = None
+    last_inventory_attempt_at: datetime | None = None
+    read_retry_at: datetime | None = None
+    read_failures: int = 0
     api_errors: int = 0
     transfer_failures: int = 0
     pause_reason: str = ""

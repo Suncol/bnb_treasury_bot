@@ -1,13 +1,13 @@
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-import json
 from types import SimpleNamespace
 
 import aiohttp
-from binance_common import websocket as sdk_ws
 import pytest
+from binance_common import websocket as sdk_ws
 
 from services.exchange_adapter import ExchangeError
 from services.market_data import MarketWindows
@@ -45,25 +45,36 @@ class Socket:
         return ConnectionError("disconnected")
 
     def ticker(self):
-        self.messages.put_nowait(SimpleNamespace(
-            type=aiohttp.WSMsgType.TEXT,
-            data=json.dumps({
-                "stream": "bnbusdt@ticker",
-                "data": {
-                    "e": "24hrTicker", "s": "BNBUSDT",
-                    "E": int(datetime.now(timezone.utc).timestamp() * 1000),
-                    "b": "599", "a": "601", "P": "0",
-                },
-            }),
-        ))
+        self.messages.put_nowait(
+            SimpleNamespace(
+                type=aiohttp.WSMsgType.TEXT,
+                data=json.dumps(
+                    {
+                        "stream": "bnbusdt@ticker",
+                        "data": {
+                            "e": "24hrTicker",
+                            "s": "BNBUSDT",
+                            "E": int(datetime.now(timezone.utc).timestamp() * 1000),
+                            "b": "599",
+                            "a": "601",
+                            "P": "0",
+                        },
+                    }
+                ),
+            )
+        )
 
 
 @pytest.fixture
 def network(monkeypatch):
     """Run the real SDK's connection and subscription code with no network IO."""
     transport = SimpleNamespace(
-        attempts=0, failures=0, subscription_failures=0,
-        sockets=[], sessions=[], handshake=None,
+        attempts=0,
+        failures=0,
+        subscription_failures=0,
+        sockets=[],
+        sessions=[],
+        handshake=None,
     )
 
     class Session:
@@ -91,7 +102,9 @@ def network(monkeypatch):
 
     monkeypatch.setattr(sdk_ws.aiohttp, "ClientSession", Session)
     monkeypatch.setattr(sdk_ws, "SUBSCRIBE_MESSAGE_DELAY_SECONDS", 0)
-    monkeypatch.setattr(sdk_ws, "global_stream_connections", sdk_ws.StreamConnectionsMap())
+    monkeypatch.setattr(
+        sdk_ws, "global_stream_connections", sdk_ws.StreamConnectionsMap()
+    )
     return transport
 
 
@@ -118,9 +131,9 @@ async def running_stream(network):
 
 
 async def received_quote(stream, network, socket_count):
-    await wait_until(lambda: (
-        len(network.sockets) == socket_count and network.sockets[-1].sent
-    ))
+    await wait_until(
+        lambda: len(network.sockets) == socket_count and network.sockets[-1].sent
+    )
     socket = network.sockets[-1]
     assert [m["params"] for m in socket.sent] == [["bnbusdt@ticker"]]
     socket.ticker()
@@ -149,15 +162,20 @@ def test_sdk_feed_recovers_repeated_disconnects_and_rewarms(network, failure):
                 elif failure == "eof":
                     socket.messages.put_nowait(None)
                 else:
-                    socket.messages.put_nowait(SimpleNamespace(type=aiohttp.WSMsgType.ERROR))
+                    socket.messages.put_nowait(
+                        SimpleNamespace(type=aiohttp.WSMsgType.ERROR)
+                    )
                 await wait_until(lambda: stream.windows is not old_windows)
                 with pytest.raises(ExchangeError):
                     stream.quote()
                 socket = await received_quote(stream, network, socket_count)
                 assert stream.quote().drawdown_15m is None
                 assert len(api.connections) == 1
-                assert len(api.connections[0].stream_callback_map["bnbusdt@ticker"]) == 1
+                assert (
+                    len(api.connections[0].stream_callback_map["bnbusdt@ticker"]) == 1
+                )
             assert network.attempts == 3
+
     asyncio.run(replay())
 
 
@@ -168,9 +186,14 @@ def test_sdk_scheduled_reconnect_does_not_race_the_watchdog(network, close_old):
             await received_quote(stream, network, 1)
             old_connection = api.connections[0]
             network.handshake = asyncio.Event()
-            replacing = asyncio.create_task(api.schedule_reconnect(
-                old_connection, api.configuration, 0, close_old,
-            ))
+            replacing = asyncio.create_task(
+                api.schedule_reconnect(
+                    old_connection,
+                    api.configuration,
+                    0,
+                    close_old,
+                )
+            )
             await wait_until(lambda: network.attempts == 2)
             await asyncio.sleep(0.45)  # Span two application watchdog checks.
             assert network.attempts == 2 and api.reconnect_tasks
@@ -182,6 +205,7 @@ def test_sdk_scheduled_reconnect_does_not_race_the_watchdog(network, close_old):
             await asyncio.sleep(0.45)
             assert network.attempts == 2 and len(api.connections) == 1
             assert len(api.connections[0].stream_callback_map["bnbusdt@ticker"]) == 1
+
     asyncio.run(replay())
 
 
@@ -201,6 +225,7 @@ def test_exhausted_sdk_retries_start_a_fresh_subscription(network, scheduled):
             await received_quote(stream, network, 2)
             assert network.attempts == 5
             assert len(api.connections[0].stream_callback_map["bnbusdt@ticker"]) == 1
+
     asyncio.run(replay())
 
 
@@ -211,6 +236,7 @@ def test_initial_sdk_connection_failure_is_retried(network):
         async with running_stream(network) as (stream, api):
             await received_quote(stream, network, 1)
             assert network.attempts == 2
+
     asyncio.run(replay())
 
 
@@ -222,10 +248,69 @@ def test_failed_resubscription_does_not_leave_a_stale_sdk_stream(network, schedu
             network.subscription_failures = 1
             if scheduled:
                 with pytest.raises(ConnectionError, match="subscription send failed"):
-                    await api.schedule_reconnect(api.connections[0], api.configuration, 0)
+                    await api.schedule_reconnect(
+                        api.connections[0], api.configuration, 0
+                    )
             else:
                 socket.messages.put_nowait(None)
             await received_quote(stream, network, 3)
             assert network.attempts == 3
             assert len(api.connections[0].stream_callback_map["bnbusdt@ticker"]) == 1
+
+    asyncio.run(replay())
+
+
+@pytest.mark.parametrize("stage", ["close", "forget"])
+def test_cleanup_failure_does_not_stop_stream_recovery(network, monkeypatch, stage):
+    async def replay():
+        async with running_stream(network) as (stream, api):
+            await received_quote(stream, network, 1)
+            failures = 0
+            if stage == "close":
+                original = api.close_connection
+
+                async def faulty(*args, **kwargs):
+                    nonlocal failures
+                    await original(*args, **kwargs)
+                    if failures == 0 and kwargs.get("close_session"):
+                        failures += 1
+                        raise RuntimeError("cleanup failed after transport close")
+
+                monkeypatch.setattr(api, "close_connection", faulty)
+            else:
+                original = __import__(
+                    "services.market_stream", fromlist=["_forget_connection_streams"]
+                )._forget_connection_streams
+
+                def faulty(connection):
+                    nonlocal failures
+                    original(connection)
+                    if failures == 0:
+                        failures += 1
+                        raise RuntimeError("subscription cleanup failed")
+
+                monkeypatch.setattr(
+                    "services.market_stream._forget_connection_streams", faulty
+                )
+            # Resubscription fails while a connection is still known to finally.
+            network.subscription_failures = 1
+            network.sockets[-1].messages.put_nowait(None)
+            await received_quote(stream, network, 3)
+            assert failures == 1
+            assert stream.last_error and "cleanup" in stream.last_error["stage"]
+
+    asyncio.run(replay())
+
+
+def test_real_cancellation_propagates_and_cleans_sdk_connections(network):
+    async def replay():
+        stream = MarketStream("BNBUSDT", make_strategy_config().crash_guard)
+        task = asyncio.create_task(stream._run())
+        await received_quote(stream, network, 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert all(session.closed for session in network.sessions)
+        assert not sdk_ws.global_stream_connections.stream_connections_map
+
     asyncio.run(replay())

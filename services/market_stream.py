@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal
 from threading import Event, Lock, Thread
@@ -10,6 +11,7 @@ from binance_sdk_spot.spot import Spot
 
 from core.crash_guard import latch_guard_trigger
 from core.models import CrashGuardState, MarketSnapshot
+
 from .binance_adapter import sdk_data
 from .exchange_adapter import ExchangeError
 from .market_data import MarketWindows
@@ -30,9 +32,12 @@ class MarketStream:
         self._thread = None
         self.windows = MarketWindows(cfg)
         self._last_message_at = monotonic()
+        self.last_error = None
 
     def start(self):
-        self._thread = Thread(target=lambda: asyncio.run(self._run()), daemon=True)
+        self._thread = Thread(
+            target=lambda: asyncio.run(self._supervise()), daemon=True
+        )
         self._thread.start()
         return self
 
@@ -55,21 +60,41 @@ class MarketStream:
             )
             if not quote.return_24h.is_finite():
                 raise ValueError("Invalid ticker return")
-            sampled = self.windows.update(quote, now)
-            self._last_message_at = monotonic()
             with self._lock:
+                sampled = self.windows.update(quote, now)
+                self._last_message_at = monotonic()
                 self._latest = sampled
                 risk = latch_guard_trigger(
                     self._risk or CrashGuardState(), sampled, now, self.cfg
                 )
                 self._risk = risk if risk.active else None
-        except Exception:
+        except Exception as exc:
+            self._record_error("ticker", exc)
             self._invalidate()
 
+    def _record_error(self, stage, exc):
+        self.last_error = {"stage": stage, "type": type(exc).__name__}
+        logging.getLogger("bnb_treasury").warning(
+            "Market stream %s failed", stage, exc_info=True
+        )
+
     def _invalidate(self):
-        self.windows = MarketWindows(self.cfg)
         with self._lock:
+            self.windows = MarketWindows(self.cfg)
             self._latest = None
+
+    async def _supervise(self):
+        while not self._stop.is_set():
+            try:
+                await self._run()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._record_error("supervisor", exc)
+            finally:
+                self._invalidate()
+            if not self._stop.is_set():
+                await asyncio.sleep(1)
 
     async def _run(self):
         api = self.client.websocket_streams
@@ -108,17 +133,36 @@ class MarketStream:
                         if connection is None:
                             break  # SDK exhausted retries and removed the subscription.
                     await asyncio.sleep(0.2)
-            except Exception:
+            except Exception as exc:
+                self._record_error("connection", exc)
                 self._invalidate()
             finally:
-                # SDK 4.4.0 can retain the old mapping if resubscription raises.
-                if connection is not None:
-                    _forget_connection_streams(connection)
-                await api.close_connection(close_session=True)
+                # Cleanup operations fail independently. Cancellation remains a
+                # BaseException and propagates, including during true shutdown.
+                try:
+                    if connection is not None:
+                        _forget_connection_streams(connection)
+                except Exception as exc:
+                    self._record_error("subscription cleanup", exc)
+                try:
+                    await asyncio.wait_for(
+                        api.close_connection(close_session=True), timeout=5
+                    )
+                except Exception as exc:
+                    self._record_error("connection cleanup", exc)
             if not self._stop.is_set():
                 await asyncio.sleep(1)
 
+    def health(self):
+        return {
+            "running": self._thread is not None and self._thread.is_alive(),
+            "last_message_age_seconds": monotonic() - self._last_message_at,
+            "last_error": self.last_error,
+        }
+
     def quote(self):
+        if self._thread is not None and not self._thread.is_alive():
+            raise ExchangeError("Market stream worker exited")
         with self._lock:
             if self._latest is None:
                 raise ExchangeError("No current market stream snapshot")

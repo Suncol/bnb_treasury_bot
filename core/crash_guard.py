@@ -3,9 +3,16 @@ from datetime import datetime
 from decimal import Decimal
 
 from .math_utils import floor_to_multiple
-from .models import CrashGuardConfig, CrashGuardState, EngineInputs, MarketSnapshot, StrategyConfig
+from .models import (
+    CrashGuardConfig,
+    CrashGuardState,
+    EngineInputs,
+    MarketSnapshot,
+    StrategyConfig,
+)
 from .order_planner import compute_ref_price
-from .time_utils import age_seconds, fresh
+from .time_utils import age_seconds, fresh, utc
+from .validation import valid_account_snapshot
 
 
 def valid_market(inputs: EngineInputs, cfg: StrategyConfig) -> bool:
@@ -42,7 +49,7 @@ def update_crash_guard(inputs: EngineInputs, cfg: StrategyConfig) -> CrashGuardS
         recovery_allowed=not inputs.pending.unresolved
         and inputs.snapshot_consistent
         and inputs.allow_guard_recovery
-        and fresh(inputs.account.ts, inputs.now, cfg.risk.max_account_age_seconds),
+        and valid_account_snapshot(inputs.account, inputs.now, cfg),
     )
 
 
@@ -104,14 +111,26 @@ def update_guard_from_market(
     if ceiling is not None and price_tick is not None:
         ceiling = floor_to_multiple(ceiling, price_tick)
     stable = guard.stable_since
-    if (
+    if m.sample_continuity is not None:
+        # Continuous sampling is independent of REST/controller latency. A
+        # reconnect replaces this proof; a lone precomputed snapshot cannot.
+        stable = m.sample_stable_since
+        if (
+            not fresh(m.sampled_at, now, c.max_market_age_seconds)
+            or stable is None
+            or utc(stable) > utc(m.sampled_at)
+        ):
+            stable = None
+        elif guard.last_trigger_at is not None:
+            stable = max(stable, guard.last_trigger_at, key=utc)
+    elif (
         guard.last_checked_at is None
         or age_seconds(now, guard.last_checked_at) > c.max_sample_gap_seconds
     ):
         stable = None
     if reasons or not m.windows_ready or m.drawdown_1m >= c.drawdown_1m_exit:
         stable = None
-    elif stable is None:
+    elif stable is None and m.sample_continuity is None:
         stable = now
     last_trigger = now if reasons else guard.last_trigger_at
     recovered = (

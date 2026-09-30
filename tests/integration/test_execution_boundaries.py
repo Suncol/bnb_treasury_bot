@@ -34,6 +34,10 @@ def accumulate_setup(tmp_path):
 
 def seed_bid(exchange, repo, *, age_hours=0, qty="1"):
     cfg = make_strategy_config()
+    # Each seeded submission must cover the previous order's wallet changes.
+    from services.reconciliation import Reconciler
+
+    Reconciler(exchange, repo, cfg).refresh(exchange.now)
     op = Executor(exchange, repo, cfg).execute(
         OrderPlan(cfg.symbol, "BUY", "LIMIT_MAKER", D(qty), D("598"), "GTC", True),
         exchange.now - timedelta(hours=age_hours),
@@ -149,10 +153,16 @@ def test_blocked_alert_sink_does_not_block_protective_tick(tmp_path):
         service.close()
 
 
-@pytest.mark.parametrize("failing_read", [
-    "fetch_account_snapshot", "fetch_recent_transfers", "fetch_symbol_filters",
-    "fetch_recent_fills", "fetch_open_orders",
-])
+@pytest.mark.parametrize(
+    "failing_read",
+    [
+        "fetch_account_snapshot",
+        "fetch_recent_transfers",
+        "fetch_symbol_filters",
+        "fetch_recent_fills",
+        "fetch_open_orders",
+    ],
+)
 @pytest.mark.parametrize("mode", [RunMode.AUTO, RunMode.PAUSED])
 def test_partial_read_failure_still_cancels_only_journaled_bids(
     tmp_path, failing_read, mode
@@ -274,7 +284,9 @@ def test_rejected_reprice_retains_funds_and_resumes_on_account_tick(tmp_path, re
     if restart:
         repo.close()
         repo = Repository(tmp_path / "test.sqlite3")
-        runner = Runner(exchange, repo, make_strategy_config(), clock=lambda: exchange.now)
+        runner = Runner(
+            exchange, repo, make_strategy_config(), clock=lambda: exchange.now
+        )
     exchange.now += timedelta(seconds=11)
     runner.tick(replace(exchange.fetch_market_snapshot("BNBUSDT"), return_1h=D("0.10")))
     assert len(exchange.writes) == 3
@@ -295,12 +307,17 @@ def test_rejected_reprice_retains_funds_and_resumes_on_account_tick(tmp_path, re
 def test_rejected_first_buy_after_funding_resumes_without_another_transfer(tmp_path):
     exchange, repo, runner = setup(
         tmp_path,
-        FakeExchange(make_account(contract_bnb=D("27"), contract_max_withdraw_amount=D("50000"))),
+        FakeExchange(
+            make_account(contract_bnb=D("27"), contract_max_withdraw_amount=D("50000"))
+        ),
         ReplenishmentState.ACCUMULATE,
     )
     exchange.reject_kind = OperationKind.ORDER
     runner.tick()
-    assert [o.kind for o in exchange.writes] == [OperationKind.TRANSFER, OperationKind.ORDER]
+    assert [o.kind for o in exchange.writes] == [
+        OperationKind.TRANSFER,
+        OperationKind.ORDER,
+    ]
     assert repo.runtime().resume_replenishment
     exchange.reject_kind = None
     exchange.now += timedelta(seconds=11)
@@ -370,9 +387,17 @@ def test_unknown_reprice_order_does_not_restore_continuation_after_restart(tmp_p
     assert sum(o.kind == OperationKind.ORDER for o in exchange.writes) == 2
 
 
-@pytest.mark.parametrize("blocker", [
-    "crash", "chase", "paused", "urgent_only", "funding_veto", "missing_window",
-])
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "crash",
+        "chase",
+        "paused",
+        "urgent_only",
+        "funding_veto",
+        "missing_window",
+    ],
+)
 def test_reprice_continuation_rechecks_all_gates_after_cancel(tmp_path, blocker):
     exchange, repo, runner = accumulate_setup(tmp_path)
     seed_bid(exchange, repo, age_hours=2, qty="5")
@@ -405,7 +430,8 @@ def test_reprice_continuation_rechecks_all_gates_after_cancel(tmp_path, blocker)
     exchange.submit = cancel_and_change_conditions
     run(runner, exchange, inventory=False)
     assert [o.kind for o in exchange.writes] == [
-        OperationKind.ORDER, OperationKind.CANCEL
+        OperationKind.ORDER,
+        OperationKind.CANCEL,
     ]
 
 
@@ -442,9 +468,12 @@ def test_degraded_reconciliation_retains_reported_episode_fills(tmp_path):
 def funded_setup(tmp_path):
     exchange, repo, runner = setup(
         tmp_path,
-        FakeExchange(make_account(
-            contract_bnb=D("27"), contract_max_withdraw_amount=D("50000"),
-        )),
+        FakeExchange(
+            make_account(
+                contract_bnb=D("27"),
+                contract_max_withdraw_amount=D("50000"),
+            )
+        ),
         ReplenishmentState.ACCUMULATE,
     )
     exchange.hold_transfers = True
@@ -455,10 +484,14 @@ def funded_setup(tmp_path):
     return exchange, repo, runner
 
 
-@pytest.mark.parametrize("blocker", ["chase", "paused", "urgent_only", "slice", "market"])
+@pytest.mark.parametrize(
+    "blocker", ["chase", "paused", "urgent_only", "slice", "market"]
+)
 @pytest.mark.parametrize("restart", [False, True])
 def test_funded_continuation_waits_without_sweeping_or_refunding(
-    tmp_path, blocker, restart,
+    tmp_path,
+    blocker,
+    restart,
 ):
     exchange, repo, runner = funded_setup(tmp_path)
     market = exchange.fetch_market_snapshot("BNBUSDT")
@@ -467,10 +500,13 @@ def test_funded_continuation_waits_without_sweeping_or_refunding(
             RunMode.PAUSED if blocker == "paused" else RunMode.URGENT_ONLY
         )
     elif blocker == "slice":
-        repo.save("runtime", replace(
-            repo.runtime(),
-            slice_state=SliceState(True, exchange.now + timedelta(seconds=20)),
-        ))
+        repo.save(
+            "runtime",
+            replace(
+                repo.runtime(),
+                slice_state=SliceState(True, exchange.now + timedelta(seconds=20)),
+            ),
+        )
     elif blocker == "chase":
         market = replace(market, return_1h=D("0.04"))
     else:
@@ -481,7 +517,9 @@ def test_funded_continuation_waits_without_sweeping_or_refunding(
     if restart:
         repo.close()
         repo = Repository(tmp_path / "test.sqlite3")
-        runner = Runner(exchange, repo, make_strategy_config(), clock=lambda: exchange.now)
+        runner = Runner(
+            exchange, repo, make_strategy_config(), clock=lambda: exchange.now
+        )
     runner.set_run_mode(RunMode.AUTO)
     exchange.now += timedelta(seconds=21)
     runner.tick()
@@ -495,8 +533,12 @@ def test_funded_continuation_rebudgets_when_prices_rise(tmp_path):
     exchange, repo, runner = funded_setup(tmp_path)
     old_market = exchange.fetch_market_snapshot
     exchange.fetch_market_snapshot = lambda symbol: replace(
-        old_market(symbol), best_bid=D("799.5"), best_ask=D("800.5"),
-        mid_price=D("800"), vwap_5m=D("800"), smooth_price=D("800"),
+        old_market(symbol),
+        best_bid=D("799.5"),
+        best_ask=D("800.5"),
+        mid_price=D("800"),
+        vwap_5m=D("800"),
+        smooth_price=D("800"),
     )
     runner.tick()
     buys = [op.payload for op in exchange.writes if op.kind == OperationKind.ORDER]
@@ -514,11 +556,31 @@ def test_ended_funding_continuation_releases_the_sweep_reservation(tmp_path, rea
         exchange.account = replace(exchange.account, contract_bnb=D("29"))
         repo.save("runtime", replace(repo.runtime(), state=ReplenishmentState.IDLE))
     elif reason == "covered":
+        from core.models import Fill
+
         exchange.account = replace(exchange.account, spot_bnb=D("5.5"))
+        exchange.fills.append(
+            Fill(
+                "BNBUSDC",
+                "external",
+                "outside",
+                exchange.now,
+                D("5"),
+                quote_qty=D("3000"),
+                quote_asset="USDC",
+            )
+        )
+        runner.reconciler.import_spot_trades(
+            ("BNBUSDC",),
+            operator="test",
+            reason="Verify external purchase covering target",
+            now=exchange.now,
+        )
     else:
         market = exchange.fetch_market_snapshot
         exchange.fetch_market_snapshot = lambda symbol: replace(
-            market(symbol), drawdown_1m=D("0.02"),
+            market(symbol),
+            drawdown_1m=D("0.02"),
         )
     runner.tick()
     assert not repo.runtime().resume_replenishment

@@ -8,13 +8,13 @@ from core.models import (
     ReplenishmentState,
     RunMode,
 )
+from core.order_planner import plan_buy_orders
 from services.executor import Executor
 from services.runner import Runner
 from storage.repository import Repository
 from tests.fake_exchange import FakeExchange
 from tests.helpers import D, make_account, make_strategy_config
 from tests.unit.test_order_planner import make_state_decision
-from core.order_planner import plan_buy_orders
 
 
 def setup(tmp_path, exchange=None, state=ReplenishmentState.URGENT):
@@ -178,6 +178,7 @@ def test_consecutive_failures_pause_and_survive_restart(tmp_path):
     exchange.read_failure = True
     for _ in range(3):
         run(runner, exchange)
+        exchange.now = repo.runtime().read_retry_at
     assert repo.runtime().run_mode == RunMode.PAUSED
     assert repo.runtime().pause_reason
     Runner(exchange, repo, make_strategy_config(), clock=lambda: exchange.now)
@@ -333,7 +334,7 @@ def test_failed_unknown_query_does_not_skip_known_protective_cancels(tmp_path):
     exchange.query_operation = failing_query
     market = replace(exchange.fetch_market_snapshot("BNBUSDT"), drawdown_1m=D("0.02"))
     plan = runner.run_once(market=market)
-    assert plan is not None
+    assert plan is None  # Failed query enters read backoff after priority protection.
     assert any(op.kind == OperationKind.CANCEL for op in exchange.writes)
     assert len([op for op in exchange.writes if op.kind == OperationKind.ORDER]) == 1
-    assert repo.operations(unresolved_only=True)[0].status == OperationStatus.UNKNOWN
+    assert repo.operation("lost-funding").status == OperationStatus.UNKNOWN

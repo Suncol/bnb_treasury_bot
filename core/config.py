@@ -1,8 +1,9 @@
 from dataclasses import fields, is_dataclass
 from decimal import Decimal
 from pathlib import Path
-import tomllib
 from typing import get_type_hints
+
+import tomllib
 
 from .models import (
     CrashGuardConfig,
@@ -79,6 +80,19 @@ def validate_config(cfg: StrategyConfig) -> None:
         raise ValueError(
             "Invalid crash guard acquisition allowance or sampling interval"
         )
+    if (
+        len(cfg.spot_activity_symbols) > 16
+        or len(set(cfg.spot_activity_symbols)) != len(cfg.spot_activity_symbols)
+        or any(
+            not isinstance(symbol, str)
+            or not symbol.isalnum()
+            or symbol != symbol.upper()
+            for symbol in cfg.spot_activity_symbols
+        )
+    ):
+        raise ValueError("At most 16 unique uppercase activity symbols are supported")
+    if not 0 <= e.urgent_ioc_buffer <= Decimal("0.01"):
+        raise ValueError("urgent_ioc_buffer must not exceed 1 percent")
     if cfg.symbol != "BNB" + cfg.quote_asset or not cfg.strategy_id:
         raise ValueError(
             "The configured symbol must be BNB + quote_asset; strategy_id is required"
@@ -99,8 +113,17 @@ def load_config(path: str | Path) -> StrategyConfig:
     if set(data) - allowed:
         raise ValueError(f"Unknown config sections: {sorted(set(data) - allowed)}")
     exchange = data.get("exchange", {})
-    if set(exchange) - {"symbol", "quote_asset", "strategy_id"}:
+    if set(exchange) - {
+        "symbol",
+        "quote_asset",
+        "strategy_id",
+        "spot_activity_symbols",
+    }:
         raise ValueError("Unknown exchange configuration key")
+    if "spot_activity_symbols" in exchange:
+        if not isinstance(exchange["spot_activity_symbols"], list):
+            raise ValueError("spot_activity_symbols must be an array of symbols")
+        exchange["spot_activity_symbols"] = tuple(exchange["spot_activity_symbols"])
     cfg = StrategyConfig(
         thresholds=_section(ThresholdConfig, data["thresholds"]),
         risk=_section(RiskConfig, data["risk"]),

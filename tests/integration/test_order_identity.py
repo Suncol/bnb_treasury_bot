@@ -1,4 +1,5 @@
 from dataclasses import replace
+from datetime import timedelta
 
 import pytest
 
@@ -26,7 +27,8 @@ def test_lost_ack_then_cancel_recovers_identity_across_restart(tmp_path, degrade
     exchange.lose_response = OperationKind.ORDER
     original = Executor(exchange, repo, cfg).execute(
         OrderPlan(cfg.symbol, "BUY", "LIMIT", D("1"), D("590"), "GTC", False),
-        exchange.now, ReplenishmentState.ACCUMULATE,
+        exchange.now,
+        ReplenishmentState.ACCUMULATE,
     )
     adapter = BinanceAdapter("", "", cfg, clients=(None, None, None))
     adapter.fetch_order = exchange.fetch_order
@@ -46,7 +48,9 @@ def test_lost_ack_then_cancel_recovers_identity_across_restart(tmp_path, degrade
         result = submit(op)
         if op.kind == OperationKind.CANCEL:
             order = exchange.orders[op.payload.order_id]
-            exchange.orders[order.order_id] = replace(order, client_id="cancel-generated-id")
+            exchange.orders[order.order_id] = replace(
+                order, client_id="cancel-generated-id"
+            )
         return result
 
     exchange.query_operation = query_operation
@@ -66,6 +70,7 @@ def test_lost_ack_then_cancel_recovers_identity_across_restart(tmp_path, degrade
     repo.close()
 
     inconclusive = False
+    exchange.now += timedelta(seconds=10)  # Honor the persisted read retry window.
     exchange.fetch_open_orders = open_orders
     repo = Repository(tmp_path / "test.sqlite3")
     runner = Runner(exchange, repo, cfg, clock=lambda: exchange.now)
@@ -82,11 +87,16 @@ def test_legacy_tracked_identity_is_used_without_resubmitting(tmp_path):
     cfg = make_strategy_config()
     op = Executor(exchange, repo, cfg).execute(
         OrderPlan(cfg.symbol, "BUY", "LIMIT", D("1"), D("590"), "GTC", False),
-        exchange.now, ReplenishmentState.ACCUMULATE,
+        exchange.now,
+        ReplenishmentState.ACCUMULATE,
     )
-    order = replace(exchange.orders[op.exchange_id], client_id="cancel-id", status="CANCELED")
+    order = replace(
+        exchange.orders[op.exchange_id], client_id="cancel-id", status="CANCELED"
+    )
     exchange.orders[order.order_id] = order
-    repo.save("tracked_orders", {op.client_id: replace(order, strategy_id=cfg.strategy_id)})
+    repo.save(
+        "tracked_orders", {op.client_id: replace(order, strategy_id=cfg.strategy_id)}
+    )
     repo.update_operation(replace(op, status=OperationStatus.UNKNOWN, exchange_id=None))
     adapter = BinanceAdapter("", "", cfg, clients=(None, None, None))
     adapter.fetch_order = exchange.fetch_order
@@ -103,12 +113,15 @@ def test_reused_client_id_does_not_reassign_an_external_order(tmp_path):
     cfg = make_strategy_config()
     op = Executor(exchange, repo, cfg).execute(
         OrderPlan(cfg.symbol, "BUY", "LIMIT", D("1"), D("590"), "GTC", False),
-        exchange.now, ReplenishmentState.ACCUMULATE,
+        exchange.now,
+        ReplenishmentState.ACCUMULATE,
     )
     external = replace(exchange.orders[op.exchange_id], order_id="external")
     exchange.orders[external.order_id] = external
     exchange.fill(op.exchange_id, D("1"))
-    _, orders, pending, consistent = Reconciler(exchange, repo, cfg).refresh(exchange.now)
+    _, orders, pending, consistent = Reconciler(exchange, repo, cfg).refresh(
+        exchange.now
+    )
     assert consistent and not pending.unresolved
     assert len(orders) == 1 and orders[0].strategy_id is None
     assert repo.fills_since(op.created_at)[0].strategy_id == cfg.strategy_id
@@ -117,20 +130,26 @@ def test_reused_client_id_does_not_reassign_an_external_order(tmp_path):
 
 
 @pytest.mark.parametrize("degraded", [False, True])
-def test_amended_quantity_keeps_ownership_and_protective_cancel_after_restart(tmp_path, degraded):
+def test_amended_quantity_keeps_ownership_and_protective_cancel_after_restart(
+    tmp_path, degraded
+):
     exchange, repo, runner = accumulate_setup(tmp_path)
     cfg = make_strategy_config()
     op = seed_bid(exchange, repo, qty="2")
     runner.reconciler.refresh(exchange.now)
     exchange.fill(op.exchange_id, D("0.25"))
     exchange.orders[op.exchange_id] = replace(
-        exchange.orders[op.exchange_id], qty=D("1"), client_id="amended-client-id",
+        exchange.orders[op.exchange_id],
+        qty=D("1"),
+        client_id="amended-client-id",
     )
     repo.close()
     repo = Repository(tmp_path / "test.sqlite3")
     runner = Runner(exchange, repo, cfg, clock=lambda: exchange.now)
     read_market = exchange.fetch_market_snapshot
-    exchange.fetch_market_snapshot = lambda symbol: replace(read_market(symbol), drawdown_1m=D("0.02"))
+    exchange.fetch_market_snapshot = lambda symbol: replace(
+        read_market(symbol), drawdown_1m=D("0.02")
+    )
     if degraded:
         read_account = exchange.fetch_account_snapshot
         exchange.fetch_account_snapshot = lambda: (_ for _ in ()).throw(TimeoutError())

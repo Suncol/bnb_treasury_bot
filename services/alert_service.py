@@ -3,6 +3,8 @@ import logging
 from threading import Event, Lock, Thread
 from urllib.request import Request, urlopen
 
+from storage.repository import Repository
+
 
 class LogSink:
     name = "log"
@@ -39,6 +41,9 @@ class AlertService:
         self.repository, self.sinks = repository, tuple(sinks)
         if len({s.name for s in self.sinks}) != len(self.sinks):
             raise ValueError("Alert sink names must be unique")
+        self._outbox = (
+            Repository(repository.path) if repository.path != ":memory:" else repository
+        )
         self._wake, self._stop = Event(), Event()
         self._start_lock, self._delivery_lock = Lock(), Lock()
         self._thread = None
@@ -60,6 +65,8 @@ class AlertService:
         self._wake.set()
         if self._thread is not None:
             self._thread.join()
+        if self._outbox is not self.repository:
+            self._outbox.close()
 
     def _run(self):
         while not self._stop.is_set():
@@ -76,16 +83,16 @@ class AlertService:
 
     def deliver(self):
         with self._delivery_lock:
-            # The shared SQLite connection is serialized for short local reads
-            # and acknowledgements only. Never hold the account lock over send().
-            with self.repository.exclusive():
-                pending = self.repository.pending_alerts()
+            # This worker owns an independent connection for short local reads
+            # and acknowledgements. Never take the account execution lock.
+            with self._outbox.local_access():
+                pending = self._outbox.pending_alerts()
             for alert_id, alert in pending:
                 if self._stop.is_set():
                     return
                 key = f"alert:{alert_id}"
-                with self.repository.exclusive():
-                    delivered = set(self.repository.load(key, ()))
+                with self._outbox.local_access():
+                    delivered = set(self._outbox.load(key, ()))
                 for sink in self.sinks:
                     if self._stop.is_set():
                         return
@@ -99,8 +106,8 @@ class AlertService:
                         )
                         continue
                     delivered.add(sink.name)
-                    with self.repository.exclusive():
-                        self.repository.save(key, tuple(sorted(delivered)))
+                    with self._outbox.local_access():
+                        self._outbox.save(key, tuple(sorted(delivered)))
                 if self.sinks and all(s.name in delivered for s in self.sinks):
-                    with self.repository.exclusive():
-                        self.repository.mark_delivered(alert_id)
+                    with self._outbox.local_access():
+                        self._outbox.mark_delivered(alert_id)

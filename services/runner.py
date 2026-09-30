@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import logging
+import random
+import sqlite3
+import traceback
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from core.config import validate_config
@@ -17,8 +21,12 @@ from core.models import (
     ReplenishmentState,
     RunMode,
 )
+from core.order_planner import order_passes_filters
 from core.replenishment_engine import build_cycle_plan
 from core.time_utils import age_seconds, fresh, utc
+from core.validation import valid_account_snapshot
+
+from .exchange_adapter import RequestDeferred
 from .executor import Executor
 from .history import historical_metrics
 from .market_data import MarketWindows
@@ -46,6 +54,14 @@ class Runner:
         self.windows = MarketWindows(cfg.crash_guard)
         self.cached_inputs = None
         self.last_reconciled_at = None
+        self._health_alerts = ()
+        self._health_checked_at = None
+        self._priority_busy = False
+        self._priority_revision = 0
+        self._priority_market = None
+        self.reconciler.read_checkpoint = self._priority_checkpoint
+        if hasattr(exchange, "read_checkpoint"):
+            exchange.read_checkpoint = self._priority_checkpoint
         with repository.exclusive():
             runtime = repository.runtime()
             repository.save(
@@ -73,11 +89,22 @@ class Runner:
             )
 
     def tick(self, raw_market=None):
+        try:
+            return self._tick(raw_market)
+        except BlockingIOError:
+            logging.getLogger("bnb_treasury").warning(
+                "Account lock busy; deferring tick"
+            )
+            return None
+
+    def _tick(self, raw_market=None):
         """Call each check_seconds; HTTP account reconciliation has a slower cadence."""
         with self.repository.exclusive():
             market = None
             try:
                 now = self.clock()
+                if self._waiting_for_reads(raw_market):
+                    return None
                 raw = raw_market or self._read_market()
                 market = (
                     raw
@@ -91,6 +118,13 @@ class Runner:
                     or age_seconds(now, runtime.last_inventory_at)
                     >= self.cfg.scheduler.t_check_minutes * 60
                 )
+                if inventory_due and runtime.last_inventory_attempt_at is not None:
+                    inventory_due = age_seconds(
+                        now, runtime.last_inventory_attempt_at
+                    ) >= min(
+                        self.cfg.scheduler.reconciliation_seconds,
+                        self.cfg.risk.max_account_age_seconds,
+                    )
                 reconcile_due = self.last_reconciled_at is None or age_seconds(
                     now, self.last_reconciled_at
                 ) >= min(
@@ -136,9 +170,20 @@ class Runner:
                 return self._failed_read(exc, market)
 
     def run_once(self, *, market=None, inventory_cycle=True):
+        try:
+            return self._run_once(market=market, inventory_cycle=inventory_cycle)
+        except BlockingIOError:
+            logging.getLogger("bnb_treasury").warning(
+                "Account lock busy; deferring cycle"
+            )
+            return None
+
+    def _run_once(self, *, market=None, inventory_cycle=True):
         """Explicit cycle entry, also useful for deterministic replay and tests."""
         with self.repository.exclusive():
             try:
+                if self._waiting_for_reads(market):
+                    return None
                 if market is None:
                     raw = self._read_market()
                     market = (
@@ -151,20 +196,48 @@ class Runner:
                 return self._failed_read(exc, market)
 
     def _failed_read(self, exc, market=None):
-        self.executor.note_failure(reason=type(exc).__name__)
-        self.repository.event(self.clock(), "API_ERROR", type(exc).__name__)
+        if isinstance(exc, sqlite3.Error) or (
+            isinstance(exc, OSError) and exc.errno in {5, 28, 30}
+        ):
+            logging.getLogger("bnb_treasury").exception(
+                "Storage failed; controller stopped without further writes"
+            )
+            raise exc
+        runtime = self.repository.runtime()
+        failures = runtime.read_failures + (not isinstance(exc, RequestDeferred))
+        delay = max(
+            float(getattr(exc, "retry_after", None) or 0),
+            min(60, 2 ** min(failures, 6)),
+        )
+        retry_at = self.clock() + timedelta(seconds=delay + random.uniform(0, 1))
+        self.repository.save(
+            "runtime", replace(runtime, read_failures=failures, read_retry_at=retry_at)
+        )
+        if not isinstance(exc, RequestDeferred):
+            self.executor.note_failure(reason=type(exc).__name__)
+            self.repository.event(
+                self.clock(),
+                "API_ERROR",
+                {
+                    "type": type(exc).__name__,
+                    "endpoint": getattr(exc, "endpoint", None),
+                    "http_status": getattr(exc, "http_status", None),
+                    "code": getattr(exc, "code", None),
+                    "retry_at": retry_at,
+                    "request_weights": getattr(exc, "request_weights", None),
+                    "trace": tuple(
+                        f"{frame.filename}:{frame.lineno}:{frame.name}"
+                        for frame in traceback.extract_tb(exc.__traceback__)
+                    ),
+                },
+            )
+            logging.getLogger("bnb_treasury").warning(
+                "Read failed (%s); retry at %s", type(exc).__name__, retry_at
+            )
         # Never reuse a partially reconciled view for trading or guard recovery.
         self.cached_inputs = None
         self.last_reconciled_at = None
-        if market is None or not fresh(
-            market.ts, self.clock(), self.cfg.crash_guard.max_market_age_seconds
-        ):
-            raw = self._read_market()
-            market = (
-                raw
-                if raw.smooth_price is not None
-                else self.windows.update(raw, self.clock())
-            )
+        market = self._local_market(market)
         self._consume_stream_risk()
         runtime = self.repository.runtime()
         guard = update_guard_from_market(runtime.guard, market, self.clock(), self.cfg)
@@ -176,8 +249,11 @@ class Runner:
         if self.execute_enabled:
             # Exposure is unverified: cancel only journaled ordinary bids. No
             # filters, balances or transfer history are needed to address them.
-            for cancel in self.reconciler.protective_cancellations():
-                self.executor.execute(cancel, self.clock(), runtime.state)
+            try:
+                for cancel in self.reconciler.protective_cancellations():
+                    self.executor.execute(cancel, self.clock(), runtime.state)
+            except RequestDeferred:
+                pass  # Exchange cooldown covers protective requests too.
         alerts = (
             Alert(
                 "WARNING",
@@ -193,7 +269,8 @@ class Runner:
         if guard.active:
             alerts += (
                 Alert(
-                    "WARNING", "CRASH_GUARD",
+                    "WARNING",
+                    "CRASH_GUARD",
                     "Crash protection active: " + ",".join(guard.reasons),
                 ),
             )
@@ -201,17 +278,131 @@ class Runner:
         return None
 
     def _read_market(self):
-        try:
-            return self.exchange.fetch_market_snapshot(self.cfg.symbol)
-        except Exception:
-            self.executor.note_failure(reason="Market data unavailable")
-            # Missing prices must not prevent reconciliation and known-order cancels.
-            zero = Decimal("0")
-            return MarketSnapshot(
-                None, self.cfg.symbol, zero, zero, zero, zero, zero, zero
+        return self.exchange.fetch_market_snapshot(self.cfg.symbol)
+
+    def _local_market(self, fallback=None):
+        feed = getattr(self.exchange, "feed", None)
+        if feed is not None:
+            try:
+                return feed.quote()
+            except Exception:
+                pass
+        if fallback is not None:
+            return fallback
+        zero = Decimal("0")
+        return MarketSnapshot(None, self.cfg.symbol, zero, zero, zero, zero, zero, zero)
+
+    def _waiting_for_reads(self, market):
+        retry_at = self.repository.runtime().read_retry_at
+        if retry_at is None or utc(self.clock()) >= utc(retry_at):
+            return False
+        self._priority_market = self._local_market(market)
+        self._priority_checkpoint()
+        self._publish(
+            (
+                Alert(
+                    "WARNING",
+                    "READ_BACKOFF",
+                    f"REST reads deferred until {retry_at.isoformat()}",
+                ),
             )
+        )
+        return True
+
+    def _priority_checkpoint(self):
+        if self._priority_busy:
+            return
+        self._priority_busy = True
+        try:
+            self._consume_stream_risk()
+            runtime = self.repository.runtime()
+            now = self.clock()
+            market = self._local_market(self._priority_market)
+            guard = update_guard_from_market(runtime.guard, market, now, self.cfg)
+            if guard != runtime.guard:
+                self.repository.save_guard(replace(runtime, guard=guard), now)
+            changed = (guard.active, guard.reasons) != (
+                runtime.guard.active,
+                runtime.guard.reasons,
+            )
+            if guard.active and self.execute_enabled:
+                for cancel in self.reconciler.protective_cancellations(
+                    guard=guard, now=now
+                ):
+                    self.executor.execute(cancel, self.clock(), runtime.state)
+                    self._priority_revision += 1
+                if changed:
+                    self._publish(
+                        (
+                            Alert(
+                                "WARNING",
+                                "CRASH_GUARD",
+                                "Crash protection active: " + ",".join(guard.reasons),
+                            ),
+                        )
+                    )
+        except RequestDeferred:
+            pass
+        finally:
+            self._priority_busy = False
 
     def _publish(self, alerts):
+        now = self.clock()
+        if (
+            self._health_checked_at is None
+            or age_seconds(now, self._health_checked_at) >= 60
+        ):
+            health = self.repository.health()
+            warnings = []
+            if (
+                health["disk_free_bytes"] is not None
+                and health["disk_free_bytes"] < 256 * 1024 * 1024
+            ):
+                warnings.append(
+                    Alert(
+                        "CRITICAL",
+                        "STORAGE_SPACE",
+                        "Database disk has less than 256 MiB free",
+                    )
+                )
+            if health["wal_bytes"] > 64 * 1024 * 1024:
+                warnings.append(
+                    Alert(
+                        "WARNING",
+                        "WAL_SIZE",
+                        "WAL exceeds 64 MiB; inspect readers and schedule checkpoint maintenance",
+                    )
+                )
+            if health["pending_alerts"] >= 1000:
+                warnings.append(
+                    Alert(
+                        "WARNING",
+                        "OUTBOX_BACKLOG",
+                        "At least 1000 notifications remain undelivered",
+                    )
+                )
+            if (
+                health["oldest_unresolved_at"] is not None
+                and now.timestamp() - health["oldest_unresolved_at"] > 3600
+            ):
+                warnings.append(
+                    Alert(
+                        "WARNING",
+                        "UNRESOLVED_AGE",
+                        "An operation remains unresolved for over one hour; inspect status and exchange evidence",
+                    )
+                )
+            self._health_alerts, self._health_checked_at = tuple(warnings), now
+        alerts = tuple(alerts) + self._health_alerts
+        issue = self.repository.load("spot_settlement_issue")
+        if issue:
+            alerts = tuple(alerts) + (
+                Alert(
+                    "WARNING",
+                    "SPOT_SETTLEMENT",
+                    f"Uncovered wallet changes; verify activity receipts: {issue}",
+                ),
+            )
         runtime = self.repository.runtime()
         if runtime.pause_reason:
             alerts = tuple(alerts) + (
@@ -226,16 +417,25 @@ class Runner:
         self.repository.save_guard(
             replace(
                 runtime,
-                state=plan.state_decision.confirmed_state,
+                state=plan.state_decision.confirmed_state
+                if plan.inventory_valid
+                else runtime.state,
                 candidate=plan.state_decision.candidate_state
-                if inventory
+                if inventory and plan.inventory_valid
                 else runtime.candidate,
                 candidate_streak=plan.state_decision.candidate_streak
-                if inventory
+                if inventory and plan.inventory_valid
                 else runtime.candidate_streak,
-                last_inventory_at=now if inventory else runtime.last_inventory_at,
+                last_inventory_at=now
+                if inventory and plan.inventory_valid
+                else runtime.last_inventory_at,
+                last_inventory_attempt_at=now
+                if inventory
+                else runtime.last_inventory_attempt_at,
                 guard=plan.crash_guard,
-                slice_state=plan.slice_state if update_slice else runtime.slice_state,
+                slice_state=plan.slice_state
+                if update_slice and plan.inventory_valid
+                else runtime.slice_state,
             ),
             now,
         )
@@ -253,7 +453,8 @@ class Runner:
             guard = runtime.guard
             if guard.active:
                 ceilings = [
-                    v for v in (guard.keep_price_ceiling, event.keep_price_ceiling)
+                    v
+                    for v in (guard.keep_price_ceiling, event.keep_price_ceiling)
                     if v is not None
                 ]
                 guard = replace(
@@ -261,21 +462,22 @@ class Runner:
                     started_at=min(guard.started_at, event.started_at, key=utc),
                     last_trigger_at=max(
                         guard.last_trigger_at or event.last_trigger_at,
-                        event.last_trigger_at, key=utc,
+                        event.last_trigger_at,
+                        key=utc,
                     ),
                     keep_price_ceiling=min(ceilings) if ceilings else None,
                     reasons=tuple(dict.fromkeys(guard.reasons + event.reasons)),
                     stable_since=None,
                     last_checked_at=None,
                 )
-            elif (
-                guard.ended_at is None
-                or utc(event.last_trigger_at) > utc(guard.ended_at)
+            elif guard.ended_at is None or utc(event.last_trigger_at) > utc(
+                guard.ended_at
             ):
                 guard = replace(
                     event,
                     started_at=max(event.started_at, guard.ended_at, key=utc)
-                    if guard.ended_at else event.started_at,
+                    if guard.ended_at
+                    else event.started_at,
                 )
             else:
                 feed.acknowledge_risk(event)
@@ -292,6 +494,13 @@ class Runner:
     def _inputs(self, market, inventory, *, continuing=False):
         self._consume_stream_risk()
         now = self.clock()
+        if inventory:
+            self.repository.save(
+                "runtime",
+                replace(self.repository.runtime(), last_inventory_attempt_at=now),
+            )
+        self._priority_market = market
+        self._priority_checkpoint()
         account, orders, pending, consistent = self.reconciler.refresh(now)
         filters = self.exchange.fetch_symbol_filters(self.cfg.symbol)
         # Reconciliation may be slow. Never timestamp an old quote as a new one.
@@ -307,11 +516,20 @@ class Runner:
         self._consume_stream_risk()
         now = self.clock()
         runtime = self.repository.runtime()
-        rate, margin = historical_metrics(self.repository, account, now)
-        if (
-            inventory and consistent and not pending.unresolved
-            and fresh(account.ts, now, self.cfg.risk.max_account_age_seconds)
-        ):
+        if runtime.read_failures or runtime.read_retry_at:
+            runtime = replace(runtime, read_failures=0, read_retry_at=None)
+            self.repository.save("runtime", runtime)
+        trusted = (
+            consistent
+            and not pending.unresolved
+            and valid_account_snapshot(account, now, self.cfg)
+        )
+        rate, margin = (
+            historical_metrics(self.repository, account, now)
+            if trusted
+            else (Decimal("0"), None)
+        )
+        if inventory and trusted:
             self.repository.save_snapshot(account)
         inputs = EngineInputs(
             account,
@@ -344,27 +562,40 @@ class Runner:
         queue = None
         submitted_qty = Decimal("0")
         group_qty = Decimal("0")
+        advance_inventory = inventory
         # A bounded cycle can manage many old orders but never resubmit an intent.
         for index in range(64):
             runtime = self.repository.runtime()
+            priority_revision = self._priority_revision
             inputs = self._inputs(
                 market,
-                inventory and index == 0,
+                advance_inventory,
                 continuing=inventory
                 or runtime.resume_replenishment
                 or runtime.resume_repricing
                 or bool(queue),
             )
+            if self._priority_revision != priority_revision:
+                # A priority cancel invalidated the in-flight reconciliation,
+                # including fills that became visible during the slow read.
+                if submitted_qty:
+                    used.add("buys")
+                queue = None
+                market = inputs.market
+                continue
             saved_slice = inputs.slice_state
             # A funded continuation spends settled balances, and a queued group
             # may finish its slice without funding or opening another group.
             inputs = replace(
                 inputs,
                 allow_usd_funding=(
-                    "fund" not in used and queue is None
+                    "fund" not in used
+                    and queue is None
                     and not self.repository.runtime().resume_replenishment
                 ),
-                slice_state=replace(saved_slice, next_at=None) if queue else saved_slice,
+                slice_state=replace(saved_slice, next_at=None)
+                if queue
+                else saved_slice,
             )
             plan = build_cycle_plan(inputs, self.cfg)
             if queue:
@@ -372,7 +603,9 @@ class Runner:
                     plan,
                     slice_state=replace(plan.slice_state, next_at=saved_slice.next_at),
                 )
-            self._persist_plan(plan, inventory=inventory and index == 0, now=inputs.now)
+            self._persist_plan(plan, inventory=advance_inventory, now=inputs.now)
+            if plan.inventory_valid:
+                advance_inventory = False
             if index == 0:
                 self.repository.event(inputs.now, "CYCLE", plan)
             self._publish(plan.alerts)
@@ -398,14 +631,25 @@ class Runner:
                     or plan.transfer_decision.allow
                     or plan.spot_usd_sweep_plan
                 )
-                if not fresh(
-                    inputs.account.ts, now, self.cfg.risk.max_account_age_seconds
-                ) or (
-                    needs_market
-                    and not fresh(
-                        inputs.market.ts,
-                        now,
-                        self.cfg.crash_guard.max_market_age_seconds,
+                if (
+                    not fresh(
+                        inputs.account.ts, now, self.cfg.risk.max_account_age_seconds
+                    )
+                    or (
+                        inputs.filters.observed_at is not None
+                        and not fresh(
+                            inputs.filters.observed_at,
+                            now,
+                            self.cfg.crash_guard.max_market_age_seconds,
+                        )
+                    )
+                    or (
+                        needs_market
+                        and not fresh(
+                            inputs.market.ts,
+                            now,
+                            self.cfg.crash_guard.max_market_age_seconds,
+                        )
                     )
                 ):
                     if submitted_qty:
@@ -416,7 +660,12 @@ class Runner:
             action = None
             tag = None
             if plan.cancellations:
-                candidates = [c for c in plan.cancellations if c.order_id not in used]
+                candidates = [
+                    c
+                    for c in plan.cancellations
+                    if c.order_id not in used
+                    and not self.repository.cancel_recorded(c.symbol, c.order_id)
+                ]
                 if candidates:
                     action, tag = candidates[0], candidates[0].order_id
             elif inputs.pending.unresolved:
@@ -444,11 +693,7 @@ class Runner:
                     if (
                         candidate.qty <= min(allowed, group_qty - submitted_qty)
                         and candidate.price <= max_price
-                        and candidate.qty % inputs.filters.qty_step == 0
-                        and candidate.price % inputs.filters.price_tick == 0
-                        and candidate.qty >= inputs.filters.min_qty
-                        and candidate.qty * candidate.price
-                        >= inputs.filters.min_notional
+                        and order_passes_filters(candidate, inputs.filters)
                         and candidate.qty
                         * candidate.price
                         * (1 + self.cfg.risk.fee_reserve_rate)
@@ -473,13 +718,15 @@ class Runner:
                 if (
                     not self.repository.operations(unresolved_only=True)
                     and plan.gates.data_gate == GateStatus.OPEN
+                    and plan.inventory_valid
                 ):
                     runtime = self.repository.runtime()
                     state = plan.state_decision.confirmed_state
                     continuing = plan.state_decision.delta_bnb > 0 and (
                         state == ReplenishmentState.URGENT
                         or (
-                            state in {
+                            state
+                            in {
                                 ReplenishmentState.WATCH,
                                 ReplenishmentState.ACCUMULATE,
                             }

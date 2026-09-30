@@ -2,6 +2,8 @@
 symbol = "BNBUSDT"
 quote_asset = "USDT"
 strategy_id = "bnb-treasury"
+# 共享现货账户的其他交易对（包括用 BNB 支付手续费的交易），最多 16 个。
+spot_activity_symbols = []
 
 [thresholds]
 b_low = 25.0
@@ -15,6 +17,7 @@ u_min = 500.0
 alpha_warn = 0.10
 alpha_crit = 0.25
 m_abs_min = 2000.0
+# 仅限制合约向现货调入；不是全部买入成交额上限。
 u_budget_24h = 3000.0
 slippage = 0.015
 u_spot_idle_max = 1000.0
@@ -30,6 +33,7 @@ accumulate_discounts = [0.003, 0.007, 0.015]
 layer_weights = [0.30, 0.40, 0.30]
 watch_reprice_hours = 6
 accumulate_reprice_hours = 2
+# 最终 IOC 限价缓冲，上限 0.01。
 urgent_ioc_buffer = 0.002
 watch_batch_transfer_bnb = 2.0
 watch_ttl_hours = 24

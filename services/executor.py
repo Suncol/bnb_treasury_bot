@@ -11,6 +11,7 @@ from core.models import (
     OrderPlan,
     RunMode,
 )
+
 from .exchange_adapter import RequestRejected
 
 
@@ -34,23 +35,42 @@ class Executor:
 
     def execute(self, payload, now, state, *, starts_slice=False, account=None):
         kind, scope = operation_scope(payload)
+        if kind == OperationKind.CANCEL:
+            existing = self.repository.cancel_operation(
+                payload.symbol, payload.order_id
+            )
+            if existing is not None:
+                return existing
+        checker = getattr(self.exchange, "ensure_request_allowed", None)
+        if checker is not None:
+            checker(
+                protective=kind == OperationKind.CANCEL
+            )  # No unsent UNKNOWN intent.
         previous_runtime = self.repository.runtime()
         runtime = previous_runtime
         if kind != OperationKind.CANCEL:
-            if runtime.run_mode == RunMode.PAUSED or self.repository.operations(
-                unresolved_only=True
+            if (
+                runtime.run_mode == RunMode.PAUSED
+                or self.repository.operations(unresolved_only=True)
+                or self.repository.load("spot_settlement_issue")
             ):
                 raise RuntimeError(
                     "New operations require an unpaused, reconciled runtime"
                 )
-        if kind == OperationKind.TRANSFER and account is None:
+        if kind != OperationKind.CANCEL and account is None:
             account = self.exchange.fetch_account_snapshot()
         op = Operation(
-            "bt-" + uuid4().hex, kind, scope, payload, now, state=state,
-            balance_before=account if kind == OperationKind.TRANSFER else None,
+            "bt-" + uuid4().hex,
+            kind,
+            scope,
+            payload,
+            now,
+            state=state,
+            balance_before=account if kind != OperationKind.CANCEL else None,
             balance_fill_cursor=self.repository.fill_cursor()
-            if kind == OperationKind.TRANSFER else None,
-            balance_pending=kind == OperationKind.TRANSFER,
+            if kind != OperationKind.CANCEL
+            else None,
+            balance_pending=kind != OperationKind.CANCEL,
         )
         if starts_slice:
             runtime = replace(
@@ -71,6 +91,18 @@ class Executor:
                 runtime, resume_replenishment=False, resume_repricing=False
             )
         self.repository.record_intent(op, runtime)
+        if kind == OperationKind.CANCEL:
+            self.repository.event(
+                now,
+                "CANCEL_INTENT",
+                {"client_id": op.client_id, "order_id": payload.order_id},
+            )
+            self.repository.event(
+                self.clock() if self.clock else now,
+                "CANCEL_SENT",
+                {"client_id": op.client_id},
+            )
+        cooldown = None
         try:
             result = self.exchange.submit(op)
             op = replace(
@@ -81,6 +113,11 @@ class Executor:
                 op, status=OperationStatus.FAILED, error=str(exc), checked_at=now
             )
         except Exception as exc:
+            retry_after = getattr(exc, "retry_after", None)
+            if retry_after is not None:
+                cooldown = (self.clock() if self.clock else now) + timedelta(
+                    seconds=max(1, float(retry_after))
+                )
             # This includes response decoding failures after a successful write.
             op = replace(
                 op,
@@ -97,6 +134,11 @@ class Executor:
                 resume_replenishment=previous_runtime.resume_replenishment,
                 resume_repricing=previous_runtime.resume_repricing,
             )
+        if cooldown is not None:
+            runtime = runtime or self.repository.runtime()
+            runtime = replace(
+                runtime, read_retry_at=max(runtime.read_retry_at or cooldown, cooldown)
+            )
         op = replace(op, checked_at=self.clock() if self.clock else now)
         return self.record_result(op, runtime=runtime, submission=True)
 
@@ -111,7 +153,8 @@ class Executor:
             or (submission and op.status == OperationStatus.UNKNOWN)
         ) and not op.failure_recorded:
             runtime = self._failure_runtime(
-                runtime, transfer=op.kind == OperationKind.TRANSFER,
+                runtime,
+                transfer=op.kind == OperationKind.TRANSFER,
                 reason=f"{op.kind.value}: {op.status.value}",
             )
             op = replace(op, failure_recorded=True)
@@ -120,9 +163,16 @@ class Executor:
                 runtime,
                 api_errors=0 if submission else runtime.api_errors,
                 transfer_failures=0
-                if op.kind == OperationKind.TRANSFER else runtime.transfer_failures,
+                if op.kind == OperationKind.TRANSFER
+                else runtime.transfer_failures,
             )
         self.repository.update_operation(op, runtime)
+        if op.kind == OperationKind.CANCEL and op.status == OperationStatus.CONFIRMED:
+            self.repository.event(
+                op.checked_at,
+                "CANCEL_TERMINAL",
+                {"client_id": op.client_id, "order_id": op.payload.order_id},
+            )
         return op
 
     @staticmethod

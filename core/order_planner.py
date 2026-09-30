@@ -21,6 +21,26 @@ def compute_ref_price(market: MarketSnapshot) -> Decimal:
     return min(market.mid_price, market.vwap_5m, anchor_ask)
 
 
+def order_passes_filters(order: OrderPlan, filters: SymbolFilters) -> bool:
+    """The same final-order validation is used for planning and queued execution."""
+    price, qty = order.price, order.qty
+    return (
+        price is not None
+        and price.is_finite()
+        and qty.is_finite()
+        and price > 0
+        and qty > 0
+        and price >= filters.min_price
+        and (filters.max_price is None or price <= filters.max_price)
+        and qty % filters.qty_step == 0
+        and price % filters.price_tick == 0
+        and qty >= filters.min_qty
+        and qty * price >= filters.min_notional
+        and (filters.max_qty is None or qty <= filters.max_qty)
+        and (filters.max_notional is None or qty * price <= filters.max_notional)
+    )
+
+
 def _max_affordable_qty(
     delta_bnb: Decimal,
     ref_price: Decimal,
@@ -97,7 +117,7 @@ def _layered_orders(
             qty = floor_to_multiple(carry_qty, filters.qty_step)
             plans[-1] = replace(plans[-1], qty=plans[-1].qty + qty)
 
-    return tuple(plans)
+    return tuple(order for order in plans if order_passes_filters(order, filters))
 
 
 def plan_watch_orders(
@@ -197,7 +217,7 @@ def plan_urgent_orders(
     )
     return BuyPlan(
         state=ReplenishmentState.URGENT,
-        orders=(order,),
+        orders=(order,) if order_passes_filters(order, filters) else (),
         reason="Urgent IOC replenishment",
     )
 

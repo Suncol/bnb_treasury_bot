@@ -23,7 +23,8 @@ class FakeExchange:
         )
         if self.account.contract_quote_balance is None:
             self.account = replace(
-                self.account, contract_quote_balance=self.account.contract_max_withdraw_amount
+                self.account,
+                contract_quote_balance=self.account.contract_max_withdraw_amount,
             )
         self.orders, self.transfers, self.fills, self.writes = {}, {}, [], []
         self.hold_transfers = False
@@ -74,7 +75,11 @@ class FakeExchange:
         return (
             ()
             if self.hide_fills
-            else tuple(f for f in self.fills if utc(since) <= utc(f.ts) <= utc(until))
+            else tuple(
+                f
+                for f in self.fills
+                if f.symbol == symbol and utc(since) <= utc(f.ts) <= utc(until)
+            )
         )
 
     def fetch_recent_transfers(self, since, until):
@@ -95,7 +100,14 @@ class FakeExchange:
             spot_usd=self.account.spot_usd - qty * o.price,
         )
         self.fills.append(
-            Fill(o.symbol, str(len(self.fills) + 1), order_id, self.now, qty, quote_qty=qty * o.price)
+            Fill(
+                o.symbol,
+                str(len(self.fills) + 1),
+                order_id,
+                self.now,
+                qty,
+                quote_qty=qty * o.price,
+            )
         )
 
     def settle(self, transfer_id):

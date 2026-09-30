@@ -16,15 +16,18 @@ from .models import (
     ReplenishmentState,
     RunMode,
     SliceState,
+    StateDecision,
     StateInputs,
     StrategyConfig,
     TransferDecision,
+    TransitionReason,
 )
 from .order_manager import plan_cancellations
 from .order_planner import compute_ref_price, plan_buy_orders
 from .risk_checks import compute_usd_transfer_needed, evaluate_transfer_gate
 from .state_machine import evaluate_state
 from .time_utils import fresh, utc
+from .validation import valid_account_snapshot
 
 ZERO = Decimal("0")
 
@@ -50,25 +53,6 @@ def _to_state_inputs(inputs: EngineInputs) -> StateInputs:
         has_unknown_orders=p.has_unknown_orders,
         has_unknown_transfers=p.has_unknown_transfers,
         bnb_in_transit=p.bnb_in_transit,
-    )
-
-
-def _valid_account(inputs: EngineInputs, cfg: StrategyConfig) -> bool:
-    a = inputs.account
-    amounts = (
-        a.contract_bnb,
-        a.contract_max_withdraw_amount,
-        a.spot_bnb,
-        a.spot_usd,
-        a.reserved_spot_usd,
-        a.reserved_spot_bnb,
-    )
-    return (
-        inputs.snapshot_consistent
-        and fresh(a.ts, inputs.now, cfg.risk.max_account_age_seconds)
-        and all(x.is_finite() and x >= 0 for x in amounts)
-        and a.reserved_spot_usd <= a.spot_usd
-        and a.reserved_spot_bnb <= a.spot_bnb
     )
 
 
@@ -153,24 +137,45 @@ def _alerts(inputs, cfg, decision, transfer, gates, guard) -> tuple[Alert, ...]:
         )
     if transfer.level not in {"OK", "NO_ACTION"}:
         add(transfer.level, "TRANSFER_GATE", transfer.message)
-    if inputs.account.contract_bnb <= cfg.thresholds.b_low:
-        add("DANGER", "BNB_URGENT", "Futures BNB is at or below the inventory floor")
-    if inputs.account.contract_bnb <= cfg.thresholds.b_low / 2:
+    if valid_account_snapshot(inputs.account, inputs.now, cfg):
+        if inputs.account.contract_bnb <= cfg.thresholds.b_low:
+            add(
+                "DANGER", "BNB_URGENT", "Futures BNB is at or below the inventory floor"
+            )
+        if inputs.account.contract_bnb <= cfg.thresholds.b_low / 2:
+            add(
+                "CRITICAL",
+                "BNB_NEAR_ZERO",
+                "Futures BNB is below half of the inventory floor",
+            )
+        withdraw = inputs.account.contract_max_withdraw_amount
+        if withdraw < cfg.risk.m_abs_min:
+            add(
+                "CRITICAL",
+                "WITHDRAW_LOW",
+                "maxWithdrawAmount is below the absolute floor",
+            )
+        if withdraw <= 0 or cfg.risk.u_min / withdraw > cfg.risk.alpha_warn:
+            add(
+                "CRITICAL"
+                if withdraw <= 0 or cfg.risk.u_min / withdraw > cfg.risk.alpha_crit
+                else "WARNING",
+                "GRANULARITY_VETO",
+                "Minimum transfer unit is unsafe relative to maxWithdrawAmount",
+            )
+    if (
+        inputs.snapshot_consistent
+        and not inputs.pending.unresolved
+        and valid_account_snapshot(inputs.account, inputs.now, cfg)
+        and inputs.account.contract_bnb <= cfg.thresholds.b_low
+        and decision.delta_bnb == 0
+        and inputs.account.spot_bnb - inputs.account.reserved_spot_bnb
+        <= cfg.thresholds.b_spot_reserve
+    ):
         add(
-            "CRITICAL",
-            "BNB_NEAR_ZERO",
-            "Futures BNB is below half of the inventory floor",
-        )
-    withdraw = inputs.account.contract_max_withdraw_amount
-    if withdraw < cfg.risk.m_abs_min:
-        add("CRITICAL", "WITHDRAW_LOW", "maxWithdrawAmount is below the absolute floor")
-    if withdraw <= 0 or cfg.risk.u_min / withdraw > cfg.risk.alpha_warn:
-        add(
-            "CRITICAL"
-            if withdraw <= 0 or cfg.risk.u_min / withdraw > cfg.risk.alpha_crit
-            else "WARNING",
-            "GRANULARITY_VETO",
-            "Minimum transfer unit is unsafe relative to maxWithdrawAmount",
+            "DANGER",
+            "INVENTORY_UNAVAILABLE",
+            "Total exposure covers target but frozen inventory or open orders cannot replenish futures now",
         )
     if inputs.budget_used_24h >= cfg.risk.u_budget_24h:
         add("WARNING", "BUDGET_EXHAUSTED", "Rolling 24h transfer budget is exhausted")
@@ -217,7 +222,9 @@ def _alerts(inputs, cfg, decision, transfer, gates, guard) -> tuple[Alert, ...]:
             "CRASH_RECOVERED",
             "Crash protection recovered after continuous observation and reconciliation",
         )
-    if inputs.market.return_24h < Decimal("-0.08"):
+    if inputs.market.return_24h.is_finite() and inputs.market.return_24h < Decimal(
+        "-0.08"
+    ):
         add(
             "WARNING", "DROP_24H", "24h price drop exceeds 8 percent (observation only)"
         )
@@ -230,7 +237,35 @@ def build_cycle_plan(inputs: EngineInputs, cfg: StrategyConfig) -> CyclePlan:
     Cancels precede new actions. A funding decision contains no dependent orders;
     its confirmed completion requires a new snapshot and a new plan.
     """
-    decision = evaluate_state(_to_state_inputs(inputs), cfg)
+    account_ok = inputs.snapshot_consistent and valid_account_snapshot(
+        inputs.account, inputs.now, cfg
+    )
+    inventory_valid = account_ok and not inputs.pending.unresolved
+    if inventory_valid:
+        decision = evaluate_state(_to_state_inputs(inputs), cfg)
+    else:
+        # Invalid inputs cannot become tomorrow's trusted strategy state. Avoid
+        # even performing Decimal comparisons/arithmetic on corrupt balances.
+        previous = inputs.previous_state
+        reason = (
+            TransitionReason.DATA_INVALID
+            if not account_ok
+            else TransitionReason.WAIT_RECONCILE
+        )
+        decision = StateDecision(
+            current_state=previous,
+            raw_candidate_state=previous,
+            candidate_state=inputs.previous_candidate_state or previous,
+            confirmed_state=previous,
+            transitioned=False,
+            reason=reason,
+            candidate_reason=reason,
+            t_depletion=None,
+            effective_supply=cfg.thresholds.b_target,
+            delta_bnb=ZERO,
+            candidate_streak=inputs.candidate_streak,
+        )
+        inputs = replace(inputs, snapshot_consistent=False, allow_guard_recovery=False)
     if (
         not inputs.advance_state
         and decision.raw_candidate_state != ReplenishmentState.URGENT
@@ -272,11 +307,13 @@ def build_cycle_plan(inputs: EngineInputs, cfg: StrategyConfig) -> CyclePlan:
     reconcile_gate = (
         GateStatus.WAIT_RECONCILE if inputs.pending.unresolved else GateStatus.OPEN
     )
-    account_ok = _valid_account(inputs, cfg)
     market_ok = valid_market(inputs, cfg)
+    filters_ok = inputs.filters.observed_at is None or fresh(
+        inputs.filters.observed_at, inputs.now, cfg.crash_guard.max_market_age_seconds
+    )
     data_gate = (
         GateStatus.OPEN
-        if account_ok and market_ok and inputs.market.windows_ready
+        if account_ok and market_ok and inputs.market.windows_ready and filters_ok
         else GateStatus.BLOCKED
     )
     transfer = TransferDecision(
@@ -285,9 +322,11 @@ def build_cycle_plan(inputs: EngineInputs, cfg: StrategyConfig) -> CyclePlan:
     buy = BuyPlan(state, reason="No funded incremental demand")
     bnb_transfer = sweep = None
     slice_state = inputs.slice_state
-    if state == ReplenishmentState.IDLE or decision.delta_bnb == 0:
+    if inventory_valid and (
+        state == ReplenishmentState.IDLE or decision.delta_bnb == 0
+    ):
         slice_state = SliceState()
-    elif decision.delta_bnb > cfg.execution.slice_threshold_bnb:
+    elif inventory_valid and decision.delta_bnb > cfg.execution.slice_threshold_bnb:
         slice_state = replace(slice_state, active=True)
     ready = run_gate == reconcile_gate == GateStatus.OPEN and account_ok and not cancels
     if ready:
@@ -305,6 +344,21 @@ def build_cycle_plan(inputs: EngineInputs, cfg: StrategyConfig) -> CyclePlan:
         )
     )
     qty = decision.delta_bnb
+    if inputs.filters.max_position is not None and account_ok:
+        qty = min(
+            qty,
+            non_negative(
+                inputs.filters.max_position
+                - inputs.account.spot_bnb
+                - inputs.pending.open_buy_remaining_qty
+            ),
+        )
+    slots = inputs.filters.exchange_order_slots
+    if inputs.filters.max_open_orders is not None:
+        symbol_slots = max(0, inputs.filters.max_open_orders - len(inputs.orders))
+        slots = symbol_slots if slots is None else min(slots, symbol_slots)
+    if slots is not None and slots <= 0:
+        can_buy = False
     if slice_state.active:
         qty = min(qty, cfg.execution.slice_qty_bnb)
         if slice_state.next_at is not None and utc(inputs.now) < utc(
@@ -335,6 +389,8 @@ def build_cycle_plan(inputs: EngineInputs, cfg: StrategyConfig) -> CyclePlan:
         requested = replace(decision, delta_bnb=qty)
         # Use the same price, lot and notional rules as the eventual orders.
         demand = plan_buy_orders(requested, inputs.market, inputs.filters, cfg, None)
+        if slots is not None:
+            demand = replace(demand, orders=demand.orders[: max(0, slots)])
         ref = compute_ref_price(inputs.market)
         if demand.orders and state == ReplenishmentState.URGENT:
             ref = demand.orders[0].price
@@ -365,6 +421,8 @@ def build_cycle_plan(inputs: EngineInputs, cfg: StrategyConfig) -> CyclePlan:
                 cfg,
                 free / (1 + cfg.risk.fee_reserve_rate),
             )
+        if slots is not None:
+            buy = replace(buy, orders=buy.orders[: max(0, slots)])
     if ready and data_gate == GateStatus.OPEN and not transfer.allow and not buy.orders:
         gross = (
             decision.delta_bnb
@@ -386,4 +444,5 @@ def build_cycle_plan(inputs: EngineInputs, cfg: StrategyConfig) -> CyclePlan:
         guard,
         slice_state,
         target,
+        inventory_valid,
     )

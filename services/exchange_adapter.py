@@ -18,6 +18,24 @@ from core.models import (
 class ExchangeError(Exception):
     """Transport, protocol or execution uncertainty; never safe to resubmit."""
 
+    def __init__(
+        self,
+        message="",
+        *,
+        endpoint=None,
+        http_status=None,
+        code=None,
+        retry_after=None,
+        request_weights=None,
+    ):
+        super().__init__(message)
+        self.endpoint, self.http_status, self.code = endpoint, http_status, code
+        self.retry_after, self.request_weights = retry_after, request_weights
+
+
+class RequestDeferred(ExchangeError):
+    """Local throttle: no network request was sent."""
+
 
 class RequestRejected(ExchangeError):
     """A documented, definitive rejection before execution."""
