@@ -6,6 +6,7 @@ from typing import Protocol
 from core.models import (
     AccountSnapshot,
     Fill,
+    FuturesIncome,
     MarketSnapshot,
     Operation,
     OperationResult,
@@ -80,5 +81,8 @@ class ExchangeAdapter(Protocol):
     def fetch_recent_transfers(
         self, since: datetime, until: datetime
     ) -> tuple[TransferRecord, ...]: ...
+    def fetch_futures_income(
+        self, since: datetime, until: datetime
+    ) -> tuple[FuturesIncome, ...]: ...
     def submit(self, operation: Operation) -> OperationResult: ...
     def query_operation(self, operation: Operation) -> OperationResult: ...

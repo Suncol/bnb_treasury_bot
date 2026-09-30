@@ -454,6 +454,15 @@ class TransferRecord:
 
 
 @dataclass(frozen=True)
+class FuturesIncome:
+    income_type: str
+    transaction_id: str
+    asset: str
+    amount: Decimal
+    ts: datetime
+
+
+@dataclass(frozen=True)
 class Operation:
     client_id: str
     kind: OperationKind
@@ -469,6 +478,8 @@ class Operation:
     balance_fill_cursor: int | None = None
     balance_pending: bool = False
     failure_recorded: bool = False
+    cancel_attempts: int = 0
+    cancel_retry_at: datetime | None = None
 
     @property
     def unresolved(self) -> bool:
@@ -481,6 +492,7 @@ class Operation:
 class OperationResult:
     status: OperationStatus
     exchange_id: str | None = None
+    transfer: TransferRecord | None = None
 
 
 @dataclass(frozen=True)

@@ -334,6 +334,7 @@ def test_sdk_definite_order_rejection_does_not_block_next_order(
         "BNBUSDT", "BUY", order_type, D("1"), D("600"), tif, order_type == "LIMIT_MAKER"
     )
     repo = Repository(tmp_path / "sdk.sqlite3")
+    repo.initialize_spot_checkpoint(FakeExchange().fetch_account_snapshot(), {"operator": "test", "reason": "quiescent fixture"})
     executor = Executor(adapter, repo, make_strategy_config())
     rejected = executor.execute(
         payload,
@@ -388,6 +389,7 @@ def test_ambiguous_sdk_rejections_and_absence_keep_journal_unresolved(
     )
     payload = OrderPlan("BNBUSDT", "BUY", "LIMIT_MAKER", D("1"), D("600"), "GTC", True)
     repo = Repository(tmp_path / "sdk.sqlite3")
+    repo.initialize_spot_checkpoint(FakeExchange().fetch_account_snapshot(), {"operator": "test", "reason": "quiescent fixture"})
     executor = Executor(adapter, repo, make_strategy_config())
     unresolved = executor.execute(
         payload,
@@ -416,6 +418,7 @@ def test_definite_transfer_limit_rejection_can_reconcile_and_counts_failures(
         {"code": -3020, "msg": "Transfer out amount exceeds max amount."},
     )
     repo = Repository(tmp_path / "sdk.sqlite3")
+    repo.initialize_spot_checkpoint(FakeExchange().fetch_account_snapshot(), {"operator": "test", "reason": "quiescent fixture"})
     executor = Executor(adapter, repo, make_strategy_config())
     payload = AssetTransferPlan("USDT", D("500"), "USDⓈ-M Futures", "SPOT", "fund")
     for attempt in range(2):
@@ -442,6 +445,7 @@ def test_uncertain_transfer_responses_keep_the_gate_closed(sdk, tmp_path, status
         {"code": code, "msg": "transfer response"},
     )
     repo = Repository(tmp_path / "sdk.sqlite3")
+    repo.initialize_spot_checkpoint(FakeExchange().fetch_account_snapshot(), {"operator": "test", "reason": "quiescent fixture"})
     executor = Executor(adapter, repo, make_strategy_config())
     payload = AssetTransferPlan("USDT", D("500"), "USDⓈ-M Futures", "SPOT", "fund")
     op = executor.execute(
@@ -811,6 +815,7 @@ def test_write_rate_limit_persists_cooldown_with_unknown_intent(sdk, tmp_path):
     )
     path = tmp_path / "limited.db"
     repo = Repository(path)
+    repo.initialize_spot_checkpoint(FakeExchange().fetch_account_snapshot(), {"operator": "test", "reason": "quiescent fixture"})
     result = Executor(adapter, repo, make_strategy_config(), clock=lambda: NOW).execute(
         OrderPlan("BNBUSDT", "BUY", "LIMIT", D("1"), D("600"), "IOC", False),
         NOW,
@@ -824,3 +829,54 @@ def test_write_rate_limit_persists_cooldown_with_unknown_intent(sdk, tmp_path):
     assert repo.operations(unresolved_only=True)[0].client_id == result.client_id
     assert len(calls) == 1
     repo.close()
+
+
+def test_sdk_income_paginates_same_millisecond_without_joining_transfer_ids(sdk):
+    from datetime import timedelta
+    adapter, calls, responses = sdk
+    def response(call):
+        params = parse_qs(call["params"])
+        assert params["startTime"] == [str(millis(NOW - timedelta(seconds=1)))]
+        assert params["endTime"] == [str(millis(NOW))]
+        assert params["limit"] == ["1000"]
+        assert "incomeType" not in params and "symbol" not in params
+        page = int(params["page"][0])
+        ids = range(1000) if page == 1 else [1000]
+        return 200, [{"incomeType": "COMMISSION", "tranId": i,
+                      "income": "-0.00000001", "asset": "BNB", "time": millis(NOW)} for i in ids]
+    responses["GET", "/fapi/v1/income"] = response
+    rows = adapter.fetch_futures_income(NOW - timedelta(seconds=1), NOW)
+    assert len(rows) == 1001
+    assert sum(r.amount for r in rows) == D("-0.00001001")
+    assert len(calls) == 2
+
+
+def test_sdk_income_rejects_stalled_pagination_and_expired_evidence(sdk):
+    from datetime import timedelta
+    adapter, calls, responses = sdk
+    responses["GET", "/fapi/v1/income"] = (200, [
+        {"incomeType": "TRANSFER", "tranId": i, "asset": "USDT", "income": "500", "time": millis(NOW)}
+        for i in range(1000)
+    ])
+    with pytest.raises(ExchangeError, match="repeated"):
+        adapter.fetch_futures_income(NOW - timedelta(seconds=1), NOW)
+    count = len(calls)
+    with pytest.raises(ExchangeError, match="retention"):
+        adapter.fetch_futures_income(NOW - timedelta(days=100), NOW)
+    assert len(calls) == count
+
+
+def test_sdk_transfer_query_returns_complete_authenticated_receipt(sdk):
+    adapter, calls, responses = sdk
+    transfer = replace(operation(OperationKind.TRANSFER,
+        AssetTransferPlan("BNB", D("2"), "SPOT", "USDⓈ-M Futures", "test")), exchange_id="456")
+    def response(call):
+        direction = parse_qs(call["params"])["type"][0]
+        rows = [{"tranId": 456, "asset": "BNB", "amount": "2", "timestamp": millis(NOW), "status": "CONFIRMED"}] if direction == "MAIN_UMFUTURE" else []
+        return 200, {"total": len(rows), "rows": rows}
+    responses["GET", "/sapi/v1/asset/transfer"] = response
+    result = adapter.query_operation(transfer)
+    assert result.status == OperationStatus.CONFIRMED
+    assert result.transfer.transfer_id == "456"
+    assert result.transfer.amount == D("2")
+    assert result.transfer.to_account == "USDⓈ-M Futures"

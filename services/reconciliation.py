@@ -19,22 +19,35 @@ class Reconciler:
         self.read_checkpoint = None
         self.executor = Executor(exchange, repository, cfg, clock=self.clock)
 
-    def protective_cancellations(self, *, guard=None, now=None):
+    def protective_cancellations(self, *, guard=None, now=None, retries_only=False):
         """Best-effort known-order management when a complete view is unavailable.
 
         Absence/query failure never releases exposure. A journaled exchange ID
         remains safe to cancel, but unidentified submissions and external orders
-        are never guessed. Pending and terminal cancels are not submitted again.
+        are never guessed. Only verified open orders can retry a pending cancel.
         """
         repo, cfg = self.repository, self.cfg
         operations = repo.operations(active_only=True)
+        now = now or (self.clock() if self.clock else None)
+        count = 0
+        if now is not None:
+            for op in operations:
+                if op.kind == OperationKind.CANCEL and self.executor.cancel_due(
+                    op.payload, now
+                ):
+                    yield op.payload
+                    count += 1
+                    if count >= 64:
+                        return
+        if retries_only:
+            return
         blocked = {
             (op.payload.symbol, op.payload.order_id)
             for op in operations
             if op.kind == OperationKind.CANCEL and op.status != OperationStatus.FAILED
         }
         tracked = repo.tracked_orders(active_only=True)
-        count = kept = 0
+        kept = 0
         allowance = (
             max(cfg.crash_guard.max_acquisition_bnb - guard.filled_bnb, ZERO)
             if guard
@@ -155,7 +168,10 @@ class Reconciler:
         repo, exchange, cfg = self.repository, self.exchange, self.cfg
         tracked = repo.tracked_orders(active_only=True)
         for op in repo.operations(unresolved_only=True):
-            if op.status == OperationStatus.CONFIRMED:
+            if op.status == OperationStatus.CONFIRMED and not (
+                op.kind == OperationKind.TRANSFER
+                and repo.transfer_record(op.exchange_id) is None
+            ):
                 continue  # Submission/transfer accepted; balance coverage remains.
             if op.kind != OperationKind.CANCEL and not op.balance_pending:
                 op = replace(op, balance_pending=True)
@@ -171,21 +187,33 @@ class Reconciler:
             except RequestDeferred:
                 raise
             except Exception as exc:
-                repo.update_operation(
-                    replace(
-                        repo.operation(op.client_id),
-                        status=OperationStatus.UNKNOWN,
-                        balance_pending=op.balance_pending,
-                        checked_at=self.clock() if self.clock else now,
-                        error=type(exc).__name__,
+                current = repo.operation(op.client_id)
+                if not (
+                    op.kind == OperationKind.CANCEL
+                    and current.status == OperationStatus.CONFIRMED
+                ):
+                    repo.update_operation(
+                        replace(
+                            current,
+                            status=OperationStatus.UNKNOWN,
+                            balance_pending=op.balance_pending,
+                            checked_at=self.clock() if self.clock else now,
+                            error=type(exc).__name__,
+                        )
                     )
-                )
                 # The read circuit breaker handles this once; its protective
                 # path can still cancel other journaled orders without guessing.
                 raise
             # A priority checkpoint may bind identity while this read is in
             # progress. Never overwrite that newer binding with an old query.
             current = repo.operation(op.client_id)
+            if op.kind == OperationKind.CANCEL:
+                if current.status == OperationStatus.CONFIRMED:
+                    continue  # A protective read boundary already closed it.
+                op = replace(
+                    op, cancel_attempts=current.cancel_attempts,
+                    cancel_retry_at=current.cancel_retry_at,
+                )
             if current.exchange_id is not None:
                 if (
                     result.exchange_id is not None
@@ -201,7 +229,8 @@ class Reconciler:
                     status=result.status,
                     exchange_id=result.exchange_id or op.exchange_id,
                     checked_at=self.clock() if self.clock else now,
-                )
+                ),
+                transfer=result.transfer,
             )
         operations = repo.operations(active_only=True)
         for op in operations:
@@ -276,6 +305,11 @@ class Reconciler:
         repo.save_tracked_orders(tracked)
         runtime = repo.runtime()
         since = repo.load("fills_since", utc(now) - timedelta(hours=24))
+        checkpoint = repo.load("spot_checkpoint")
+        if checkpoint is not None:
+            since = min(
+                utc(since), utc(checkpoint["account"].ts) - timedelta(seconds=1)
+            )
         if tracked:
             totals = repo.fill_totals(
                 cfg.symbol, (o.order_id for o in tracked.values())
@@ -301,11 +335,34 @@ class Reconciler:
                 runtime, guard=replace(runtime.guard, filled_bnb=episode.filled_bnb)
             )
             repo.save("runtime", runtime)
-        repo.save("fills_since", utc(now) - timedelta(seconds=60))
+        recovery_since = utc(now) - timedelta(hours=49)
+        if checkpoint is not None:
+            recovery_since = min(
+                recovery_since, utc(checkpoint["account"].ts) - timedelta(seconds=1)
+            )
+        pending_transfers = tuple(
+            op for op in repo.operations(unresolved_only=True)
+            if op.kind == OperationKind.TRANSFER
+        )
+        if pending_transfers:
+            recovery_since = min(
+                recovery_since,
+                min(utc(op.created_at) for op in pending_transfers) - timedelta(minutes=1),
+            )
         transfers = self._read(
-            exchange.fetch_recent_transfers, utc(now) - timedelta(hours=49), now
+            exchange.fetch_recent_transfers, recovery_since, now
         )
         repo.save_transfers(transfers)
+        # Income IDs belong to the futures API's own namespace; they must never
+        # be treated as universal-transfer IDs. Retain the signed flow evidence.
+        income_since = [
+            self._income_since(op) for op in pending_transfers
+            if op.status == OperationStatus.CONFIRMED and op.balance_before is not None
+        ]
+        if income_since:
+            repo.save_futures_income(
+                self._read(exchange.fetch_futures_income, min(income_since), now)
+            )
         # Balance is the source of truth for net inventory; fills are for audit
         # and gross guard allowance only, never added on top of this balance.
         account = self._read(exchange.fetch_account_snapshot)
@@ -335,6 +392,9 @@ class Reconciler:
         ):
             if repo.load("spot_checkpoint") is not None or not external_pending:
                 spot_settled = self._settle_spot(account)
+            if spot_settled:
+                repo.save("fills_since", utc(now) - timedelta(seconds=60))
+            futures_issues = {}
             for op in repo.operations(active_only=True):
                 if (
                     op.status != OperationStatus.CONFIRMED
@@ -343,7 +403,7 @@ class Reconciler:
                     continue
                 settled = spot_settled and (
                     op.kind == OperationKind.ORDER
-                    or _futures_transfer_settled(op, account)
+                    or self._futures_transfer_settled(op, account, futures_issues)
                 )
                 if op.balance_pending == settled:
                     op = replace(op, balance_pending=not settled)
@@ -351,6 +411,7 @@ class Reconciler:
                 previous = tracked.get(op.client_id)
                 if settled and previous is not None and not previous.is_open:
                     repo.retire_order(op.client_id)
+            repo.save("futures_settlement_issue", futures_issues or None)
         active = tuple(o for o in orders.values() if o.is_open)
         unresolved = repo.operations(unresolved_only=True)
         pending = PendingState(
@@ -429,17 +490,11 @@ class Reconciler:
         repo, cfg = self.repository, self.cfg
         checkpoint = repo.load("spot_checkpoint")
         if checkpoint is None:
-            if repo.operations(active_only=True):
-                repo.save(
-                    "spot_settlement_issue",
-                    {"reason": "Legacy active intent has no trusted spot baseline"},
-                )
-                return False
             repo.save(
-                "spot_checkpoint", {"account": account, "cursor": repo.wallet_cursor()}
+                "spot_settlement_issue",
+                {"reason": "No trusted spot baseline; stop external activity and run explicit baseline initialization"},
             )
-            repo.save("spot_settlement_issue", None)
-            return True
+            return False
         before = checkpoint["account"]
         expected = {"BNB": before.spot_bnb, cfg.quote_asset: before.spot_usd}
         missing = []
@@ -589,7 +644,8 @@ class Reconciler:
                     status=result.status,
                     balance_pending=True,
                     checked_at=self.clock() if self.clock else now,
-                )
+                ),
+                transfer=result.transfer,
             )
             self.repository.event(
                 now,
@@ -597,33 +653,130 @@ class Reconciler:
                 {"client_id": client_id, "transfer_id": transfer_id},
             )
 
+    @staticmethod
+    def _income_since(op):
+        return utc(op.balance_before.ts) - timedelta(seconds=1)
 
-def _futures_transfer_settled(op, account):
-    """Spot coverage is checked globally; a transfer also needs futures evidence."""
-    before, p = op.balance_before, op.payload
-    if before is None or op.balance_fill_cursor is None:
+    def _futures_transfer_settled(self, op, account, issues):
+        """Explain the exact wallet delta with authenticated signed income.
+
+        updateTime bounds an observation, never substitutes for receipts. The
+        two APIs' transfer IDs are deliberately not joined: compare signed flow
+        totals for the same asset/interval, then reconcile the entire balance.
+        """
+        before, p, repo = op.balance_before, op.payload, self.repository
+        if before is None or before.ts is None:
+            issues[op.client_id] = {"reason": "Missing pre-transfer futures baseline"}
+            return False
+        field = "contract_bnb" if p.asset == "BNB" else "contract_quote_balance"
+        version = (
+            "contract_bnb_updated_at" if p.asset == "BNB" else "contract_quote_updated_at"
+        )
+        previous, actual = getattr(before, field), getattr(account, field)
+        lower = utc(getattr(before, version) or before.ts)
+        upper = utc(getattr(account, version) or account.ts)
+        since = self._income_since(op)
+        receipt = repo.transfer_record(op.exchange_id)
+        valid = (
+            previous is not None and actual is not None
+            and previous.is_finite() and actual.is_finite()
+            and lower <= utc(before.ts) + timedelta(seconds=1)
+            and lower < upper <= utc(account.ts) + timedelta(seconds=1)
+            and receipt is not None and receipt.status == OperationStatus.CONFIRMED
+            and (receipt.asset, receipt.amount, receipt.from_account, receipt.to_account)
+            == (p.asset, p.amount, p.from_account, p.to_account)
+        )
+        income = tuple(
+            r for r in repo.futures_income_since(since)
+            if r.asset == p.asset and lower < utc(r.ts) <= upper
+        )
+        transfers = tuple(
+            t for t in repo.transfers_since(since)
+            if t.asset == p.asset and t.status == OperationStatus.CONFIRMED
+            and lower < utc(t.ts) <= upper
+        )
+        wallet_flows = tuple(
+            t.amount if t.to_account == "USDⓈ-M Futures" else -t.amount
+            for t in transfers
+        )
+        income_flows = tuple(r.amount for r in income if r.income_type == "TRANSFER")
+        # Check both directions, so opposite transfers cannot hide each other.
+        def flows(values):
+            return (
+                sum((x for x in values if x > 0), ZERO),
+                sum((x for x in values if x < 0), ZERO),
+            )
+
+        expected = (
+            previous + sum((r.amount for r in income), ZERO)
+            if previous is not None else None
+        )
+        if (
+            valid and receipt in transfers
+            and flows(wallet_flows) == flows(income_flows) and expected == actual
+        ):
+            return True
+        issues[op.client_id] = {
+            "asset": p.asset, "before": previous, "expected": expected, "actual": actual,
+            "from": lower, "through": upper,
+            "wallet_transfer_flows": flows(wallet_flows),
+            "income_transfer_flows": flows(income_flows),
+            "income_receipts": tuple((r.income_type, r.transaction_id) for r in income),
+            "reason": "Futures balance or transfer flow lacks complete matching evidence",
+        }
         return False
-    bnb = p.asset == "BNB"
-    futures_field = "contract_bnb" if bnb else "contract_quote_balance"
-    spot_delta = p.amount if p.to_account == "SPOT" else -p.amount
-    value, previous = getattr(account, futures_field), getattr(before, futures_field)
-    if value is None or not value.is_finite():
-        return False
-    updated_at = (
-        account.contract_bnb_updated_at if bnb else account.contract_quote_updated_at
-    )
-    # Per-asset futures updateTime can prove a later revision containing fees/PnL.
-    # The spot account's metadata updateTime is not an asset balance watermark.
-    # Include the adapter's permitted 1s clock skew; waiting alone proves nothing.
-    if (
-        updated_at is not None
-        and op.checked_at is not None
-        and utc(op.checked_at) + timedelta(seconds=1)
-        < utc(updated_at)
-        <= utc(account.ts) + timedelta(seconds=1)
-    ):
-        return True
-    if previous is None or not previous.is_finite():
-        return False
-    expected_futures = previous - spot_delta
-    return value >= expected_futures if spot_delta < 0 else value <= expected_futures
+
+    def initialize_spot_baseline(self, *, operator, reason, now):
+        """Operator attests quiescence; bracket reads reject observable races.
+
+        Equal balances alone are not proof of quiescence. This command only
+        creates a first checkpoint, never repairs or overwrites an existing one.
+        """
+        if not operator.strip() or not reason.strip():
+            raise ValueError("Baseline initialization requires operator and quiescence reason")
+        repo, exchange, cfg = self.repository, self.exchange, self.cfg
+        with repo.exclusive():
+            if repo.load("spot_checkpoint") is not None or repo.operations(
+                active_only=True
+            ):
+                raise ValueError("Initialization requires no checkpoint or active intents")
+            before = self._read(exchange.fetch_account_snapshot)
+            before_checked_at = self.clock() if self.clock else now
+            self.refresh(self.clock() if self.clock else now)
+            after = self._read(exchange.fetch_account_snapshot)
+            end = self.clock() if self.clock else now
+            if not (
+                valid_account_snapshot(before, before_checked_at, cfg)
+                and valid_account_snapshot(after, end, cfg)
+            ):
+                raise ValueError("Initialization requires fresh valid account snapshots")
+            fields = ("spot_bnb", "spot_usd", "reserved_spot_bnb", "reserved_spot_usd")
+            if (
+                any(getattr(before, f) != getattr(after, f) for f in fields)
+                or after.reserved_spot_bnb or after.reserved_spot_usd
+            ):
+                raise ValueError("Spot activity during initialization; restore quiescence first")
+            start = utc(before.ts) - timedelta(seconds=1)
+            # Catch receipts that appeared between the history cutoff and the
+            # second balance read, including offsetting trades with zero net delta.
+            for symbol in dict.fromkeys((cfg.symbol, *cfg.spot_activity_symbols)):
+                if self._read(exchange.fetch_open_orders, symbol):
+                    raise ValueError("Open orders prevent quiescent initialization")
+                if self._read(exchange.fetch_recent_fills, symbol, start, end):
+                    raise ValueError("Recent spot executions prevent quiescent initialization")
+            transfers = self._read(exchange.fetch_recent_transfers, start, end)
+            if any(t.asset in {"BNB", cfg.quote_asset} for t in transfers):
+                raise ValueError("Recent transfers prevent quiescent initialization")
+            if any(
+                t.status in {OperationStatus.PENDING, OperationStatus.UNKNOWN}
+                for t in repo.transfers_since(utc(now) - timedelta(hours=49))
+            ):
+                raise ValueError("Pending transfers prevent quiescent initialization")
+            repo.initialize_spot_checkpoint(
+                after, {
+                    "operator": operator, "reason": reason,
+                    "before": before, "after": after,
+                    "symbols": (cfg.symbol, *cfg.spot_activity_symbols),
+                },
+            )
+            return after

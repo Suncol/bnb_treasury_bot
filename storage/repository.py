@@ -57,7 +57,7 @@ class Repository:
     def _migrate(self):
         # Preserve rowids: outstanding legacy transfer cursors refer to fills.
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version > 1:
+        if version > 2:
             raise ValueError("Database schema is newer than this controller")
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
@@ -110,6 +110,8 @@ class Repository:
                 "CREATE TABLE IF NOT EXISTS episodes (id TEXT PRIMARY KEY, started REAL NOT NULL, ended REAL, data TEXT NOT NULL)",
                 "CREATE INDEX IF NOT EXISTS episodes_started ON episodes(started DESC)",
                 "CREATE TABLE IF NOT EXISTS wallet_events (id INTEGER PRIMARY KEY AUTOINCREMENT, reference TEXT UNIQUE NOT NULL, ts REAL NOT NULL, data TEXT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS futures_income (income_type TEXT NOT NULL, transaction_id TEXT NOT NULL, ts REAL NOT NULL, data TEXT NOT NULL, PRIMARY KEY(income_type,transaction_id))",
+                "CREATE INDEX IF NOT EXISTS futures_income_time ON futures_income(ts)",
             ):
                 self.db.execute(statement)
             if version == 0:
@@ -140,7 +142,7 @@ class Repository:
                     "SELECT data FROM transfers ORDER BY rowid"
                 ).fetchall():
                     self._transfer_event(loads(data))
-                self.db.execute("PRAGMA user_version=1")
+            self.db.execute("PRAGMA user_version=2")
 
     def acquire_controller(self):
         """One process owns execution/maintenance for its entire lifetime."""
@@ -354,21 +356,6 @@ class Repository:
         if operation.status != OperationStatus.PENDING:
             raise ValueError("New operation must be PENDING")
         with self.db:
-            if (
-                operation.balance_before is not None
-                and self.load("spot_checkpoint") is None
-            ):
-                self.db.execute(
-                    "INSERT INTO kv VALUES ('spot_checkpoint',?)",
-                    (
-                        dumps(
-                            {
-                                "account": operation.balance_before,
-                                "cursor": self.wallet_cursor(),
-                            }
-                        ),
-                    ),
-                )
             self.db.execute(
                 "INSERT INTO operations(client_id,scope,status,created,data,kind,exchange_id,unresolved,active) VALUES (?,?,?,?,?,?,?,?,?)",
                 (
@@ -390,9 +377,21 @@ class Repository:
                 )
 
     def update_operation(
-        self, operation: Operation, runtime: RuntimeState | None = None
+        self, operation: Operation, runtime: RuntimeState | None = None,
+        *, transfer=None, event=None,
     ):
         with self.db:
+            if transfer is not None:
+                p = operation.payload
+                if (
+                    operation.kind != OperationKind.TRANSFER
+                    or (transfer.transfer_id, transfer.asset, transfer.amount,
+                        transfer.from_account, transfer.to_account, transfer.status)
+                    != (operation.exchange_id, p.asset, p.amount,
+                        p.from_account, p.to_account, operation.status)
+                ):
+                    raise ValueError("Transfer receipt contradicts operation identity")
+                self._save_transfers((transfer,))
             result = self.db.execute(
                 "UPDATE operations SET status=?,data=?,exchange_id=?,unresolved=?,active=CASE WHEN ?='FAILED' THEN 0 ELSE active END WHERE client_id=?",
                 (
@@ -411,6 +410,28 @@ class Repository:
                     "INSERT INTO kv VALUES ('runtime',?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
                     (dumps(runtime),),
                 )
+            if event is not None:
+                at, kind, data = event
+                self.db.execute(
+                    "INSERT INTO events(ts,kind,data) VALUES (?,?,?)",
+                    (utc(at).timestamp(), kind, dumps(data)),
+                )
+
+    def initialize_spot_checkpoint(self, account, evidence):
+        """Explicit maintenance acceptance; never a reset of an existing ledger."""
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            if self.load("spot_checkpoint") is not None or self.operations(active_only=True):
+                raise ValueError("Initialization requires an empty active journal and no checkpoint")
+            self.db.execute(
+                "INSERT INTO kv VALUES ('spot_checkpoint',?)",
+                (dumps({"account": account, "cursor": self.wallet_cursor()}),),
+            )
+            self.db.execute("DELETE FROM kv WHERE key='spot_settlement_issue'")
+            self.db.execute(
+                "INSERT INTO events(ts,kind,data) VALUES (?,?,?)",
+                (utc(account.ts).timestamp(), "SPOT_BASELINE_INITIALIZED", dumps(evidence)),
+            )
 
     def operations(
         self, unresolved_only=False, *, active_only=False
@@ -602,32 +623,59 @@ class Repository:
 
     def save_transfers(self, transfers):
         with self.db:
-            for transfer in transfers:
-                if not transfer.amount.is_finite() or transfer.amount <= 0:
-                    raise ValueError("Invalid transfer amount")
-                previous = self.db.execute(
-                    "SELECT data FROM transfers WHERE transfer_id=?",
-                    (transfer.transfer_id,),
+            self._save_transfers(transfers)
+
+    def _save_transfers(self, transfers):
+        for transfer in transfers:
+            if not transfer.amount.is_finite() or transfer.amount <= 0:
+                raise ValueError("Invalid transfer amount")
+            old = self.transfer_record(transfer.transfer_id)
+            if old is not None:
+                if old == transfer:
+                    continue
+                if replace(old, status=transfer.status) != transfer or (
+                    old.status in {OperationStatus.CONFIRMED, OperationStatus.FAILED}
+                    and old.status != transfer.status
+                ):
+                    raise ValueError("Conflicting transfer evidence")
+            self._transfer_event(transfer)
+            self.db.execute(
+                "INSERT INTO transfers VALUES (?,?,?) ON CONFLICT(transfer_id) DO UPDATE SET data=excluded.data",
+                (transfer.transfer_id, utc(transfer.ts).timestamp(), dumps(transfer)),
+            )
+
+    def transfer_record(self, transfer_id):
+        row = self.db.execute(
+            "SELECT data FROM transfers WHERE transfer_id=?", (transfer_id,)
+        ).fetchone()
+        return loads(row[0]) if row else None
+
+    def save_futures_income(self, records):
+        with self.db:
+            for record in records:
+                if not record.amount.is_finite() or not all(
+                    (record.income_type, record.transaction_id, record.asset)
+                ):
+                    raise ValueError("Invalid futures income receipt")
+                old = self.db.execute(
+                    "SELECT data FROM futures_income WHERE income_type=? AND transaction_id=?",
+                    (record.income_type, record.transaction_id),
                 ).fetchone()
-                if previous:
-                    old = loads(previous[0])
-                    if old == transfer:
-                        continue
-                    if replace(old, status=transfer.status) != transfer or (
-                        old.status
-                        in {OperationStatus.CONFIRMED, OperationStatus.FAILED}
-                        and old.status != transfer.status
-                    ):
-                        raise ValueError("Conflicting transfer evidence")
-                self._transfer_event(transfer)
+                if old is not None:
+                    if loads(old[0]) != record:
+                        raise ValueError("Conflicting futures income evidence")
+                    continue
                 self.db.execute(
-                    "INSERT INTO transfers VALUES (?,?,?) ON CONFLICT(transfer_id) DO UPDATE SET data=excluded.data",
-                    (
-                        transfer.transfer_id,
-                        utc(transfer.ts).timestamp(),
-                        dumps(transfer),
-                    ),
+                    "INSERT INTO futures_income VALUES (?,?,?,?)",
+                    (record.income_type, record.transaction_id,
+                     utc(record.ts).timestamp(), dumps(record)),
                 )
+
+    def futures_income_since(self, since):
+        return tuple(loads(row[0]) for row in self.db.execute(
+            "SELECT data FROM futures_income WHERE ts>=? ORDER BY ts,income_type,transaction_id",
+            (utc(since).timestamp(),),
+        ))
 
     def transfers_since(self, since):
         return tuple(

@@ -110,12 +110,12 @@ def test_legacy_migration_preserves_fill_rowids_and_pending_intents(tmp_path):
     assert repo.wallet_changes(0)[0][1] == "trade:BNBUSDT:old-fill"
     repo.close()
     reopened = Repository(path)
-    assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 2
     assert len(reopened.wallet_changes(0)) == 1
     reopened.close()
 
 
-def test_intent_checkpoint_and_runtime_are_one_transaction(tmp_path):
+def test_failed_intent_never_creates_an_implicit_checkpoint(tmp_path):
     repo = Repository(tmp_path / "atomic.db")
     now = make_engine_inputs().now
     repo.save("runtime", repo.runtime())
@@ -167,7 +167,7 @@ def test_late_fill_only_repairs_its_closed_episode_and_sell_is_not_acquisition()
     repo.close()
 
 
-def test_legacy_closed_order_archive_does_not_block_initial_balance_checkpoint(
+def test_legacy_closed_archive_requires_explicit_baseline_initialization(
     tmp_path,
 ):
     from core.models import OrderView
@@ -212,6 +212,10 @@ def test_legacy_closed_order_archive_does_not_block_initial_balance_checkpoint(
     repo = Repository(path)
     assert repo.operations() == (op,)  # Audit history remains intact.
     assert not repo.operations(active_only=True)
+    reconciler = Reconciler(exchange, repo, make_strategy_config())
+    assert reconciler.refresh(now)[2].unresolved
+    assert repo.load("spot_checkpoint") is None
+    reconciler.initialize_spot_baseline(operator="test", reason="quiescent migrated account", now=now)
     assert (
         not Reconciler(exchange, repo, make_strategy_config())
         .refresh(now)[2]

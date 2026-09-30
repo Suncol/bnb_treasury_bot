@@ -17,7 +17,10 @@ from storage.repository import Repository
 
 from .alert_service import AlertService, LogSink, WebhookSink
 from .binance_adapter import BinanceAdapter
+from .exchange_adapter import ExchangeError, RequestDeferred
+from .executor import Executor
 from .market_stream import MarketStream
+from .read_backoff import clear_read_backoff, record_read_failure, retry_deadline
 from .reconciliation import Reconciler
 from .runner import Runner
 
@@ -61,19 +64,28 @@ def main():
         help="Verify external trade receipts since the frozen balance checkpoint; exits without trading",
     )
     parser.add_argument(
-        "--operator", help="Operator identity recorded with evidence import"
+        "--operator", help="Operator identity recorded with evidence maintenance"
     )
-    parser.add_argument("--reason", help="Audit reason for evidence import")
+    parser.add_argument("--reason", help="Audit reason for evidence maintenance")
+    parser.add_argument(
+        "--initialize-spot-baseline",
+        action="store_true",
+        help="Attest that external spot activity is stopped and initialize a new ledger; never resets a checkpoint",
+    )
     args = parser.parse_args()
     if any(
         not value.is_finite() or value < 0
         for value in (args.min_transfer_bnb, args.min_transfer_usd)
     ):
         parser.error("Transfer minima must be finite and nonnegative")
-    if args.bind_transfer_id and args.import_spot_trades:
+    if sum(bool(x) for x in (
+        args.bind_transfer_id, args.import_spot_trades, args.initialize_spot_baseline
+    )) > 1:
         parser.error("Use one maintenance action at a time")
-    if args.import_spot_trades and (not args.operator or not args.reason):
-        parser.error("Evidence import requires --operator and --reason")
+    if (args.import_spot_trades or args.initialize_spot_baseline) and (
+        not args.operator or not args.reason
+    ):
+        parser.error("Evidence maintenance requires --operator and --reason")
     cfg = load_config(args.config)
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
@@ -93,6 +105,10 @@ def main():
                             "spot_settlement_issue"
                         ),
                         "account_identity": repository.load("account_identity"),
+                        "transport_backoff": repository.load("transport_backoff"),
+                        "futures_settlement_issue": repository.load(
+                            "futures_settlement_issue"
+                        ),
                         "storage": repository.health(),
                     }
                 )
@@ -101,6 +117,8 @@ def main():
             repository.close()
         return
     feed = alerts = None
+    exchange = None
+    authenticated = False
     try:
         # Read-only status above does not participate in execution ownership.
         # Every writer/maintenance command takes the same lifetime lease.
@@ -113,7 +131,7 @@ def main():
             min_transfer_bnb=args.min_transfer_bnb,
             min_transfer_usd=args.min_transfer_usd,
         )
-        exchange.request_not_before = repository.runtime().read_retry_at
+        exchange.request_not_before = retry_deadline(repository)
         # Restart and mode changes must honor the saved cooldown before even
         # authenticating the database identity. Shutdown remains interruptible.
         if exchange.request_not_before is not None:
@@ -132,10 +150,20 @@ def main():
             sha256(dumps(cfg).encode()).hexdigest(),
             datetime.now(timezone.utc),
         )
+        authenticated = True
+        if args.initialize_spot_baseline:
+            Reconciler(exchange, repository, cfg).initialize_spot_baseline(
+                operator=args.operator,
+                reason=args.reason,
+                now=datetime.now(timezone.utc),
+            )
+            clear_read_backoff(repository)
+            return
         if args.bind_transfer_id:
             Reconciler(exchange, repository, cfg).bind_transfer_id(
                 *args.bind_transfer_id, datetime.now(timezone.utc)
             )
+            clear_read_backoff(repository)
             return
         if args.import_spot_trades:
             Reconciler(exchange, repository, cfg).import_spot_trades(
@@ -152,6 +180,7 @@ def main():
                     }
                 )
             )
+            clear_read_backoff(repository)
             return
         feed = MarketStream(cfg.symbol, cfg.crash_guard).start()
         exchange.feed = feed
@@ -177,6 +206,14 @@ def main():
             stop.wait(
                 max(0, cfg.crash_guard.check_seconds - (time.monotonic() - started))
             )
+    except (ExchangeError, TimeoutError, ConnectionError) as exc:
+        record_read_failure(
+            repository, exc, datetime.now(timezone.utc),
+            authenticated=authenticated, exchange=exchange,
+        )
+        if authenticated and not isinstance(exc, RequestDeferred):
+            Executor(exchange, repository, cfg).note_failure(reason=type(exc).__name__)
+        raise
     finally:
         if feed is not None:
             feed.close()

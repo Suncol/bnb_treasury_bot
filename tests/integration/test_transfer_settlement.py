@@ -67,20 +67,20 @@ def test_usd_settlement_uses_both_wallets_and_blocks_direct_resubmission(tmp_pat
     repo.close()
 
 
-def test_later_futures_fee_revision_releases_gate_but_elapsed_time_does_not(tmp_path):
+def test_futures_fee_requires_real_income_and_arbitrary_revision_does_not_release(tmp_path):
     exchange, repo, runner = setup(tmp_path, FakeExchange(make_account(spot_bnb=D("8.5"))))
     transfer = AssetTransferPlan("BNB", D("8"), "SPOT", "USDⓈ-M Futures", "test")
     runner.executor.execute(transfer, exchange.now, repo.runtime().state)
-    exchange.account = replace(
-        exchange.account, contract_bnb=exchange.account.contract_bnb - D("0.01"),
-        contract_bnb_updated_at=exchange.now,
-    )
+    exchange.futures_change("BNB", D("-0.01"))
+    receipt = exchange.income.pop()
     assert runner.reconciler.refresh(exchange.now)[2].unresolved
     confirmed_at = repo.operations()[0].checked_at
     exchange.now += timedelta(seconds=11)
     assert runner.reconciler.refresh(exchange.now)[2].unresolved
     assert repo.operations()[0].checked_at == confirmed_at
     exchange.account = replace(exchange.account, contract_bnb_updated_at=exchange.now)
+    assert runner.reconciler.refresh(exchange.now)[2].unresolved
+    exchange.income.append(receipt)
     assert not runner.reconciler.refresh(exchange.now)[2].unresolved
     assert len(exchange.writes) == 1
     repo.close()

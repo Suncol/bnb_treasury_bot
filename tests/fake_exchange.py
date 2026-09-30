@@ -1,8 +1,9 @@
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from core.models import (
     Fill,
+    FuturesIncome,
     OperationKind,
     OperationResult,
     OperationStatus,
@@ -11,6 +12,7 @@ from core.models import (
 )
 from services.exchange_adapter import RequestRejected
 from tests.helpers import D, make_account, make_filters, make_market
+from core.time_utils import utc
 
 
 class FakeExchange:
@@ -27,6 +29,10 @@ class FakeExchange:
                 contract_quote_balance=self.account.contract_max_withdraw_amount,
             )
         self.orders, self.transfers, self.fills, self.writes = {}, {}, [], []
+        self.income = []
+        self.account = replace(self.account,
+            contract_bnb_updated_at=self.account.contract_bnb_updated_at or self.now - timedelta(seconds=1),
+            contract_quote_updated_at=self.account.contract_quote_updated_at or self.now - timedelta(seconds=1))
         self.hold_transfers = False
         self.lose_response = None
         self.reject_kind = None
@@ -83,7 +89,17 @@ class FakeExchange:
         )
 
     def fetch_recent_transfers(self, since, until):
-        return tuple(self.transfers.values())
+        return tuple(t for t in self.transfers.values() if utc(since) <= utc(t.ts) <= utc(until))
+
+    def fetch_futures_income(self, since, until):
+        return tuple(r for r in self.income if utc(since) <= utc(r.ts) <= utc(until))
+
+    def futures_change(self, asset, amount, income_type="COMMISSION"):
+        self.now += timedelta(milliseconds=1)
+        field = "contract_bnb" if asset == "BNB" else "contract_quote_balance"
+        version = "contract_bnb_updated_at" if asset == "BNB" else "contract_quote_updated_at"
+        self.account = replace(self.account, **{field: getattr(self.account, field) + amount, version: self.now})
+        self.income.append(FuturesIncome(income_type, str(len(self.income) + 10000), asset, amount, self.now))
 
     def fill(self, order_id, qty):
         o = self.orders[order_id]
@@ -114,11 +130,13 @@ class FakeExchange:
         t = self.transfers[transfer_id]
         if t.status == OperationStatus.CONFIRMED:
             return
+        self.now += timedelta(milliseconds=1)
         if t.asset == "BNB":
             self.account = replace(
                 self.account,
                 spot_bnb=self.account.spot_bnb - t.amount,
                 contract_bnb=self.account.contract_bnb + t.amount,
+                contract_bnb_updated_at=self.now,
             )
         else:
             amount = t.amount if t.to_account == "SPOT" else -t.amount
@@ -128,7 +146,11 @@ class FakeExchange:
                 contract_max_withdraw_amount=self.account.contract_max_withdraw_amount
                 - amount,
                 contract_quote_balance=self.account.contract_quote_balance - amount,
+                contract_quote_updated_at=self.now,
             )
+        self.income.append(FuturesIncome("TRANSFER", "income-" + transfer_id, t.asset,
+                                        t.amount if t.to_account == "USDⓈ-M Futures" else -t.amount, self.now))
+        # Universal history timestamps are stable across status changes.
         self.transfers[transfer_id] = replace(t, status=OperationStatus.CONFIRMED)
 
     def submit(self, op):
@@ -161,6 +183,7 @@ class FakeExchange:
             self.orders[p.order_id] = replace(order, status="CANCELED")
             result = OperationResult(OperationStatus.CONFIRMED, p.order_id)
         else:
+            self.now += timedelta(milliseconds=1)
             self.transfers[exchange_id] = TransferRecord(
                 exchange_id,
                 p.asset,
@@ -183,12 +206,12 @@ class FakeExchange:
             if op.exchange_id is None or op.exchange_id not in self.transfers:
                 return OperationResult(OperationStatus.UNKNOWN)
             return OperationResult(
-                self.transfers[op.exchange_id].status, op.exchange_id
+                self.transfers[op.exchange_id].status, op.exchange_id, self.transfers[op.exchange_id]
             )
         order = self.fetch_order(
             op.payload.symbol,
-            client_id=op.client_id,
-            order_id=getattr(op.payload, "order_id", None),
+            client_id=op.client_id if op.exchange_id is None and op.kind == OperationKind.ORDER else None,
+            order_id=op.payload.order_id if op.kind == OperationKind.CANCEL else op.exchange_id,
         )
         if order is not None and (op.kind == OperationKind.ORDER or not order.is_open):
             return OperationResult(OperationStatus.CONFIRMED, order.order_id)

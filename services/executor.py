@@ -11,8 +11,11 @@ from core.models import (
     OrderPlan,
     RunMode,
 )
+from core.time_utils import utc
 
-from .exchange_adapter import RequestRejected
+from .exchange_adapter import ExchangeError, RequestRejected, order_matches_operation
+
+MAX_CANCEL_ATTEMPTS = 5
 
 
 def operation_scope(payload):
@@ -33,6 +36,14 @@ class Executor:
         self.exchange, self.repository, self.cfg = exchange, repository, cfg
         self.clock = clock or getattr(exchange, "clock", None)
 
+    def cancel_due(self, payload, now):
+        op = self.repository.cancel_operation(payload.symbol, payload.order_id)
+        return op is None or (
+            op.unresolved
+            and op.cancel_attempts < MAX_CANCEL_ATTEMPTS
+            and utc(now) >= utc(op.cancel_retry_at or op.created_at + timedelta(seconds=2))
+        )
+
     def execute(self, payload, now, state, *, starts_slice=False, account=None):
         kind, scope = operation_scope(payload)
         if kind == OperationKind.CANCEL:
@@ -40,7 +51,7 @@ class Executor:
                 payload.symbol, payload.order_id
             )
             if existing is not None:
-                return existing
+                return self._recover_cancel(existing, now)
         checker = getattr(self.exchange, "ensure_request_allowed", None)
         if checker is not None:
             checker(
@@ -53,6 +64,7 @@ class Executor:
                 runtime.run_mode == RunMode.PAUSED
                 or self.repository.operations(unresolved_only=True)
                 or self.repository.load("spot_settlement_issue")
+                or self.repository.load("spot_checkpoint") is None
             ):
                 raise RuntimeError(
                     "New operations require an unpaused, reconciled runtime"
@@ -97,14 +109,73 @@ class Executor:
                 "CANCEL_INTENT",
                 {"client_id": op.client_id, "order_id": payload.order_id},
             )
-            self.repository.event(
-                self.clock() if self.clock else now,
-                "CANCEL_SENT",
-                {"client_id": op.client_id},
+        return self._submit(op, now, previous_runtime)
+
+    def _recover_cancel(self, op, now):
+        if not self.cancel_due(op.payload, now):
+            return op
+        checker = getattr(self.exchange, "ensure_request_allowed", None)
+        if checker is not None:
+            checker(protective=True)
+        # Throttle queries too, including missing/stale terminal evidence. Never
+        # turn a missing order or an unverified owner into a new cancel attempt.
+        op = replace(op, cancel_retry_at=now + timedelta(seconds=5))
+        self.repository.update_operation(op)
+        owner = self.repository.order_operation(op.payload.order_id)
+        if owner is None or owner.status == OperationStatus.FAILED:
+            return op
+        try:
+            order = self.exchange.fetch_order(
+                op.payload.symbol, order_id=op.payload.order_id
+            )
+        except Exception as exc:
+            checked_at = self.clock() if self.clock else now
+            delay = max(5, float(getattr(exc, "retry_after", None) or 0))
+            self.repository.update_operation(
+                replace(
+                    op, cancel_retry_at=checked_at + timedelta(seconds=delay),
+                    checked_at=checked_at, error=type(exc).__name__,
+                )
+            )
+            raise
+        if order is None:
+            return op
+        if not order_matches_operation(order, owner):
+            raise ExchangeError("Cancel recovery found a conflicting order identity")
+        if not order.is_open:
+            return self.record_result(
+                replace(
+                    op, status=OperationStatus.CONFIRMED,
+                    exchange_id=order.order_id,
+                    checked_at=self.clock() if self.clock else now,
+                )
+            )
+        if order.status not in {"NEW", "PARTIALLY_FILLED"}:
+            return op
+        return self._submit(
+            op, self.clock() if self.clock else now, self.repository.runtime()
+        )
+
+    def _submit(self, op, now, previous_runtime):
+        kind = op.kind
+        if kind == OperationKind.CANCEL:
+            attempts = op.cancel_attempts + 1
+            op = replace(
+                op, cancel_attempts=attempts,
+                cancel_retry_at=now + timedelta(seconds=min(60, 2 ** attempts)),
+            )
+            # Intent, deadline and attempt number commit before the network.
+            self.repository.update_operation(
+                op, event=(now, "CANCEL_SENT", {
+                    "client_id": op.client_id, "order_id": op.payload.order_id,
+                    "attempt": attempts,
+                }),
             )
         cooldown = None
+        transfer = None
         try:
             result = self.exchange.submit(op)
+            transfer = result.transfer
             op = replace(
                 op, status=result.status, exchange_id=result.exchange_id, checked_at=now
             )
@@ -139,10 +210,12 @@ class Executor:
             runtime = replace(
                 runtime, read_retry_at=max(runtime.read_retry_at or cooldown, cooldown)
             )
+            if kind == OperationKind.CANCEL:
+                op = replace(op, cancel_retry_at=max(op.cancel_retry_at, cooldown))
         op = replace(op, checked_at=self.clock() if self.clock else now)
-        return self.record_result(op, runtime=runtime, submission=True)
+        return self.record_result(op, runtime=runtime, submission=True, transfer=transfer)
 
-    def record_result(self, op, *, runtime=None, submission=False):
+    def record_result(self, op, *, runtime=None, submission=False, transfer=None):
         """Commit a result and its continuation/circuit-breaker effects together."""
         runtime = runtime or self.repository.runtime()
         if op.status == OperationStatus.FAILED and op.kind == OperationKind.TRANSFER:
@@ -166,13 +239,18 @@ class Executor:
                 if op.kind == OperationKind.TRANSFER
                 else runtime.transfer_failures,
             )
-        self.repository.update_operation(op, runtime)
-        if op.kind == OperationKind.CANCEL and op.status == OperationStatus.CONFIRMED:
-            self.repository.event(
+        event = None
+        if op.kind == OperationKind.CANCEL:
+            event = (
                 op.checked_at,
-                "CANCEL_TERMINAL",
-                {"client_id": op.client_id, "order_id": op.payload.order_id},
+                "CANCEL_TERMINAL" if op.status == OperationStatus.CONFIRMED else "CANCEL_RESULT",
+                {
+                    "client_id": op.client_id, "order_id": op.payload.order_id,
+                    "attempt": op.cancel_attempts, "status": op.status.value,
+                    "error": op.error,
+                },
             )
+        self.repository.update_operation(op, runtime, transfer=transfer, event=event)
         return op
 
     @staticmethod

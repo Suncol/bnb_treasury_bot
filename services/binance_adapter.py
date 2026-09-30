@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from calendar import monthrange
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -28,6 +29,7 @@ from binance_sdk_wallet.wallet import Wallet
 from core.models import (
     AccountSnapshot,
     Fill,
+    FuturesIncome,
     MarketSnapshot,
     OperationKind,
     OperationResult,
@@ -710,6 +712,51 @@ class BinanceAdapter:
                 page += 1
         return tuple(transfers)
 
+    def fetch_futures_income(self, since, until):
+        # Respect the documented three-calendar-month retention. Do not accept
+        # a successful but truncated response as complete reconciliation evidence.
+        current = utc(self.clock())
+        month_index = current.year * 12 + current.month - 1 - 3
+        year, month = divmod(month_index, 12)
+        month += 1
+        cutoff = current.replace(
+            year=year, month=month,
+            day=min(current.day, monthrange(year, month)[1]),
+        )
+        if utc(since) < cutoff:
+            raise ExchangeError(
+                "Futures income exceeds supported retention; authenticated archival evidence required"
+            )
+        records = {}
+        start, end = millis(since), millis(until)
+        while start <= end:
+            stop = min(start + 7 * 86_400_000 - 1, end)
+            page = 1
+            while True:
+                rows = self._call(
+                    self.futures.get_income_history,
+                    start_time=start, end_time=stop, page=page, limit=1000,
+                    recv_window=5000,
+                )
+                for row in rows:
+                    if not start <= int(row["time"]) <= stop:
+                        raise ExchangeError("Futures income outside requested interval")
+                    record = FuturesIncome(
+                        row["incomeType"], str(row["tranId"]), row["asset"],
+                        D(row["income"]), timestamp(row["time"]),
+                    )
+                    key = record.income_type, record.transaction_id
+                    if key in records:
+                        raise ExchangeError("Futures income pagination repeated an identity")
+                    if not record.amount.is_finite():
+                        raise ExchangeError("Invalid futures income amount")
+                    records[key] = record
+                if len(rows) < 1000:
+                    break
+                page += 1
+            start = stop + 1
+        return tuple(records.values())
+
     def submit(self, operation):
         if not self.live:
             raise RequestRejected("Live mutations are disabled")
@@ -840,5 +887,5 @@ class BinanceAdapter:
                 p.from_account,
                 p.to_account,
             ):
-                return OperationResult(r.status, r.transfer_id)
+                return OperationResult(r.status, r.transfer_id, r)
         return OperationResult(OperationStatus.UNKNOWN, operation.exchange_id)

@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import logging
-import random
 import sqlite3
-import traceback
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -26,11 +24,12 @@ from core.replenishment_engine import build_cycle_plan
 from core.time_utils import age_seconds, fresh, utc
 from core.validation import valid_account_snapshot
 
-from .exchange_adapter import RequestDeferred
-from .executor import Executor
+from .exchange_adapter import ExchangeError, RequestDeferred
+from .executor import Executor, MAX_CANCEL_ATTEMPTS
 from .history import historical_metrics
 from .market_data import MarketWindows
 from .reconciliation import Reconciler
+from .read_backoff import clear_read_backoff, record_read_failure, retry_deadline
 
 
 class Runner:
@@ -203,37 +202,9 @@ class Runner:
                 "Storage failed; controller stopped without further writes"
             )
             raise exc
-        runtime = self.repository.runtime()
-        failures = runtime.read_failures + (not isinstance(exc, RequestDeferred))
-        delay = max(
-            float(getattr(exc, "retry_after", None) or 0),
-            min(60, 2 ** min(failures, 6)),
-        )
-        retry_at = self.clock() + timedelta(seconds=delay + random.uniform(0, 1))
-        self.repository.save(
-            "runtime", replace(runtime, read_failures=failures, read_retry_at=retry_at)
-        )
+        record_read_failure(self.repository, exc, self.clock(), exchange=self.exchange)
         if not isinstance(exc, RequestDeferred):
             self.executor.note_failure(reason=type(exc).__name__)
-            self.repository.event(
-                self.clock(),
-                "API_ERROR",
-                {
-                    "type": type(exc).__name__,
-                    "endpoint": getattr(exc, "endpoint", None),
-                    "http_status": getattr(exc, "http_status", None),
-                    "code": getattr(exc, "code", None),
-                    "retry_at": retry_at,
-                    "request_weights": getattr(exc, "request_weights", None),
-                    "trace": tuple(
-                        f"{frame.filename}:{frame.lineno}:{frame.name}"
-                        for frame in traceback.extract_tb(exc.__traceback__)
-                    ),
-                },
-            )
-            logging.getLogger("bnb_treasury").warning(
-                "Read failed (%s); retry at %s", type(exc).__name__, retry_at
-            )
         # Never reuse a partially reconciled view for trading or guard recovery.
         self.cached_inputs = None
         self.last_reconciled_at = None
@@ -250,10 +221,18 @@ class Runner:
             # Exposure is unverified: cancel only journaled ordinary bids. No
             # filters, balances or transfer history are needed to address them.
             try:
-                for cancel in self.reconciler.protective_cancellations():
+                for cancel in self.reconciler.protective_cancellations(now=self.clock()):
                     self.executor.execute(cancel, self.clock(), runtime.state)
             except RequestDeferred:
                 pass  # Exchange cooldown covers protective requests too.
+            except (ExchangeError, TimeoutError, ConnectionError) as protection_error:
+                # A retry first queries its bound order. A failed protection
+                # query must not escape this failure boundary and stop the loop.
+                record_read_failure(
+                    self.repository, protection_error, self.clock(),
+                    exchange=self.exchange,
+                )
+                self.executor.note_failure(reason=type(protection_error).__name__)
         alerts = (
             Alert(
                 "WARNING",
@@ -293,7 +272,7 @@ class Runner:
         return MarketSnapshot(None, self.cfg.symbol, zero, zero, zero, zero, zero, zero)
 
     def _waiting_for_reads(self, market):
-        retry_at = self.repository.runtime().read_retry_at
+        retry_at = retry_deadline(self.repository)
         if retry_at is None or utc(self.clock()) >= utc(retry_at):
             return False
         self._priority_market = self._local_market(market)
@@ -325,12 +304,16 @@ class Runner:
                 runtime.guard.active,
                 runtime.guard.reasons,
             )
-            if guard.active and self.execute_enabled:
+            if self.execute_enabled:
                 for cancel in self.reconciler.protective_cancellations(
-                    guard=guard, now=now
+                    guard=guard if guard.active else None, now=now,
+                    retries_only=not guard.active,
                 ):
-                    self.executor.execute(cancel, self.clock(), runtime.state)
-                    self._priority_revision += 1
+                    previous = self.repository.cancel_operation(cancel.symbol, cancel.order_id)
+                    result = self.executor.execute(cancel, self.clock(), runtime.state)
+                    if (previous is None or previous.cancel_attempts != result.cancel_attempts
+                            or previous.status != result.status):
+                        self._priority_revision += 1
                 if changed:
                     self._publish(
                         (
@@ -404,6 +387,13 @@ class Runner:
                 ),
             )
         runtime = self.repository.runtime()
+        issue = self.repository.load("futures_settlement_issue")
+        if issue:
+            alerts += (Alert("WARNING", "FUTURES_SETTLEMENT", f"Uncovered futures flow: {issue}"),)
+        if any(op.kind == OperationKind.CANCEL and op.cancel_attempts >= MAX_CANCEL_ATTEMPTS
+               for op in self.repository.operations(unresolved_only=True)):
+            alerts += (Alert("CRITICAL", "CANCEL_RECOVERY_EXHAUSTED",
+                             "Cancel recovery exhausted; verify and cancel the bound order at the exchange"),)
         if runtime.pause_reason:
             alerts = tuple(alerts) + (
                 Alert("CRITICAL", "AUTO_PAUSED", runtime.pause_reason),
@@ -515,10 +505,8 @@ class Runner:
             )
         self._consume_stream_risk()
         now = self.clock()
+        clear_read_backoff(self.repository)
         runtime = self.repository.runtime()
-        if runtime.read_failures or runtime.read_retry_at:
-            runtime = replace(runtime, read_failures=0, read_retry_at=None)
-            self.repository.save("runtime", runtime)
         trusted = (
             consistent
             and not pending.unresolved
@@ -664,7 +652,7 @@ class Runner:
                     c
                     for c in plan.cancellations
                     if c.order_id not in used
-                    and not self.repository.cancel_recorded(c.symbol, c.order_id)
+                    and self.executor.cancel_due(c, self.clock())
                 ]
                 if candidates:
                     action, tag = candidates[0], candidates[0].order_id

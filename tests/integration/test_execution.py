@@ -20,6 +20,7 @@ from tests.unit.test_order_planner import make_state_decision
 def setup(tmp_path, exchange=None, state=ReplenishmentState.URGENT):
     exchange = exchange or FakeExchange()
     repo = Repository(tmp_path / "test.sqlite3")
+    repo.initialize_spot_checkpoint(exchange.fetch_account_snapshot(), {"operator": "test", "reason": "quiescent fixture"})
     repo.save("runtime", replace(repo.runtime(), state=state))
     runner = Runner(exchange, repo, make_strategy_config(), clock=lambda: exchange.now)
     return exchange, repo, runner

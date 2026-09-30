@@ -111,7 +111,7 @@ def test_stream_trigger_during_history_read_preempts_next_read(tmp_path):
 def test_retry_after_is_persistent_and_pause_does_not_restart_read_storm(
     tmp_path, monkeypatch
 ):
-    monkeypatch.setattr("services.runner.random.uniform", lambda *_: 0)
+    monkeypatch.setattr("services.read_backoff.random.uniform", lambda *_: 0)
     exchange, repo, runner = setup(tmp_path)
     calls = []
 
