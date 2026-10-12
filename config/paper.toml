@@ -1,0 +1,12 @@
+# 虚拟账户参数：这是测试场景，不是真实余额或币安费率。
+# 参数绑定执行数据库；修改后应使用新的 paper 数据库。
+[paper]
+initial_contract_usd = 100000.0
+initial_contract_bnb = 24.0
+initial_spot_usd = 0.0
+initial_spot_bnb = 0.5
+contract_unavailable_usd = 0.0
+spot_fee_rate = 0.001
+liquidity_participation = 0.10
+transfer_delay_seconds = 2.0
+bnb_consumption_per_hour = 0.04

@@ -9,9 +9,12 @@ from storage.repository import Repository
 class LogSink:
     name = "log"
 
+    def __init__(self, *, prefix=""):
+        self.prefix = prefix
+
     def send(self, alert, key):
         logging.getLogger("bnb_treasury").warning(
-            "%s %s: %s [%s]", alert.level, alert.code, alert.message, key
+            "%s%s %s: %s [%s]", self.prefix, alert.level, alert.code, alert.message, key
         )
 
 

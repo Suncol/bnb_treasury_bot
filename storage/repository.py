@@ -23,11 +23,15 @@ class Repository:
     reconcile/plan/execute sequence, without keeping a SQL transaction open.
     """
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, readonly=False):
         self.path = str(path)
         self._mutex = RLock()
         self._controller_lock = None
         self._lock_depth = 0
+        if readonly:
+            self.db = sqlite3.connect(Path(self.path).resolve().as_uri() + "?mode=ro",
+                                      uri=True, timeout=5, check_same_thread=False)
+            return
         if self.path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path, timeout=5, check_same_thread=False)
@@ -421,17 +425,21 @@ class Repository:
         """Explicit maintenance acceptance; never a reset of an existing ledger."""
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
-            if self.load("spot_checkpoint") is not None or self.operations(active_only=True):
-                raise ValueError("Initialization requires an empty active journal and no checkpoint")
-            self.db.execute(
-                "INSERT INTO kv VALUES ('spot_checkpoint',?)",
-                (dumps({"account": account, "cursor": self.wallet_cursor()}),),
-            )
-            self.db.execute("DELETE FROM kv WHERE key='spot_settlement_issue'")
-            self.db.execute(
-                "INSERT INTO events(ts,kind,data) VALUES (?,?,?)",
-                (utc(account.ts).timestamp(), "SPOT_BASELINE_INITIALIZED", dumps(evidence)),
-            )
+            self._initialize_spot_checkpoint(account, evidence)
+
+    def _initialize_spot_checkpoint(self, account, evidence):
+        """Caller owns the transaction, including atomic paper account bootstrap."""
+        if self.load("spot_checkpoint") is not None or self.operations(active_only=True):
+            raise ValueError("Initialization requires an empty active journal and no checkpoint")
+        self.db.execute(
+            "INSERT INTO kv VALUES ('spot_checkpoint',?)",
+            (dumps({"account": account, "cursor": self.wallet_cursor()}),),
+        )
+        self.db.execute("DELETE FROM kv WHERE key='spot_settlement_issue'")
+        self.db.execute(
+            "INSERT INTO events(ts,kind,data) VALUES (?,?,?)",
+            (utc(account.ts).timestamp(), "SPOT_BASELINE_INITIALIZED", dumps(evidence)),
+        )
 
     def operations(
         self, unresolved_only=False, *, active_only=False

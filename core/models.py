@@ -184,6 +184,28 @@ class PendingState:
 
 
 @dataclass(frozen=True)
+class PaperConfig:
+    initial_contract_usd: Decimal = Decimal("100000")
+    initial_contract_bnb: Decimal = Decimal("24")
+    initial_spot_usd: Decimal = Decimal("0")
+    initial_spot_bnb: Decimal = Decimal("0.5")
+    contract_unavailable_usd: Decimal = Decimal("0")
+    spot_fee_rate: Decimal = Decimal("0.001")
+    liquidity_participation: Decimal = Decimal("0.10")
+    transfer_delay_seconds: Decimal = Decimal("2")
+    bnb_consumption_per_hour: Decimal = Decimal("0.04")
+
+
+@dataclass(frozen=True)
+class ExecutionQuote:
+    ts: datetime
+    symbol: str
+    best_bid: Decimal
+    best_ask: Decimal
+    ask_qty: Decimal | None
+
+
+@dataclass(frozen=True)
 class MarketSnapshot:
     ts: datetime | None
     symbol: str

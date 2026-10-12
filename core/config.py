@@ -8,6 +8,7 @@ import tomllib
 from .models import (
     CrashGuardConfig,
     ExecutionConfig,
+    PaperConfig,
     RiskConfig,
     SchedulerConfig,
     StrategyConfig,
@@ -133,4 +134,25 @@ def load_config(path: str | Path) -> StrategyConfig:
         **exchange,
     )
     validate_config(cfg)
+    return cfg
+
+
+def validate_paper_config(cfg: PaperConfig) -> None:
+    for field in fields(cfg):
+        value = getattr(cfg, field.name)
+        if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
+            raise ValueError("Paper amounts must be finite nonnegative decimals")
+    if cfg.spot_fee_rate >= 1 or not 0 < cfg.liquidity_participation <= 1:
+        raise ValueError("Invalid paper fee or liquidity participation")
+    if cfg.contract_unavailable_usd > cfg.initial_contract_usd:
+        raise ValueError("Paper unavailable quote exceeds initial contract balance")
+
+
+def load_paper_config(path: str | Path) -> PaperConfig:
+    with open(path, "rb") as source:
+        data = tomllib.load(source, parse_float=Decimal)
+    if set(data) != {"paper"}:
+        raise ValueError("Paper configuration requires only a [paper] section")
+    cfg = _section(PaperConfig, data["paper"])
+    validate_paper_config(cfg)
     return cfg

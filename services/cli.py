@@ -1,4 +1,4 @@
-"""python -m services.cli --help. Does not trade unless --live is supplied."""
+"""python -m services.cli --help. --live trades on Binance; --paper executes virtually."""
 
 import argparse
 import logging
@@ -10,16 +10,18 @@ from decimal import Decimal
 from hashlib import sha256
 from threading import Event
 
-from core.config import load_config
+from core.config import load_config, load_paper_config
 from core.models import RunMode
 from storage.codec import dumps
 from storage.repository import Repository
+from storage.paper_ledger import PaperLedger, check_environment
 
 from .alert_service import AlertService, LogSink, WebhookSink
 from .binance_adapter import BinanceAdapter
 from .exchange_adapter import ExchangeError, RequestDeferred
 from .executor import Executor
 from .market_stream import MarketStream
+from .paper_exchange import PaperExchange
 from .read_backoff import clear_read_backoff, record_read_failure, retry_deadline
 from .reconciliation import Reconciler
 from .runner import Runner
@@ -28,12 +30,15 @@ from .runner import Runner
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config/strategy.toml")
-    parser.add_argument("--db", default="var/treasury.sqlite3")
-    parser.add_argument(
+    parser.add_argument("--db", help="Execution journal; defaults to var/paper.sqlite3 in paper, var/treasury.sqlite3 otherwise")
+    environment = parser.add_mutually_exclusive_group()
+    environment.add_argument(
         "--live",
         action="store_true",
         help="Enable actual Binance order, cancel and transfer requests",
     )
+    environment.add_argument("--paper", action="store_true", help="Execute using public quotes and a persistent virtual account")
+    parser.add_argument("--paper-config", help="Paper parameters; defaults to config/paper.toml, requires --paper")
     parser.add_argument(
         "--once",
         action="store_true",
@@ -73,6 +78,11 @@ def main():
         help="Attest that external spot activity is stopped and initialize a new ledger; never resets a checkpoint",
     )
     args = parser.parse_args()
+    if args.paper_config and not args.paper:
+        parser.error("--paper-config requires --paper")
+    if args.paper and (args.initialize_spot_baseline or args.import_spot_trades):
+        parser.error("Paper accounts initialize atomically; external spot trade import is unsupported")
+    args.db = args.db or ("var/paper.sqlite3" if args.paper else "var/treasury.sqlite3")
     if any(
         not value.is_finite() or value < 0
         for value in (args.min_transfer_bnb, args.min_transfer_usd)
@@ -93,26 +103,24 @@ def main():
     stop = Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    repository = Repository(args.db)
+    repository = Repository(args.db, readonly=args.paper and args.status)
     if args.status:
         try:
-            print(
-                dumps(
-                    {
-                        "runtime": repository.runtime(),
-                        "unresolved": repository.operations(unresolved_only=True),
-                        "spot_settlement_issue": repository.load(
-                            "spot_settlement_issue"
-                        ),
-                        "account_identity": repository.load("account_identity"),
-                        "transport_backoff": repository.load("transport_backoff"),
-                        "futures_settlement_issue": repository.load(
-                            "futures_settlement_issue"
-                        ),
-                        "storage": repository.health(),
-                    }
-                )
-            )
+            if args.paper:
+                repository.db.execute("BEGIN")  # One consistent WAL snapshot while the controller writes.
+            check_environment(repository, paper=args.paper)
+            status = {
+                "runtime": repository.runtime(),
+                "unresolved": repository.operations(unresolved_only=True),
+                "spot_settlement_issue": repository.load("spot_settlement_issue"),
+                "account_identity": repository.load("account_identity"),
+                "transport_backoff": repository.load("transport_backoff"),
+                "futures_settlement_issue": repository.load("futures_settlement_issue"),
+                "storage": repository.health(),
+            }
+            if args.paper:
+                status["paper"] = PaperLedger.status(repository)
+            print(dumps(status))
         finally:
             repository.close()
         return
@@ -123,14 +131,18 @@ def main():
         # Read-only status above does not participate in execution ownership.
         # Every writer/maintenance command takes the same lifetime lease.
         repository.acquire_controller()
-        exchange = BinanceAdapter(
-            os.environ.get("BINANCE_API_KEY", ""),
-            os.environ.get("BINANCE_API_SECRET", ""),
-            cfg,
-            live=args.live,
-            min_transfer_bnb=args.min_transfer_bnb,
-            min_transfer_usd=args.min_transfer_usd,
-        )
+        check_environment(repository, paper=args.paper)
+        if args.paper:
+            exchange = PaperExchange(
+                repository, cfg, load_paper_config(args.paper_config or "config/paper.toml"),
+                min_transfer_bnb=args.min_transfer_bnb, min_transfer_usd=args.min_transfer_usd,
+            )
+        else:
+            exchange = BinanceAdapter(
+                os.environ.get("BINANCE_API_KEY", ""),
+                os.environ.get("BINANCE_API_SECRET", ""), cfg, live=args.live,
+                min_transfer_bnb=args.min_transfer_bnb, min_transfer_usd=args.min_transfer_usd,
+            )
         exchange.request_not_before = retry_deadline(repository)
         # Restart and mode changes must honor the saved cooldown before even
         # authenticating the database identity. Shutdown remains interruptible.
@@ -184,11 +196,12 @@ def main():
             return
         feed = MarketStream(cfg.symbol, cfg.crash_guard).start()
         exchange.feed = feed
-        sinks = [LogSink()]
-        if os.environ.get("ALERT_WEBHOOK_URL"):
+        sinks = [LogSink(prefix="PAPER " if args.paper else "")]
+        if not args.paper and os.environ.get("ALERT_WEBHOOK_URL"):
             sinks.append(WebhookSink("webhook", os.environ["ALERT_WEBHOOK_URL"]))
         alerts = AlertService(repository, sinks)
-        runner = Runner(exchange, repository, cfg, alerts=alerts, execute=args.live)
+        runner = Runner(exchange, repository, cfg, clock=exchange.clock,
+                        alerts=alerts, execute=args.live or args.paper)
         if args.mode:
             runner.set_run_mode(RunMode(args.mode))
         for _ in range(50):
@@ -200,7 +213,12 @@ def main():
                     return
         while not stop.is_set():
             started = time.monotonic()
-            runner.tick()
+            try:
+                if args.paper:
+                    exchange.advance()
+                runner.tick()
+            except BlockingIOError:
+                logging.getLogger("bnb_treasury").warning("Account lock busy; deferring paper tick")
             if args.once:
                 break
             stop.wait(

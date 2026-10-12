@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from threading import Event, Lock, Thread
 from time import monotonic
 
@@ -10,9 +10,9 @@ from binance_common.websocket import _forget_connection_streams
 from binance_sdk_spot.spot import Spot
 
 from core.crash_guard import latch_guard_trigger
-from core.models import CrashGuardState, MarketSnapshot
+from core.models import CrashGuardState, ExecutionQuote, MarketSnapshot
 
-from .binance_adapter import sdk_data
+from .sdk_transport import sdk_data
 from .exchange_adapter import ExchangeError
 from .market_data import MarketWindows
 
@@ -27,6 +27,7 @@ class MarketStream:
         )
         self._stop, self._lock = Event(), Lock()
         self._latest = None
+        self._execution_quote = None
         # Two bounded slots: one being persisted, one collecting newer triggers.
         self._risk = self._leased_risk = None
         self._thread = None
@@ -60,10 +61,17 @@ class MarketStream:
             )
             if not quote.return_24h.is_finite():
                 raise ValueError("Invalid ticker return")
+            try:
+                ask_qty = Decimal(str(event["A"])) if event.get("A") is not None else None
+            except (InvalidOperation, TypeError, ValueError):
+                ask_qty = None  # Quantity failure must not erase valid price/risk evidence.
             with self._lock:
                 sampled = self.windows.update(quote, now)
                 self._last_message_at = monotonic()
                 self._latest = sampled
+                self._execution_quote = ExecutionQuote(
+                    quote.ts, self.symbol, bid, ask, ask_qty,
+                )
                 risk = latch_guard_trigger(
                     self._risk or CrashGuardState(), sampled, now, self.cfg
                 )
@@ -82,6 +90,7 @@ class MarketStream:
         with self._lock:
             self.windows = MarketWindows(self.cfg)
             self._latest = None
+            self._execution_quote = None
 
     async def _supervise(self):
         while not self._stop.is_set():
@@ -173,6 +182,12 @@ class MarketStream:
             if self._leased_risk is None:
                 self._leased_risk, self._risk = self._risk, None
             return self._leased_risk
+
+    def execution_quote(self):
+        if self._thread is not None and not self._thread.is_alive():
+            raise ExchangeError("Market stream worker exited")
+        with self._lock:
+            return self._execution_quote
 
     def acknowledge_risk(self, event):
         with self._lock:
