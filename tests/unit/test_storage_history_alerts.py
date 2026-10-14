@@ -62,7 +62,7 @@ def test_failed_operation_and_continuation_are_committed_together(tmp_path):
     )
     repo.record_intent(op, repo.runtime())
     failed = replace(op, status=OperationStatus.FAILED)
-    resumed = replace(repo.runtime(), resume_repricing=True)
+    resumed = replace(repo.runtime(), resume_replanning=True)
     repo.db.execute("""
         CREATE TEMP TRIGGER fail_runtime_update BEFORE UPDATE ON kv
         WHEN NEW.key = 'runtime'
@@ -73,12 +73,32 @@ def test_failed_operation_and_continuation_are_committed_together(tmp_path):
     repo.close()
     repo = Repository(path)
     assert repo.operations(unresolved_only=True) == (op,)
-    assert not repo.runtime().resume_repricing
+    assert not repo.runtime().resume_replanning
     repo.update_operation(failed, resumed)
     repo.close()
     repo = Repository(path)
     assert repo.operations() == (failed,)
-    assert repo.runtime().resume_repricing
+    assert repo.runtime().resume_replanning
+
+
+def test_legacy_repricing_continuation_survives_rename_and_reopen(tmp_path):
+    from storage.codec import dumps
+
+    path = tmp_path / "legacy.db"
+    repo = Repository(path)
+    old = dumps(replace(repo.runtime(), resume_replanning=True)).replace(
+        '"resume_replanning"', '"resume_repricing"'
+    )
+    with repo.db:
+        repo.db.execute("INSERT OR REPLACE INTO kv(key,data) VALUES ('runtime',?)", (old,))
+    repo.close()
+    repo = Repository(path)
+    assert repo.runtime().resume_replanning
+    repo.save("runtime", repo.runtime())
+    assert '"resume_repricing"' not in repo.db.execute(
+        "SELECT data FROM kv WHERE key='runtime'"
+    ).fetchone()[0]
+    repo.close()
 
 
 def test_budget_uses_exchange_history_with_pending_reservation_and_no_duplicate(
@@ -150,7 +170,7 @@ def test_consumption_estimate_removes_transfer_inflows(tmp_path):
         OperationStatus.CONFIRMED,
     )
     repo.save_transfers((transfer,))
-    rate, change = historical_metrics(repo, account, now)
+    rate, change, issue = historical_metrics(repo, account, now, "USDT")
     assert rate == D("1") and change is None
 
 
@@ -158,7 +178,7 @@ def test_consumption_estimate_removes_transfer_inflows(tmp_path):
     list(range(360, -1, -30)),
     [360, 359, 300, 120, 119, 1, 0],
 ])
-def test_bursty_consumption_uses_window_average_and_triggers_early_replenishment(
+def test_bursty_consumption_uses_window_average_and_accelerates_active_replenishment(
     tmp_path, minutes
 ):
     repo = Repository(tmp_path / "journal.db")
@@ -169,10 +189,11 @@ def test_bursty_consumption_uses_window_average_and_triggers_early_replenishment
             ts=now - timedelta(minutes=minute),
         )
         repo.save_snapshot(account)
-    rate, _ = historical_metrics(repo, account, now)
+    rate, _, _ = historical_metrics(repo, account, now, "USDT")
     assert rate == D("0.6")
     plan = build_cycle_plan(
-        make_engine_inputs(account=account, consumption_rate=rate), make_strategy_config()
+        make_engine_inputs(account=account, consumption_rate=rate,
+                           previous_state=ReplenishmentState.WATCH), make_strategy_config()
     )
     assert plan.state_decision.confirmed_state == ReplenishmentState.URGENT
     assert plan.state_decision.t_depletion == D("3.4") / D("0.6")
@@ -186,9 +207,11 @@ def test_consumption_combines_full_window_rates_and_preserves_margin_change(tmp_
             make_account(contract_bnb=D(balance)),
             ts=now - timedelta(hours=hours),
             contract_total_margin_balance=D(margin),
+            contract_quote_balance=D("10000"),
+            contract_margin_asset="USDT",
         )
         repo.save_snapshot(account)
-    assert historical_metrics(repo, account, now) == (D("0.75"), D("-600"))
+    assert historical_metrics(repo, account, now, "USDT") == (D("0.75"), D("-600"), None)
 
 
 def test_consumption_adjusts_only_confirmed_bnb_transfers_inside_sample_interval(tmp_path):
@@ -210,7 +233,7 @@ def test_consumption_adjusts_only_confirmed_bnb_transfers_inside_sample_interval
         replace(credit, transfer_id="failed", status=OperationStatus.FAILED),
         replace(credit, transfer_id="usd", asset="USDT"),
     ))
-    assert historical_metrics(repo, account, now) == (D("1"), None)
+    assert historical_metrics(repo, account, now, "USDT") == (D("1"), None, None)
 
 
 @pytest.mark.parametrize("hours,balance,expected", [(5, "32", "0"), (7, "32.6", "0.6"), (6, "27", "0")])
@@ -221,7 +244,7 @@ def test_consumption_uses_actual_elapsed_time_and_requires_a_full_window(
     now = make_engine_inputs().now
     account = make_account(contract_bnb=D("28.4"))
     repo.save_snapshot(replace(account, ts=now - timedelta(hours=hours), contract_bnb=D(balance)))
-    assert historical_metrics(repo, account, now) == (D(expected), None)
+    assert historical_metrics(repo, account, now, "USDT") == (D(expected), None, None)
 
 
 def test_alert_outbox_retries_only_failed_sink_and_deduplicates_state(tmp_path):

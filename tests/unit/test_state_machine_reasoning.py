@@ -35,8 +35,22 @@ from tests.helpers import D, make_state_inputs, make_strategy_config
             D("32.2"),
             D("0.1"),
             ReplenishmentState.IDLE,
+            ReplenishmentState.IDLE,
+            TransitionReason.HIGH_BALANCE,
+        ),
+        (
+            D("30.04"),
+            D("0.07"),
             ReplenishmentState.WATCH,
+            ReplenishmentState.ACCUMULATE,
             TransitionReason.DEPLETION_72H,
+        ),
+        (
+            D("30"),
+            D("0.04"),
+            ReplenishmentState.WATCH,
+            ReplenishmentState.ACCUMULATE,
+            TransitionReason.REPLENISHMENT_ACTIVE,
         ),
         (
             D("40"),
@@ -69,13 +83,13 @@ def test_reason_becomes_hysteresis_confirmed_on_second_non_urgent_transition() -
         make_state_inputs(
             contract_bnb=D("30"),
             consumption_rate=(D("30") - D("25")) / D("72"),
-            previous_state=ReplenishmentState.IDLE,
-            previous_candidate_state=ReplenishmentState.WATCH,
+            previous_state=ReplenishmentState.WATCH,
+            previous_candidate_state=ReplenishmentState.ACCUMULATE,
             candidate_streak=1,
         ),
         cfg,
     )
-    assert decision.confirmed_state == ReplenishmentState.WATCH
+    assert decision.confirmed_state == ReplenishmentState.ACCUMULATE
     assert decision.reason == TransitionReason.HYSTERESIS_CONFIRMED
 
 
@@ -98,10 +112,8 @@ def test_reason_becomes_exit_urgent_buffer_when_buffer_blocks_exit() -> None:
 def test_monotonicity_by_depletion_time_does_not_relax_when_time_shortens() -> None:
     cfg = make_strategy_config()
     ordered_states = [
-        classify_candidate_state(D("30"), D("100"), cfg.thresholds),
-        classify_candidate_state(D("30"), D("72"), cfg.thresholds),
-        classify_candidate_state(D("30"), D("24"), cfg.thresholds),
-        classify_candidate_state(D("30"), D("6"), cfg.thresholds),
+        classify_candidate_state(D("30"), D(t), cfg.thresholds, ReplenishmentState.WATCH)
+        for t in ("100", "72", "24", "6")
     ]
     urgency_rank = {
         ReplenishmentState.IDLE: 0,

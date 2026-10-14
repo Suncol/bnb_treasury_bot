@@ -1,6 +1,6 @@
 import json
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -14,7 +14,7 @@ from services.paper_exchange import PaperExchange
 from services.spot_market import SpotMarketData
 from storage.codec import loads
 from storage.repository import Repository
-from tests.helpers import D, make_market, make_strategy_config
+from tests.helpers import D, depth_messages, make_market, make_strategy_config
 from tests.paper_helpers import paper_setup
 
 
@@ -92,6 +92,8 @@ def test_cli_paper_uses_only_unsigned_public_sdk_with_credentials_present(tmp_pa
     monkeypatch.setattr(cli.os.sys, "argv", ["cli", "--paper", "--once", "--db", str(path)])
     cli.main()
     assert public_http and all(c["method"] == "GET" for c in public_http)
+    price_requests = [c for c in public_http if urlsplit(c['url']).path == '/api/v3/referencePrice']
+    assert price_requests and all(c['timeout'] == 1 for c in price_requests)
     repo = Repository(path)
     assert repo.runtime().read_failures == repo.runtime().api_errors == 0
     assert not repo.load("transport_backoff")
@@ -164,17 +166,27 @@ def test_paper_status_does_not_create_missing_database(tmp_path, monkeypatch):
     assert not path.exists()
 
 
-def test_market_stream_exposes_original_quote_and_invalidates_it():
+def test_market_stream_exposes_original_quote_and_invalidates_it(monkeypatch):
     stream = MarketStream("BNBUSDT", make_strategy_config().crash_guard, client=object())
     now = datetime.now(timezone.utc)
-    event = {"e": "24hrTicker", "s": "BNBUSDT", "E": int(now.timestamp() * 1000),
-             "b": "599", "a": "601", "A": "3.5", "P": "0"}
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+    monkeypatch.setattr("services.market_stream.datetime", Clock)
+    snapshot, event = depth_messages(now)
+    stream.on_message(snapshot)
     stream.on_message(event)
     q = stream.execution_quote()
     assert q.ask_qty == D("3.5") and int(q.ts.timestamp() * 1000) == event["E"]
-    stream.on_message({k: v for k, v in event.items() if k != "A"})
+    # Distinct observed source times; replaying one timestamp cannot renew it.
+    for i, qty in enumerate([None, "invalid"], 2):
+        now += timedelta(seconds=1)
+        snapshot, event = depth_messages(now, i, qty)
+        stream.on_message(snapshot)
+        stream.on_message(event)
+        assert stream.execution_quote().ask_qty is None
     assert stream.execution_quote().ask_qty is None
-    stream.on_message({**event, "A": "invalid"})
     assert stream.execution_quote().ask_qty is None and stream.quote().best_ask == 601
     stream._invalidate()
     assert stream.execution_quote() is None

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from core.config import validate_config
-from core.crash_guard import update_guard_from_market
+from core.crash_guard import market_invalid_reasons, update_guard_from_market
 from core.models import (
     Alert,
     AssetTransferPlan,
@@ -19,17 +20,16 @@ from core.models import (
     ReplenishmentState,
     RunMode,
 )
-from core.order_planner import order_passes_filters
 from core.replenishment_engine import build_cycle_plan
 from core.time_utils import age_seconds, fresh, utc
 from core.validation import valid_account_snapshot
 
 from .exchange_adapter import ExchangeError, RequestDeferred
-from .executor import Executor, MAX_CANCEL_ATTEMPTS
-from .history import historical_metrics
+from .executor import MAX_CANCEL_ATTEMPTS
 from .market_data import MarketWindows
 from .reconciliation import Reconciler
 from .read_backoff import clear_read_backoff, record_read_failure, retry_deadline
+from .price_refresh import PriceRefreshPending
 
 
 class Runner:
@@ -48,11 +48,14 @@ class Runner:
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.alerts = alerts
         self.execute_enabled = execute
-        self.executor = Executor(exchange, repository, cfg, clock=self.clock)
         self.reconciler = Reconciler(exchange, repository, cfg, clock=self.clock)
+        self.executor = self.reconciler.executor
         self.windows = MarketWindows(cfg.crash_guard)
         self.cached_inputs = None
         self.last_reconciled_at = None
+        self._last_refresh_duration = timedelta(0)
+        self._data_gate_reasons = None
+        self._data_gate_logged_at = None
         self._health_alerts = ()
         self._health_checked_at = None
         self._priority_busy = False
@@ -101,10 +104,10 @@ class Runner:
         with self.repository.exclusive():
             market = None
             try:
-                now = self.clock()
                 if self._waiting_for_reads(raw_market):
                     return None
                 raw = raw_market or self._read_market()
+                now = self.clock()
                 market = (
                     raw
                     if raw.smooth_price is not None
@@ -124,12 +127,7 @@ class Runner:
                         self.cfg.scheduler.reconciliation_seconds,
                         self.cfg.risk.max_account_age_seconds,
                     )
-                reconcile_due = self.last_reconciled_at is None or age_seconds(
-                    now, self.last_reconciled_at
-                ) >= min(
-                    self.cfg.scheduler.reconciliation_seconds,
-                    self.cfg.risk.max_account_age_seconds,
-                )
+                reconcile_due = self._reconciliation_due(now)
                 if self.cached_inputs is not None:
                     inputs = replace(
                         self.cached_inputs,
@@ -141,7 +139,7 @@ class Runner:
                         previous_candidate_state=runtime.candidate,
                         candidate_streak=runtime.candidate_streak,
                         slice_state=runtime.slice_state,
-                        reserve_replenishment_funds=runtime.resume_repricing
+                        reserve_replenishment_funds=runtime.resume_replanning
                         or runtime.resume_replenishment,
                         advance_state=False,
                         allow_new_cycle=False,
@@ -162,11 +160,38 @@ class Runner:
                         and not risk_changed
                         and not plan.cancellations
                     ):
+                        self._log_data_gate(inputs, plan)
                         self._publish(plan.alerts)
                         return plan
                 return self._cycle(market, inventory_due)
             except Exception as exc:
                 return self._failed_read(exc, market)
+
+    def _reconciliation_due(self, now):
+        if self.cached_inputs is None or self.last_reconciled_at is None:
+            return True
+        if age_seconds(now, self.last_reconciled_at) >= self.cfg.scheduler.reconciliation_seconds:
+            return True
+        # Account and dynamic filter ages start at acquisition, not at the end
+        # of reconciliation. Leave time for the next tick and a normal refresh;
+        # a slower refresh must still pass the unchanged execution freshness gates.
+        headroom = (
+            timedelta(seconds=self.cfg.crash_guard.check_seconds)
+            + self._last_refresh_duration
+        )
+        observations = [
+            (self.cached_inputs.account.ts, self.cfg.risk.max_account_age_seconds),
+        ]
+        if self.cached_inputs.filters.observed_at is not None:
+            observations.append(
+                (self.cached_inputs.filters.observed_at,
+                 self.cfg.crash_guard.max_market_age_seconds)
+            )
+        return any(
+            not fresh(ts, now, lifetime)
+            or utc(now) + headroom >= utc(ts) + timedelta(seconds=lifetime)
+            for ts, lifetime in observations
+        )
 
     def run_once(self, *, market=None, inventory_cycle=True):
         try:
@@ -195,6 +220,14 @@ class Runner:
                 return self._failed_read(exc, market)
 
     def _failed_read(self, exc, market=None):
+        if isinstance(exc, PriceRefreshPending):
+            # Expected startup/rule-change wait: retain durable intents and run
+            # local protection, but never plan from partially refreshed inputs.
+            self.cached_inputs = None
+            self.last_reconciled_at = None
+            self._priority_market = self._local_market(market)
+            self._priority_checkpoint()
+            return None
         if isinstance(exc, sqlite3.Error) or (
             isinstance(exc, OSError) and exc.errno in {5, 28, 30}
         ):
@@ -258,6 +291,48 @@ class Runner:
 
     def _read_market(self):
         return self.exchange.fetch_market_snapshot(self.cfg.symbol)
+
+    def _log_data_gate(self, inputs, plan):
+        reasons = list(market_invalid_reasons(inputs.market, inputs.now, self.cfg))
+        if not valid_account_snapshot(inputs.account, inputs.now, self.cfg):
+            reasons.append("ACCOUNT_SNAPSHOT")
+        if not inputs.snapshot_consistent:
+            reasons.append("ACCOUNT_INCONSISTENT")
+        if not inputs.market.windows_ready:
+            reasons.append("WINDOWS_WARMING")
+        if inputs.filters.observed_at is not None and not fresh(
+            inputs.filters.observed_at, inputs.now, self.cfg.crash_guard.max_market_age_seconds
+        ):
+            reasons.append("FILTER_TIMESTAMP")
+        reasons = tuple(reasons)
+        # State changes carry exact planner inputs; unchanged state gets a
+        # bounded heartbeat. No extra API reads or later feed.quote() here.
+        if (reasons == self._data_gate_reasons and self._data_gate_logged_at is not None
+                and 0 <= age_seconds(inputs.now, self._data_gate_logged_at) < 60):
+            return
+        self._data_gate_reasons, self._data_gate_logged_at = reasons, inputs.now
+
+        def age(ts):
+            return age_seconds(inputs.now, ts) if ts is not None else None
+
+        record = {
+            "evaluated_at": inputs.now.isoformat(),
+            "data_gate": plan.gates.data_gate.value,
+            "reasons": reasons,
+            "market": asdict(inputs.market),
+            "market_age_seconds": age(inputs.market.ts),
+            "quote_age_seconds": age(inputs.market.quote_ts),
+            "vwap_observation_age_seconds": age(inputs.market.vwap_requested_at),
+            "vwap_last_trade_age_seconds": age(inputs.market.vwap_close_time),
+            "account_age_seconds": age(inputs.account.ts),
+            "filters_age_seconds": age(inputs.filters.observed_at),
+            "snapshot_consistent": inputs.snapshot_consistent,
+            "pending_unresolved": inputs.pending.unresolved,
+        }
+        logging.getLogger("bnb_treasury").log(
+            logging.WARNING if reasons and reasons != ("WINDOWS_WARMING",) else logging.INFO,
+            "DATA_GATE %s", json.dumps(record, default=str, ensure_ascii=False),
+        )
 
     def _local_market(self, fallback=None):
         feed = getattr(self.exchange, "feed", None)
@@ -404,6 +479,9 @@ class Runner:
 
     def _persist_plan(self, plan, *, inventory, now, update_slice=True):
         runtime = self.repository.runtime()
+        advance_candidate = plan.inventory_valid and (
+            inventory or plan.state_decision.transitioned
+        )
         self.repository.save_guard(
             replace(
                 runtime,
@@ -411,10 +489,10 @@ class Runner:
                 if plan.inventory_valid
                 else runtime.state,
                 candidate=plan.state_decision.candidate_state
-                if inventory and plan.inventory_valid
+                if advance_candidate
                 else runtime.candidate,
                 candidate_streak=plan.state_decision.candidate_streak
-                if inventory and plan.inventory_valid
+                if advance_candidate
                 else runtime.candidate_streak,
                 last_inventory_at=now
                 if inventory and plan.inventory_valid
@@ -482,6 +560,7 @@ class Runner:
         return consumed
 
     def _inputs(self, market, inventory, *, continuing=False):
+        started = self.clock()
         self._consume_stream_risk()
         now = self.clock()
         if inventory:
@@ -491,7 +570,9 @@ class Runner:
             )
         self._priority_market = market
         self._priority_checkpoint()
-        account, orders, pending, consistent = self.reconciler.refresh(now)
+        account, orders, pending, consistent = self.reconciler.refresh(
+            now, force_income=inventory or self.execute_enabled,
+        )
         filters = self.exchange.fetch_symbol_filters(self.cfg.symbol)
         # Reconciliation may be slow. Never timestamp an old quote as a new one.
         if getattr(self.exchange, "feed", None) is not None or not fresh(
@@ -513,12 +594,10 @@ class Runner:
             and valid_account_snapshot(account, now, self.cfg)
         )
         rate, margin = (
-            historical_metrics(self.repository, account, now)
+            self.reconciler.history
             if trusted
             else (Decimal("0"), None)
         )
-        if inventory and trusted:
-            self.repository.save_snapshot(account)
         inputs = EngineInputs(
             account,
             pending,
@@ -538,14 +617,21 @@ class Runner:
             advance_state=inventory,
             allow_new_cycle=inventory or continuing,
             snapshot_consistent=consistent,
-            reserve_replenishment_funds=runtime.resume_repricing
+            reserve_replenishment_funds=runtime.resume_replanning
             or runtime.resume_replenishment,
         )
         self.cached_inputs = inputs
         self.last_reconciled_at = now
+        self._last_refresh_duration = max(
+            utc(self.clock()) - utc(started), timedelta(0)
+        )
         return inputs
 
     def _cycle(self, market, inventory):
+        with self.executor.income_batch():
+            return self._run_cycle(market, inventory)
+
+    def _run_cycle(self, market, inventory):
         used = set()
         queue = None
         submitted_qty = Decimal("0")
@@ -560,17 +646,9 @@ class Runner:
                 advance_inventory,
                 continuing=inventory
                 or runtime.resume_replenishment
-                or runtime.resume_repricing
+                or runtime.resume_replanning
                 or bool(queue),
             )
-            if self._priority_revision != priority_revision:
-                # A priority cancel invalidated the in-flight reconciliation,
-                # including fills that became visible during the slow read.
-                if submitted_qty:
-                    used.add("buys")
-                queue = None
-                market = inputs.market
-                continue
             saved_slice = inputs.slice_state
             # A funded continuation spends settled balances, and a queued group
             # may finish its slice without funding or opening another group.
@@ -585,17 +663,41 @@ class Runner:
                 if queue
                 else saved_slice,
             )
-            plan = build_cycle_plan(inputs, self.cfg)
+            candidate = queue[0] if queue else None
+            plan = build_cycle_plan(inputs, self.cfg, queued_order=candidate)
+            if not self.executor.income_audited(self.clock()) and (
+                advance_inventory or self.execute_enabled and (
+                    plan.buy_plan.orders or plan.transfer_decision.allow
+                    or plan.bnb_transfer_plan or plan.spot_usd_sweep_plan
+                )
+            ) and plan.inventory_valid and not inputs.pending.unresolved and not plan.cancellations:
+                consistent = self.reconciler.audit_income(inputs.account, self.clock())
+                rate, margin = self.reconciler.history
+                inputs = replace(inputs, snapshot_consistent=consistent,
+                                 consumption_rate=rate, margin_change_24h=margin)
+                self.cached_inputs = inputs
+                plan = build_cycle_plan(inputs, self.cfg, queued_order=candidate)
+            if self._priority_revision != priority_revision:
+                # All reads, including an income audit, can observe a priority cancel.
+                if submitted_qty:
+                    used.add("buys")
+                queue = None
+                self.executor._income_audited_at = None
+                market = inputs.market
+                continue
             if queue:
                 plan = replace(
                     plan,
                     slice_state=replace(plan.slice_state, next_at=saved_slice.next_at),
                 )
+            if advance_inventory and plan.inventory_valid:
+                self.repository.save_snapshot(inputs.account)
             self._persist_plan(plan, inventory=advance_inventory, now=inputs.now)
             if plan.inventory_valid:
                 advance_inventory = False
             if index == 0:
                 self.repository.event(inputs.now, "CYCLE", plan)
+            self._log_data_gate(inputs, plan)
             self._publish(plan.alerts)
             if not self.execute_enabled:
                 return plan
@@ -675,19 +777,9 @@ class Runner:
                     group_qty = sum((o.qty for o in queue), Decimal("0"))
                 if queue:
                     candidate = queue[0]
-                    allowed = sum((o.qty for o in plan.buy_plan.orders), Decimal("0"))
-                    max_price = max(o.price for o in plan.buy_plan.orders)
-                    free = inputs.account.spot_usd - inputs.account.reserved_spot_usd
                     if (
-                        candidate.qty <= min(allowed, group_qty - submitted_qty)
-                        and candidate.price <= max_price
-                        and order_passes_filters(candidate, inputs.filters)
-                        and candidate.qty
-                        * candidate.price
-                        * (1 + self.cfg.risk.fee_reserve_rate)
-                        <= free
-                        and candidate.time_in_force
-                        == plan.buy_plan.orders[0].time_in_force
+                        candidate in plan.buy_plan.orders
+                        and candidate.qty <= group_qty - submitted_qty
                     ):
                         action = queue.pop(0)
                         submitted_qty += action.qty
@@ -728,7 +820,7 @@ class Runner:
                             api_errors=0,
                             resume_replenishment=runtime.resume_replenishment
                             and continuing,
-                            resume_repricing=runtime.resume_repricing
+                            resume_replanning=runtime.resume_replanning
                             and continuing
                             and state != ReplenishmentState.URGENT,
                         ),
@@ -744,6 +836,11 @@ class Runner:
                 starts_slice=hasattr(action, "qty")
                 and plan.slice_state.active
                 and submitted_qty == action.qty,
+                resume_replanning=tag == "bnb"
+                and inputs.allow_new_cycle
+                and submitted_qty == 0
+                and plan.state_decision.confirmed_state != ReplenishmentState.IDLE
+                and plan.state_decision.delta_bnb > 0,
             )
             if op.status in {OperationStatus.UNKNOWN, OperationStatus.FAILED}:
                 self._publish(

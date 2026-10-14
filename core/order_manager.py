@@ -10,7 +10,7 @@ from .models import (
     StateDecision,
     StrategyConfig,
 )
-from .order_planner import compute_ref_price
+from .order_planner import compute_ref_price, ordinary_layers
 from .time_utils import age_seconds, utc
 
 
@@ -52,6 +52,7 @@ def plan_cancellations(
         cap = non_negative(cap - reserved)
     market_ok = valid_market(inputs, cfg)
     ref = compute_ref_price(inputs.market) if market_ok else None
+    prices = {price for _, price in ordinary_layers(state, ref, inputs.filters, c)} if ref is not None else set()
     chasing = market_ok and inputs.market.return_1h > c.chase_return_limit
     orders = sorted(
         (
@@ -116,7 +117,7 @@ def plan_cancellations(
             elif ref is not None:
                 if order.price > ref:
                     reason = "Bid above current reference price"
-                elif not chasing and (
+                elif not chasing and order.price not in prices and (
                     age >= reprice * 3600
                     or (
                         state == ReplenishmentState.ACCUMULATE

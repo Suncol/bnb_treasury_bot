@@ -126,6 +126,16 @@ class FakeExchange:
             )
         )
 
+    def fill_ordinary_orders(self, qty):
+        """Share one virtual tick's volume across ordinary orders in FIFO order."""
+        for order in tuple(self.orders.values()):
+            if qty <= 0:
+                break
+            if order.is_open and order.time_in_force != "IOC":
+                amount = min(order.remaining_qty, qty)
+                self.fill(order.order_id, amount)
+                qty -= amount
+
     def settle(self, transfer_id):
         t = self.transfers[transfer_id]
         if t.status == OperationStatus.CONFIRMED:

@@ -38,10 +38,12 @@ def test_classify_idle_when_balance_high_and_depletion_far() -> None:
     assert state == ReplenishmentState.IDLE
 
 
-def test_classify_watch_on_72h_boundary() -> None:
+def test_active_round_keeps_accumulating_on_72h_boundary() -> None:
     cfg = make_strategy_config()
-    state = classify_candidate_state(D("30"), D("72"), cfg.thresholds)
-    assert state == ReplenishmentState.WATCH
+    state = classify_candidate_state(
+        D("30"), D("72"), cfg.thresholds, ReplenishmentState.WATCH
+    )
+    assert state == ReplenishmentState.ACCUMULATE
 
 
 def test_classify_accumulate_when_below_alert_even_if_depletion_far() -> None:

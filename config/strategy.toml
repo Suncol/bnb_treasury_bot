@@ -24,8 +24,6 @@ u_spot_idle_max = 1000.0
 fee_reserve_rate = 0.001
 sweep_enabled = true
 max_account_age_seconds = 10
-margin_drop_limit = 500.0
-margin_target_reduction = 3.0
 
 [execution]
 watch_discounts = [0.005, 0.012, 0.025]

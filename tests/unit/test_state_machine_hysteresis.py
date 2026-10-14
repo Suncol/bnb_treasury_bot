@@ -60,14 +60,14 @@ def test_candidate_streak_clears_when_candidate_matches_previous_state() -> None
         make_state_inputs(
             contract_bnb=D("30"),
             consumption_rate=(D("30") - D("25")) / D("72"),
-            previous_state=ReplenishmentState.WATCH,
-            previous_candidate_state=ReplenishmentState.ACCUMULATE,
+            previous_state=ReplenishmentState.ACCUMULATE,
+            previous_candidate_state=ReplenishmentState.WATCH,
             candidate_streak=1,
         ),
         cfg,
     )
-    assert decision.candidate_state == ReplenishmentState.WATCH
-    assert decision.confirmed_state == ReplenishmentState.WATCH
+    assert decision.candidate_state == ReplenishmentState.ACCUMULATE
+    assert decision.confirmed_state == ReplenishmentState.ACCUMULATE
     assert decision.candidate_streak == 0
     assert decision.transitioned is False
 

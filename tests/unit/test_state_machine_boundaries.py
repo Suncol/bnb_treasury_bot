@@ -36,10 +36,10 @@ def test_compute_t_depletion_returns_none_for_non_positive_rate(rate) -> None:
     ("contract_bnb", "t_depletion", "expected"),
     [
         (D("40"), D("1"), ReplenishmentState.IDLE),
-        (D("39.99"), D("72"), ReplenishmentState.WATCH),
-        (D("28"), D("72"), ReplenishmentState.WATCH),
-        (D("28"), D("72.0001"), ReplenishmentState.IDLE),
-        (D("28"), None, ReplenishmentState.IDLE),
+        (D("39.99"), D("72"), ReplenishmentState.IDLE),
+        (D("28"), D("72"), ReplenishmentState.ACCUMULATE),
+        (D("28"), D("72.0001"), ReplenishmentState.ACCUMULATE),
+        (D("28"), None, ReplenishmentState.ACCUMULATE),
         (D("27.99"), D("100"), ReplenishmentState.ACCUMULATE),
         (D("25.01"), D("100"), ReplenishmentState.ACCUMULATE),
         (D("25.01"), D("6"), ReplenishmentState.URGENT),
@@ -50,14 +50,16 @@ def test_classify_candidate_state_threshold_boundaries(
 ) -> None:
     cfg = make_strategy_config()
     assert (
-        classify_candidate_state(contract_bnb, t_depletion, cfg.thresholds) == expected
+        classify_candidate_state(
+            contract_bnb, t_depletion, cfg.thresholds, ReplenishmentState.WATCH
+        ) == expected
     )
 
 
 @pytest.mark.parametrize(
     ("contract_bnb", "rate", "expected_state"),
     [
-        (D("32.2"), D("0.1"), ReplenishmentState.WATCH),
+        (D("30.04"), D("0.07"), ReplenishmentState.ACCUMULATE),
         (D("29.8"), D("0.2"), ReplenishmentState.ACCUMULATE),
         (D("25.6"), D("0.1"), ReplenishmentState.URGENT),
     ],
@@ -67,7 +69,7 @@ def test_t_depletion_exact_time_boundaries(contract_bnb, rate, expected_state) -
     inputs = make_state_inputs(
         contract_bnb=contract_bnb,
         consumption_rate=rate,
-        previous_state=ReplenishmentState.IDLE,
+        previous_state=ReplenishmentState.WATCH,
     )
     decision = evaluate_state(inputs, cfg)
     assert decision.raw_candidate_state == expected_state

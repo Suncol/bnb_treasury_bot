@@ -149,7 +149,7 @@ def test_sdk_unknown_order_remains_unknown_and_transfer_never_sends_fake_client_
     assert len(calls) == count
 
 
-def test_account_uses_asset_max_withdraw_and_total_spot_balances(sdk):
+def account_responses(sdk):
     adapter, calls, responses = sdk
     responses["GET", "/api/v3/time"] = responses["GET", "/fapi/v1/time"] = (
         200,
@@ -168,7 +168,12 @@ def test_account_uses_asset_max_withdraw_and_total_spot_balances(sdk):
             },
         ],
     )
-    responses["GET", "/fapi/v3/account"] = (200, {"totalMarginBalance": "12345"})
+    responses["GET", "/fapi/v3/account"] = (200, {
+        "totalMarginBalance": "12345", "totalWalletBalance": "10000",
+        "assets": [{"asset": "USDT", "walletBalance": "10000", "marginBalance": "12345",
+                    "unrealizedProfit": "2345", "updateTime": millis(NOW)}],
+    })
+    responses["GET", "/fapi/v1/multiAssetsMargin"] = (200, {"multiAssetsMargin": False})
     responses["GET", "/api/v3/account"] = (
         200,
         {
@@ -178,6 +183,11 @@ def test_account_uses_asset_max_withdraw_and_total_spot_balances(sdk):
             ]
         },
     )
+    return adapter, calls, responses
+
+
+def test_account_uses_asset_max_withdraw_and_total_spot_balances(sdk):
+    adapter, calls, responses = account_responses(sdk)
     account = adapter.fetch_account_snapshot()
     assert account.contract_max_withdraw_amount == D("4567.89")
     assert account.contract_bnb == D("25.75")
@@ -185,6 +195,38 @@ def test_account_uses_asset_max_withdraw_and_total_spot_balances(sdk):
     assert account.contract_bnb_updated_at == account.contract_quote_updated_at == NOW
     assert account.spot_usd == D("600") and account.reserved_spot_usd == D("100")
     assert account.spot_bnb == D("3") and account.reserved_spot_bnb == D("1")
+    assert account.contract_margin_asset == "USDT"
+
+
+@pytest.mark.parametrize("field,value", [("walletBalance", "7000"), ("updateTime", millis(NOW) + 1)])
+def test_margin_and_balance_must_cover_the_same_wallet_observation(sdk, field, value):
+    adapter, calls, responses = account_responses(sdk)
+    responses["GET", "/fapi/v3/account"][1]["assets"][0][field] = value
+    with pytest.raises(ExchangeError, match="observations disagree"):
+        adapter.fetch_account_snapshot()
+    assert not any(urlsplit(c["url"]).path == "/fapi/v1/multiAssetsMargin" for c in calls)
+
+
+def test_margin_mode_is_verified_once_and_cached_with_existing_sdk_cache(sdk):
+    adapter, calls, responses = account_responses(sdk)
+    for _ in range(3):
+        assert adapter.fetch_account_snapshot().contract_margin_asset == "USDT"
+    mode_calls = [c for c in calls if urlsplit(c["url"]).path == "/fapi/v1/multiAssetsMargin"]
+    assert len(mode_calls) == 1
+    responses["GET", "/fapi/v1/multiAssetsMargin"] = (200, {"multiAssetsMargin": True})
+    adapter.cache.pop("futures_margin_mode")
+    assert adapter.fetch_account_snapshot().contract_margin_asset == "USD"
+
+
+def test_non_usdt_quote_cannot_be_subtracted_from_usdt_aggregate_margin(sdk):
+    adapter, calls, responses = account_responses(sdk)
+    adapter.cfg = replace(adapter.cfg, quote_asset="USDC", symbol="BNBUSDC")
+    responses["GET", "/fapi/v3/balance"][1][1]["asset"] = "USDC"
+    responses["GET", "/fapi/v3/account"][1]["assets"][0]["asset"] = "USDC"
+    account = adapter.fetch_account_snapshot()
+    assert account.contract_margin_asset == "USDT"
+    assert account.contract_margin_asset != adapter.cfg.quote_asset
+    assert account.contract_max_withdraw_amount == D("4567.89")
 
 
 def test_clock_skew_blocks_signed_reads_before_any_trade(sdk):

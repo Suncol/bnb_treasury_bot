@@ -196,6 +196,8 @@ def main():
             return
         feed = MarketStream(cfg.symbol, cfg.crash_guard).start()
         exchange.feed = feed
+        if hasattr(exchange, "start_price_refresh"):
+            exchange.start_price_refresh()
         sinks = [LogSink(prefix="PAPER " if args.paper else "")]
         if not args.paper and os.environ.get("ALERT_WEBHOOK_URL"):
             sinks.append(WebhookSink("webhook", os.environ["ALERT_WEBHOOK_URL"]))
@@ -233,6 +235,8 @@ def main():
             Executor(exchange, repository, cfg).note_failure(reason=type(exc).__name__)
         raise
     finally:
+        if exchange is not None and hasattr(exchange, "close_price_refresh"):
+            exchange.close_price_refresh()
         if feed is not None:
             feed.close()
         if alerts is not None:

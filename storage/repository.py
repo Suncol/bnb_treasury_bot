@@ -582,12 +582,13 @@ class Repository:
             "SELECT COALESCE(MAX(id),0) FROM wallet_events"
         ).fetchone()[0]
 
-    def wallet_changes(self, cursor):
+    def wallet_changes(self, cursor, *, through=None):
         return tuple(
             (row[0], row[1], loads(row[2]))
             for row in self.db.execute(
-                "SELECT id,reference,data FROM wallet_events WHERE id>? ORDER BY id",
-                (cursor,),
+                "SELECT id,reference,data FROM wallet_events WHERE id>?"
+                + (" AND id<=?" if through is not None else "") + " ORDER BY id",
+                (cursor,) + ((through,) if through is not None else ()),
             )
         )
 
@@ -723,6 +724,8 @@ class Repository:
     def save_snapshot(self, account):
         if account.ts is None:
             raise ValueError("Snapshot timestamp is required")
+        if account.wallet_event_cursor is None:
+            account = replace(account, wallet_event_cursor=self.wallet_cursor())
         with self.db:
             self.db.execute(
                 "INSERT OR REPLACE INTO snapshots VALUES (?,?)",

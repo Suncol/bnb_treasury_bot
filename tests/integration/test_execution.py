@@ -114,7 +114,7 @@ def test_partial_cancel_race_counts_fills_once_and_survives_restart(tmp_path):
         cfg,
         D("10000"),
     ).orders[0]
-    Executor(exchange, repo, cfg).execute(
+    Executor(exchange, repo, cfg, clock=lambda: exchange.now).execute(
         buy, exchange.now - timedelta(minutes=1), ReplenishmentState.ACCUMULATE
     )
     guard = CrashGuardState(

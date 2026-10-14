@@ -41,31 +41,29 @@ def compute_delta_bnb(effective_supply: Decimal, b_target: Decimal) -> Decimal:
 
 
 def classify_candidate_state(
-    contract_bnb: Decimal, t_depletion: Decimal | None, thresholds: ThresholdConfig
+    contract_bnb: Decimal, t_depletion: Decimal | None, thresholds: ThresholdConfig,
+    previous_state: ReplenishmentState = ReplenishmentState.IDLE,
+    *, target_tolerance: Decimal = Decimal("0"),
 ) -> ReplenishmentState:
     if contract_bnb >= thresholds.b_high:
         return ReplenishmentState.IDLE
     if contract_bnb <= thresholds.b_low:
         return ReplenishmentState.URGENT
+    if (contract_bnb >= thresholds.b_target
+            or thresholds.b_target - contract_bnb < target_tolerance):
+        return ReplenishmentState.IDLE
+    if previous_state == ReplenishmentState.IDLE and contract_bnb >= thresholds.b_alert:
+        return ReplenishmentState.IDLE
     if t_depletion is not None and t_depletion <= Decimal("6"):
         return ReplenishmentState.URGENT
-    if contract_bnb < thresholds.b_alert:
-        return ReplenishmentState.ACCUMULATE
-    if t_depletion is not None and t_depletion <= Decimal("24"):
-        return ReplenishmentState.ACCUMULATE
-    if (
-        contract_bnb < thresholds.b_high
-        and t_depletion is not None
-        and t_depletion <= Decimal("72")
-    ):
-        return ReplenishmentState.WATCH
-    return ReplenishmentState.IDLE
+    return ReplenishmentState.ACCUMULATE
 
 
 def _classify_reason(
-    contract_bnb: Decimal, t_depletion: Decimal | None, thresholds: ThresholdConfig
+    contract_bnb: Decimal, t_depletion: Decimal | None, thresholds: ThresholdConfig,
+    candidate: ReplenishmentState,
 ) -> TransitionReason:
-    if contract_bnb >= thresholds.b_high:
+    if candidate == ReplenishmentState.IDLE:
         return TransitionReason.HIGH_BALANCE
     if contract_bnb <= thresholds.b_low:
         return TransitionReason.LOW_BALANCE
@@ -77,7 +75,7 @@ def _classify_reason(
         return TransitionReason.DEPLETION_24H
     if t_depletion is not None and t_depletion <= Decimal("72"):
         return TransitionReason.DEPLETION_72H
-    return TransitionReason.HIGH_BALANCE
+    return TransitionReason.REPLENISHMENT_ACTIVE
 
 
 def apply_hysteresis(
@@ -87,11 +85,11 @@ def apply_hysteresis(
     streak: int,
     cfg: SchedulerConfig,
 ) -> HysteresisDecision:
-    if candidate_state == ReplenishmentState.URGENT:
+    if candidate_state in {ReplenishmentState.URGENT, ReplenishmentState.IDLE}:
         return HysteresisDecision(
-            confirmed_state=ReplenishmentState.URGENT,
+            confirmed_state=candidate_state,
             candidate_streak=0,
-            transitioned=previous_state != ReplenishmentState.URGENT,
+            transitioned=previous_state != candidate_state,
         )
 
     if candidate_state == previous_state:
@@ -116,7 +114,8 @@ def apply_hysteresis(
     )
 
 
-def evaluate_state(inputs: StateInputs, cfg: StrategyConfig) -> StateDecision:
+def evaluate_state(inputs: StateInputs, cfg: StrategyConfig, *,
+                   target_tolerance: Decimal = Decimal("0")) -> StateDecision:
     t_depletion = compute_t_depletion(
         inputs.contract_bnb, cfg.thresholds.b_low, inputs.consumption_rate
     )
@@ -124,10 +123,11 @@ def evaluate_state(inputs: StateInputs, cfg: StrategyConfig) -> StateDecision:
     delta_bnb = compute_delta_bnb(effective_supply, cfg.thresholds.b_target)
 
     raw_candidate_state = classify_candidate_state(
-        inputs.contract_bnb, t_depletion, cfg.thresholds
+        inputs.contract_bnb, t_depletion, cfg.thresholds, inputs.previous_state,
+        target_tolerance=target_tolerance,
     )
     candidate_reason = _classify_reason(
-        inputs.contract_bnb, t_depletion, cfg.thresholds
+        inputs.contract_bnb, t_depletion, cfg.thresholds, raw_candidate_state
     )
 
     candidate_state = raw_candidate_state
@@ -151,7 +151,8 @@ def evaluate_state(inputs: StateInputs, cfg: StrategyConfig) -> StateDecision:
 
     if (
         hysteresis.transitioned
-        and hysteresis.confirmed_state != ReplenishmentState.URGENT
+        and hysteresis.confirmed_state
+        not in {ReplenishmentState.URGENT, ReplenishmentState.IDLE}
     ):
         reason = TransitionReason.HYSTERESIS_CONFIRMED
 

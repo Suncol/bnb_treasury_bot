@@ -12,7 +12,7 @@ from binance_common import websocket as sdk_ws
 from services.exchange_adapter import ExchangeError
 from services.market_data import MarketWindows
 from services.market_stream import MarketStream
-from tests.helpers import D, make_market, make_strategy_config
+from tests.helpers import D, depth_messages, make_market, make_strategy_config
 
 
 class Socket:
@@ -45,24 +45,10 @@ class Socket:
         return ConnectionError("disconnected")
 
     def ticker(self):
-        self.messages.put_nowait(
-            SimpleNamespace(
-                type=aiohttp.WSMsgType.TEXT,
-                data=json.dumps(
-                    {
-                        "stream": "bnbusdt@ticker",
-                        "data": {
-                            "e": "24hrTicker",
-                            "s": "BNBUSDT",
-                            "E": int(datetime.now(timezone.utc).timestamp() * 1000),
-                            "b": "599",
-                            "a": "601",
-                            "P": "0",
-                        },
-                    }
-                ),
-            )
-        )
+        for name, data in zip(("bnbusdt@depth5@100ms", "bnbusdt@depth@100ms"),
+                              depth_messages(datetime.now(timezone.utc))):
+            self.messages.put_nowait(SimpleNamespace(type=aiohttp.WSMsgType.TEXT,
+                data=json.dumps({"stream": name, "data": data})))
 
 
 @pytest.fixture
@@ -132,10 +118,11 @@ async def running_stream(network):
 
 async def received_quote(stream, network, socket_count):
     await wait_until(
-        lambda: len(network.sockets) == socket_count and network.sockets[-1].sent
+        lambda: len(network.sockets) == socket_count
+        and sum(len(m["params"]) for m in network.sockets[-1].sent) == 2
     )
     socket = network.sockets[-1]
-    assert [m["params"] for m in socket.sent] == [["bnbusdt@ticker"]]
+    assert sorted(p for m in socket.sent for p in m["params"]) == ["bnbusdt@depth5@100ms", "bnbusdt@depth@100ms"]
     socket.ticker()
     await wait_until(lambda: stream._latest is not None)
     assert stream.quote().mid_price == D("600")
@@ -172,7 +159,7 @@ def test_sdk_feed_recovers_repeated_disconnects_and_rewarms(network, failure):
                 assert stream.quote().drawdown_15m is None
                 assert len(api.connections) == 1
                 assert (
-                    len(api.connections[0].stream_callback_map["bnbusdt@ticker"]) == 1
+                    len(api.connections[0].stream_callback_map["bnbusdt@depth5@100ms"]) == 1
                 )
             assert network.attempts == 3
 
@@ -204,7 +191,8 @@ def test_sdk_scheduled_reconnect_does_not_race_the_watchdog(network, close_old):
             await received_quote(stream, network, 2)
             await asyncio.sleep(0.45)
             assert network.attempts == 2 and len(api.connections) == 1
-            assert len(api.connections[0].stream_callback_map["bnbusdt@ticker"]) == 1
+            assert all(len(api.connections[0].stream_callback_map[name]) == 1
+                       for name in ("bnbusdt@depth5@100ms", "bnbusdt@depth@100ms"))
 
     asyncio.run(replay())
 
@@ -224,7 +212,7 @@ def test_exhausted_sdk_retries_start_a_fresh_subscription(network, scheduled):
                 stream.quote()
             await received_quote(stream, network, 2)
             assert network.attempts == 5
-            assert len(api.connections[0].stream_callback_map["bnbusdt@ticker"]) == 1
+            assert len(api.connections[0].stream_callback_map["bnbusdt@depth@100ms"]) == 1
 
     asyncio.run(replay())
 
@@ -255,7 +243,7 @@ def test_failed_resubscription_does_not_leave_a_stale_sdk_stream(network, schedu
                 socket.messages.put_nowait(None)
             await received_quote(stream, network, 3)
             assert network.attempts == 3
-            assert len(api.connections[0].stream_callback_map["bnbusdt@ticker"]) == 1
+            assert len(api.connections[0].stream_callback_map["bnbusdt@depth@100ms"]) == 1
 
     asyncio.run(replay())
 

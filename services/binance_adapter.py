@@ -113,6 +113,27 @@ class BinanceAdapter(SpotMarketData):
         quote = assets.get(self.cfg.quote_asset)
         if quote is None or "maxWithdrawAmount" not in quote:
             raise ExchangeError("Quote asset does not expose futures maxWithdrawAmount")
+        margin_assets = {a["asset"]: a for a in margin.get("assets", ())}
+        margin_quote = margin_assets.get(self.cfg.quote_asset)
+        if (
+            margin_quote is None
+            or D(margin_quote["walletBalance"]) != D(quote["balance"])
+            or margin_quote.get("updateTime") != quote.get("updateTime")
+        ):
+            raise ExchangeError("Futures balance and margin observations disagree")
+        mode = self._cached("futures_margin_mode", 300, lambda: self._call(
+            self.futures.get_current_multi_assets_mode, recv_window=5000
+        ))
+        if not isinstance(mode.get("multiAssetsMargin"), bool):
+            raise ExchangeError("Futures margin mode is not verifiable")
+        # Account totals are USDT in single-asset mode and USD in multi-assets
+        # mode. Cross-currency capital flows require unavailable historical FX.
+        margin_asset = "USD" if mode["multiAssetsMargin"] else "USDT"
+        if margin_asset == self.cfg.quote_asset and (
+            D(margin["totalWalletBalance"]) != D(margin_quote["walletBalance"])
+            or D(margin["totalMarginBalance"]) != D(margin_quote["marginBalance"])
+        ):
+            margin_asset = None
         bnb = balances.get("BNB", {"free": "0", "locked": "0"})
         usd = balances.get(self.cfg.quote_asset, {"free": "0", "locked": "0"})
         return AccountSnapshot(
@@ -125,13 +146,14 @@ class BinanceAdapter(SpotMarketData):
             D(usd["locked"]),
             D(margin["totalMarginBalance"]),
             D(bnb["locked"]),
-            contract_quote_balance=D(quote["balance"]) if "balance" in quote else None,
+            contract_quote_balance=D(margin_quote["walletBalance"]),
             contract_bnb_updated_at=timestamp(assets["BNB"]["updateTime"])
             if assets.get("BNB", {}).get("updateTime")
             else None,
-            contract_quote_updated_at=timestamp(quote["updateTime"])
-            if quote.get("updateTime")
+            contract_quote_updated_at=timestamp(margin_quote["updateTime"])
+            if margin_quote.get("updateTime")
             else None,
+            contract_margin_asset=margin_asset,
         )
 
     def _filter_overrides(self, symbol):
@@ -402,7 +424,7 @@ class BinanceAdapter(SpotMarketData):
             return OperationResult(OperationStatus.PENDING, str(result["tranId"]))
         except BinanceAPIError as exc:
             if operation.kind == OperationKind.ORDER and exc.code in {-1013, -2010}:
-                self.cache.pop("filters:" + p.symbol, None)
+                self.invalidate_filters(p.symbol)
             # A narrow allowlist: unknown codes, duplicate IDs, cancel races,
             # 429s and all 5xx remain UNKNOWN and are queried, never retried.
             definite = {

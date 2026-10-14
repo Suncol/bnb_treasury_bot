@@ -13,6 +13,7 @@ from .models import (
     EngineInputs,
     ExecutionGates,
     GateStatus,
+    OrderPlan,
     ReplenishmentState,
     RunMode,
     SliceState,
@@ -70,7 +71,11 @@ def _plan_bnb_transfer(
         min(available, non_negative(target - a.contract_bnb)), inputs.filters.qty_step
     )
     minimum = inputs.filters.min_transfer_bnb
-    if state == ReplenishmentState.WATCH:
+    if (
+        state != ReplenishmentState.URGENT
+        and a.contract_bnb >= cfg.thresholds.b_alert
+        and target - a.contract_bnb - amount >= max(minimum, inputs.filters.qty_step)
+    ):
         minimum = max(minimum, cfg.execution.watch_batch_transfer_bnb)
     if amount > 0 and amount >= minimum and a.contract_bnb < cfg.thresholds.b_high:
         return AssetTransferPlan(
@@ -231,7 +236,9 @@ def _alerts(inputs, cfg, decision, transfer, gates, guard) -> tuple[Alert, ...]:
     return tuple(alerts)
 
 
-def build_cycle_plan(inputs: EngineInputs, cfg: StrategyConfig) -> CyclePlan:
+def build_cycle_plan(
+    inputs: EngineInputs, cfg: StrategyConfig, *, queued_order: OrderPlan | None = None,
+) -> CyclePlan:
     """Pure decision entry. Every action is based exclusively on settled funds.
 
     Cancels precede new actions. A funding decision contains no dependent orders;
@@ -242,7 +249,10 @@ def build_cycle_plan(inputs: EngineInputs, cfg: StrategyConfig) -> CyclePlan:
     )
     inventory_valid = account_ok and not inputs.pending.unresolved
     if inventory_valid:
-        decision = evaluate_state(_to_state_inputs(inputs), cfg)
+        decision = evaluate_state(
+            _to_state_inputs(inputs), cfg,
+            target_tolerance=max(inputs.filters.min_transfer_bnb, inputs.filters.qty_step),
+        )
     else:
         # Invalid inputs cannot become tomorrow's trusted strategy state. Avoid
         # even performing Decimal comparisons/arithmetic on corrupt balances.
@@ -265,10 +275,13 @@ def build_cycle_plan(inputs: EngineInputs, cfg: StrategyConfig) -> CyclePlan:
             delta_bnb=ZERO,
             candidate_streak=inputs.candidate_streak,
         )
-        inputs = replace(inputs, snapshot_consistent=False, allow_guard_recovery=False)
+        # Waiting for settlement freezes inventory decisions, not a consistent
+        # order observation. Existing bids still receive price/TTL/guard checks.
+        inputs = replace(inputs, snapshot_consistent=account_ok, allow_guard_recovery=False)
     if (
         not inputs.advance_state
-        and decision.raw_candidate_state != ReplenishmentState.URGENT
+        and decision.raw_candidate_state
+        not in {ReplenishmentState.URGENT, ReplenishmentState.IDLE}
     ):
         decision = replace(
             decision,
@@ -279,14 +292,6 @@ def build_cycle_plan(inputs: EngineInputs, cfg: StrategyConfig) -> CyclePlan:
     state = decision.confirmed_state
     guard = update_crash_guard(inputs, cfg)
     target = cfg.thresholds.b_target
-    if (
-        inputs.margin_change_24h is not None
-        and inputs.margin_change_24h < -cfg.risk.margin_drop_limit
-    ):
-        target = min(
-            target,
-            max(cfg.thresholds.b_low + 2, target - cfg.risk.margin_target_reduction),
-        )
     if guard.active and state == ReplenishmentState.URGENT:
         target = min(target, cfg.thresholds.b_low + 1)
     decision = replace(
@@ -388,7 +393,8 @@ def build_cycle_plan(inputs: EngineInputs, cfg: StrategyConfig) -> CyclePlan:
         free = non_negative(inputs.account.spot_usd - inputs.account.reserved_spot_usd)
         requested = replace(decision, delta_bnb=qty)
         # Use the same price, lot and notional rules as the eventual orders.
-        demand = plan_buy_orders(requested, inputs.market, inputs.filters, cfg, None)
+        demand = plan_buy_orders(requested, inputs.market, inputs.filters, cfg, None,
+                                 existing_orders=inputs.orders, queued_order=queued_order)
         if slots is not None:
             demand = replace(demand, orders=demand.orders[: max(0, slots)])
         ref = compute_ref_price(inputs.market)
@@ -420,6 +426,8 @@ def build_cycle_plan(inputs: EngineInputs, cfg: StrategyConfig) -> CyclePlan:
                 inputs.filters,
                 cfg,
                 free / (1 + cfg.risk.fee_reserve_rate),
+                existing_orders=inputs.orders,
+                queued_order=queued_order,
             )
         if slots is not None:
             buy = replace(buy, orders=buy.orders[: max(0, slots)])

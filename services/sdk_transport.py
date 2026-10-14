@@ -3,6 +3,7 @@
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from threading import RLock
 
 from binance_common.errors import (
     BadRequestError, ForbiddenError, NotFoundError, RateLimitBanError,
@@ -52,8 +53,13 @@ class SDKTransport:
         self.weight_limits = {}
         self.weight_usage = {}
         self.read_checkpoint = None
+        self._budget_lock = RLock()
 
     def ensure_request_allowed(self, *, protective=False, scope=None):
+        with self._budget_lock:
+            return self._ensure_request_allowed(protective=protective, scope=scope)
+
+    def _ensure_request_allowed(self, *, protective=False, scope=None):
         now = self.clock()
         if self.request_not_before is not None and now < self.request_not_before:
             raise RequestDeferred(
@@ -77,6 +83,10 @@ class SDKTransport:
                     )
 
     def _observe_request_budget(self, scope, headers, data):
+        with self._budget_lock:
+            self._observe_budget(scope, headers, data)
+
+    def _observe_budget(self, scope, headers, data):
         periods = {
             "SECOND": (1, "s"),
             "MINUTE": (60, "m"),
@@ -112,15 +122,19 @@ class SDKTransport:
             except (ValueError, KeyError):
                 continue
             end = (int(now.timestamp()) // seconds + 1) * seconds + 1
+            expires = datetime.fromtimestamp(end, timezone.utc)
+            previous = self.weight_usage.get((scope, header))
+            if previous is not None and previous[1] == expires:
+                used = max(used, previous[0])
             self.weight_usage[scope, header] = (
                 used,
-                datetime.fromtimestamp(end, timezone.utc),
+                expires,
             )
 
-    def _call(self, method, **params):
+    def _call(self, method, *, checkpoint=True, **params):
         endpoint = getattr(method, "__name__", type(method).__name__)
         mutation = endpoint in {"new_order", "delete_order", "user_universal_transfer"}
-        if not mutation and self.read_checkpoint is not None:
+        if checkpoint and not mutation and self.read_checkpoint is not None:
             self.read_checkpoint()
         owner = getattr(method, "__self__", None)
         scope = (
@@ -133,7 +147,7 @@ class SDKTransport:
         self.ensure_request_allowed(protective=endpoint == "delete_order", scope=scope)
         try:
             response = method(**params)
-            self.request_weights = {
+            weights = {
                 k.lower(): v
                 for k, v in getattr(response, "headers", {}).items()
                 if k.lower().startswith(
@@ -141,7 +155,9 @@ class SDKTransport:
                 )
             }
             data = sdk_data(response.data())
-            self._observe_request_budget(scope, self.request_weights, data)
+            with self._budget_lock:
+                self.request_weights = weights
+                self._observe_request_budget(scope, weights, data)
             return data
         except SDKError as exc:
             status = next(
@@ -168,7 +184,9 @@ class SDKTransport:
                     if retry_after is not None
                     else (120 if status == 418 else 60)
                 )
-                self.request_not_before = self.clock() + timedelta(seconds=retry_after)
+                with self._budget_lock:
+                    deadline = self.clock() + timedelta(seconds=retry_after)
+                    self.request_not_before = max(deadline, self.request_not_before or deadline)
             raise BinanceAPIError(
                 getattr(exc, "status_code", None),
                 message=getattr(exc, "error_message", ""),

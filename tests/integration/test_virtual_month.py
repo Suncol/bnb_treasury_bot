@@ -10,6 +10,7 @@ from services.runner import Runner
 from storage.repository import Repository
 from tests.fake_exchange import FakeExchange
 from tests.helpers import D, make_account, make_strategy_config
+from tests.month_metrics import inventory_metrics
 
 
 def test_thirty_virtual_days_preserve_inventory_budget_and_restart_invariants(tmp_path):
@@ -24,7 +25,7 @@ def test_thirty_virtual_days_preserve_inventory_budget_and_restart_invariants(tm
     ex = CommissionExchange(make_account(contract_bnb=D("24"), contract_max_withdraw_amount=D("100000")))
     start = ex.now
     consumed = peak_supply = peak_budget = D("0")
-    restarts = 0
+    restarts, trace, max_open = 0, [], 0
     path = tmp_path / "month.db"
     repo = Repository(path)
     repo.initialize_spot_checkpoint(ex.fetch_account_snapshot(), {"operator": "simulation", "reason": "quiet initial state"})
@@ -34,10 +35,7 @@ def test_thirty_virtual_days_preserve_inventory_budget_and_restart_invariants(tm
             ex.now = start + timedelta(minutes=30 * tick)
             consumed += D("0.02")
             ex.futures_change("BNB", D("-0.02"))
-            for order in tuple(ex.orders.values()):
-                if order.is_open and order.time_in_force != "IOC":
-                    ex.fill(order.order_id, min(order.remaining_qty, D("0.20")))
-                    break
+            ex.fill_ordinary_orders(D("0.20"))
             if tick and tick % 144 == 0:
                 repo.close()
                 repo = Repository(path)
@@ -58,9 +56,22 @@ def test_thirty_virtual_days_preserve_inventory_budget_and_restart_invariants(tm
             assert not repo.load("futures_settlement_issue"), tick
             assert not repo.operations(unresolved_only=True), tick
             assert repo.runtime().run_mode != RunMode.PAUSED, tick
+            if repo.runtime().state.value == "IDLE":
+                assert not ex.fetch_open_orders(cfg.symbol), tick
+            trace.append({"at": ex.now, "contract_bnb": account.contract_bnb, "state": repo.runtime().state.value})
+            max_open = max(max_open, len(ex.fetch_open_orders(cfg.symbol)))
         bought = sum((f.qty for f in ex.fills), D("0"))
         fees = sum((f.commission for f in ex.fills), D("0"))
         assert account.contract_bnb + account.spot_bnb == D("24.5") + bought - consumed - fees
+        tolerance = ex.fetch_symbol_filters(cfg.symbol).min_transfer_bnb
+        inventory = inventory_metrics(trace, start, cfg, tolerance)
+        assert inventory["first_observed_recovery_hours"]["25"] <= D("1")
+        assert inventory["first_observed_recovery_hours"]["28"] <= D("2")
+        assert inventory["below_floor_observations_after_initial_recovery"] == 0
+        assert len(inventory["completed_rounds"]) >= 2, inventory
+        assert inventory["completed_rounds"][0]["duration_hours"] <= D("96")
+        assert all(cfg.thresholds.b_target-tolerance < round_["contract_bnb"] <= cfg.thresholds.b_target
+                   for round_ in inventory["completed_rounds"])
         result = {
             "virtual_days": 30, "ticks": 1440, "sqlite_reopens": restarts,
             "writes": dict(Counter(op.kind.value for op in ex.writes)),
@@ -68,8 +79,11 @@ def test_thirty_virtual_days_preserve_inventory_budget_and_restart_invariants(tm
             "futures_bnb_consumption": str(consumed),
             "final_contract_bnb": str(account.contract_bnb), "final_spot_bnb": str(account.spot_bnb),
             "peak_effective_supply_bnb": str(peak_supply), "peak_transfer_budget_usdt": str(peak_budget),
+            "maximum_open_orders": max_open,
+            "inventory": inventory,
         }
-        (tmp_path / "virtual_month_result.json").write_text(json.dumps(result, indent=2))
-        print(json.dumps(result))
+        (tmp_path / "virtual_month_result.json").write_text(json.dumps(result, default=str, indent=2))
+        (tmp_path / "inventory_trace.json").write_text(json.dumps(trace, default=str, indent=2))
+        print(json.dumps(result, default=str))
     finally:
         repo.close()

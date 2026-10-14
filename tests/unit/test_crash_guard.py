@@ -67,10 +67,12 @@ def test_guard_ceiling_never_rises_or_resets_fill_allowance_on_retrigger():
     assert next_guard.filled_bnb == D("2")
 
 
-def test_urgent_guard_targets_26_and_shares_gross_episode_limit():
+@pytest.mark.parametrize("margin_change", [None, D("-10000")])
+def test_urgent_guard_targets_26_and_shares_gross_episode_limit(margin_change):
     inputs = make_engine_inputs(
         account=make_account(contract_bnb=D("24"), spot_usd=D("10000"))
     )
+    inputs = replace(inputs, margin_change_24h=margin_change)
     guard = CrashGuardState(
         True,
         "episode",

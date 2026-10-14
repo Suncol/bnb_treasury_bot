@@ -45,6 +45,8 @@ def _decode(value):
         return datetime.fromisoformat(value["value"])
     if kind == "tuple":
         return tuple(value["value"])
+    if kind == "RuntimeState" and "resume_repricing" in value["fields"]:
+        value["fields"]["resume_replanning"] = value["fields"].pop("resume_repricing")
     if kind in TYPES:
         return (
             TYPES[kind](**value["fields"])

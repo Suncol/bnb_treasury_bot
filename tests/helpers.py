@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from core.models import (
@@ -22,6 +22,15 @@ from core.models import (
 
 def D(value: str | int | float) -> Decimal:
     return Decimal(str(value))
+
+
+def depth_messages(now=None, update_id=1, ask_qty="3.5"):
+    now = now or datetime(2026, 10, 13, tzinfo=timezone.utc)
+    return (
+        {"lastUpdateId": update_id, "bids": [["599", "1"]], "asks": [["601", ask_qty]]},
+        {"e": "depthUpdate", "s": "BNBUSDT", "E": int(now.timestamp() * 1000),
+         "U": update_id, "u": update_id, "b": [], "a": []},
+    )
 
 
 def make_strategy_config() -> StrategyConfig:

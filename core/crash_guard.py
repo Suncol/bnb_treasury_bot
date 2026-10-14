@@ -22,21 +22,44 @@ def valid_market(inputs: EngineInputs, cfg: StrategyConfig) -> bool:
 def valid_market_snapshot(
     m: MarketSnapshot, now: datetime, cfg: StrategyConfig
 ) -> bool:
+    return not market_invalid_reasons(m, now, cfg)
+
+
+def market_invalid_reasons(
+    m: MarketSnapshot, now: datetime, cfg: StrategyConfig
+) -> tuple[str, ...]:
+    """The gate and its diagnostics share the same validation rules."""
+    reasons = []
+    lifetime = cfg.crash_guard.max_market_age_seconds
+    if m.symbol != cfg.symbol:
+        reasons.append("MARKET_SYMBOL")
+    if not fresh(m.ts, now, lifetime):
+        reasons.append("MARKET_TIMESTAMP")
+    if m.quote_ts is not None and not fresh(m.quote_ts, now, lifetime):
+        reasons.append("QUOTE_TIMESTAMP")
+    if m.vwap_requested_at is not None:
+        if not fresh(m.vwap_requested_at, now, lifetime):
+            reasons.append("VWAP_OBSERVATION_TIMESTAMP")
+        if (m.vwap_received_at is None
+                or not utc(m.vwap_requested_at) <= utc(m.vwap_received_at) <= utc(now)):
+            reasons.append("VWAP_RESPONSE_TIMESTAMP")
+    if (m.vwap_close_time is not None and m.vwap_received_at is not None
+            and utc(m.vwap_close_time) > utc(m.vwap_received_at)):
+        reasons.append("VWAP_TRADE_TIME_FUTURE")
     values = (m.best_bid, m.best_ask, m.mid_price, m.vwap_5m)
     drawdowns = (m.drawdown_1m, m.drawdown_5m, m.drawdown_15m)
-    return (
-        m.symbol == cfg.symbol
-        and fresh(m.ts, now, cfg.crash_guard.max_market_age_seconds)
-        and all(v.is_finite() and v > 0 for v in values)
-        and m.best_bid <= m.mid_price <= m.best_ask
-        and all(v is None or (v.is_finite() and 0 <= v <= 1) for v in drawdowns)
-        and (
-            m.smooth_price is None
-            or (m.smooth_price.is_finite() and m.smooth_price > 0)
-        )
-        and m.return_1h.is_finite()
-        and m.return_24h.is_finite()
-    )
+    if not all(v.is_finite() and v > 0 for v in values):
+        reasons.append("MARKET_PRICES")
+    elif not m.best_bid <= m.mid_price <= m.best_ask:
+        reasons.append("MARKET_BOOK")
+    if not all(v is None or (v.is_finite() and 0 <= v <= 1) for v in drawdowns):
+        reasons.append("MARKET_DRAWDOWNS")
+    if (m.smooth_price is not None
+            and (not m.smooth_price.is_finite() or m.smooth_price <= 0)):
+        reasons.append("MARKET_SMOOTH_PRICE")
+    if not m.return_1h.is_finite() or not m.return_24h.is_finite():
+        reasons.append("MARKET_RETURNS")
+    return tuple(reasons)
 
 
 def update_crash_guard(inputs: EngineInputs, cfg: StrategyConfig) -> CrashGuardState:

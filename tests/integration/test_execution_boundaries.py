@@ -38,7 +38,7 @@ def seed_bid(exchange, repo, *, age_hours=0, qty="1"):
     from services.reconciliation import Reconciler
 
     Reconciler(exchange, repo, cfg).refresh(exchange.now)
-    op = Executor(exchange, repo, cfg).execute(
+    op = Executor(exchange, repo, cfg, clock=lambda: exchange.now).execute(
         OrderPlan(cfg.symbol, "BUY", "LIMIT_MAKER", D(qty), D("598"), "GTC", True),
         exchange.now - timedelta(hours=age_hours),
         ReplenishmentState.ACCUMULATE,
@@ -223,7 +223,7 @@ def test_non_inventory_reprice_replaces_net_gap_and_keeps_quote_funds(
     assert len(replacements) == 3
     assert sum(o.payload.qty for o in replacements) == D("5")
     assert not any(o.kind == OperationKind.TRANSFER for o in exchange.writes)
-    assert not repo.runtime().resume_repricing
+    assert not repo.runtime().resume_replanning
 
 
 def test_reprice_unknown_cancel_waits_and_resumes_after_restart(tmp_path):
@@ -234,7 +234,7 @@ def test_reprice_unknown_cancel_waits_and_resumes_after_restart(tmp_path):
     exchange.cancel_fill_qty = D("1")
     run(runner, exchange, inventory=False)
     assert len(exchange.writes) == 2
-    assert repo.runtime().resume_repricing
+    assert repo.runtime().resume_replanning
     repo.close()
     repo = Repository(tmp_path / "test.sqlite3")
     runner = Runner(exchange, repo, make_strategy_config(), clock=lambda: exchange.now)
@@ -261,7 +261,7 @@ def test_reprice_waiting_for_slice_retains_continuation_and_funds(tmp_path):
     )
     run(runner, exchange, inventory=False)
     assert len(exchange.writes) == 2
-    assert repo.runtime().resume_repricing
+    assert repo.runtime().resume_replanning
     exchange.now = deadline
     run(runner, exchange, inventory=False)
     replacements = [o for o in exchange.writes[2:] if o.kind == OperationKind.ORDER]
@@ -279,7 +279,7 @@ def test_rejected_reprice_retains_funds_and_resumes_on_account_tick(tmp_path, re
     assert exchange.orders[bid.exchange_id].status == "CANCELED"
     assert len(exchange.writes) == 3  # Old bid, cancel, one rejected replacement.
     assert any(o.status == OperationStatus.FAILED for o in repo.operations())
-    assert repo.runtime().resume_repricing
+    assert repo.runtime().resume_replanning
     exchange.reject_kind = None
     if restart:
         repo.close()
@@ -291,14 +291,14 @@ def test_rejected_reprice_retains_funds_and_resumes_on_account_tick(tmp_path, re
     runner.tick(replace(exchange.fetch_market_snapshot("BNBUSDT"), return_1h=D("0.10")))
     assert len(exchange.writes) == 3
     assert exchange.account.spot_usd == D("5000")
-    assert repo.runtime().resume_repricing
+    assert repo.runtime().resume_replanning
     exchange.now += timedelta(seconds=11)
     runner.tick()
     replacements = exchange.writes[3:]
     assert len(replacements) == 3
     assert all(o.kind == OperationKind.ORDER for o in replacements)
     assert sum(o.payload.qty for o in replacements) == D("5")
-    assert not repo.runtime().resume_repricing
+    assert not repo.runtime().resume_replanning
     exchange.now += timedelta(seconds=11)
     runner.tick()
     assert len(exchange.writes) == 6
@@ -335,13 +335,13 @@ def test_rejected_reprice_preserves_slice_deadline_and_funds(tmp_path):
     run(runner, exchange, inventory=False)
     deadline = repo.runtime().slice_state.next_at
     assert deadline == exchange.now + timedelta(minutes=30)
-    assert repo.runtime().resume_repricing
+    assert repo.runtime().resume_replanning
     exchange.reject_kind = None
     exchange.now += timedelta(seconds=11)
     run(runner, exchange, inventory=False)
     assert len(exchange.writes) == 3
     assert repo.runtime().slice_state.next_at == deadline
-    assert repo.runtime().resume_repricing
+    assert repo.runtime().resume_replanning
     exchange.now = deadline
     run(runner, exchange, inventory=False)
     assert sum(o.payload.qty for o in exchange.writes[3:]) == D("3")
@@ -357,7 +357,7 @@ def test_repeated_reprice_rejections_still_pause_automatic_execution(tmp_path):
         runner.tick()
         exchange.now += timedelta(seconds=11)
     assert repo.runtime().run_mode == RunMode.PAUSED
-    assert repo.runtime().resume_repricing
+    assert repo.runtime().resume_replanning
     assert len(exchange.writes) == 5  # Old bid, cancel, three distinct rejections.
     exchange.reject_kind = None
     runner.tick()
@@ -372,13 +372,13 @@ def test_unknown_reprice_order_does_not_restore_continuation_after_restart(tmp_p
     exchange.query_operation = lambda op: OperationResult(OperationStatus.UNKNOWN)
     runner.tick()
     assert len(exchange.writes) == 3
-    assert not repo.runtime().resume_repricing
+    assert not repo.runtime().resume_replanning
     repo.close()
     repo = Repository(tmp_path / "test.sqlite3")
     runner = Runner(exchange, repo, make_strategy_config(), clock=lambda: exchange.now)
     runner.tick()
     assert all(o.kind == OperationKind.CANCEL for o in exchange.writes[3:])
-    assert not repo.runtime().resume_repricing
+    assert not repo.runtime().resume_replanning
     assert repo.operations(unresolved_only=True)
     exchange.query_operation = lambda op: FakeExchange.query_operation(exchange, op)
     exchange.now += timedelta(seconds=11)

@@ -9,6 +9,7 @@ from .models import (
     ExecutionConfig,
     MarketSnapshot,
     OrderPlan,
+    OrderView,
     ReplenishmentState,
     StateDecision,
     StrategyConfig,
@@ -19,6 +20,19 @@ from .models import (
 def compute_ref_price(market: MarketSnapshot) -> Decimal:
     anchor_ask = market.best_ask * Decimal("0.999")
     return min(market.mid_price, market.vwap_5m, anchor_ask)
+
+
+def ordinary_layers(
+    state: ReplenishmentState, ref_price: Decimal,
+    filters: SymbolFilters, cfg: ExecutionConfig,
+) -> tuple[tuple[Decimal, Decimal], ...]:
+    """One price grid serves new orders and periodic reassessment."""
+    discounts = cfg.watch_discounts if state == ReplenishmentState.WATCH else cfg.accumulate_discounts
+    layers: dict[Decimal, Decimal] = {}
+    for weight, discount in zip(cfg.layer_weights, discounts):
+        price = floor_to_multiple(ref_price * (1 - discount), filters.price_tick)
+        layers[price] = layers.get(price, Decimal("0")) + weight
+    return tuple((weight, price) for price, weight in layers.items())
 
 
 def order_passes_filters(order: OrderPlan, filters: SymbolFilters) -> bool:
@@ -72,23 +86,25 @@ def _max_affordable_qty(
 
 def _layered_orders(
     total_qty: Decimal,
-    ref_price: Decimal,
     symbol: str,
     filters: SymbolFilters,
-    weights: tuple[Decimal, Decimal, Decimal],
-    discounts: tuple[Decimal, Decimal, Decimal],
+    layers: tuple[tuple[Decimal, Decimal], ...],
     order_type: str,
     time_in_force: str | None,
     post_only: bool,
+    existing_orders: tuple[OrderView, ...] = (),
 ) -> tuple[OrderPlan, ...]:
+    occupied = {o.price for o in existing_orders}
+    slots = max(0, len(layers) - len(existing_orders))
+    available = tuple((weight, price) for weight, price in layers if price not in occupied)[:slots]
+    weight_sum = sum((weight for weight, _ in available), Decimal("0"))
+    if not available or weight_sum <= 0:
+        return ()
     plans: list[OrderPlan] = []
     carry_qty = Decimal("0")
 
-    for index, (weight, discount) in enumerate(zip(weights, discounts)):
-        raw_qty = (total_qty * weight) + carry_qty
-        price = floor_to_multiple(
-            ref_price * (Decimal("1") - discount), filters.price_tick
-        )
+    for index, (weight, price) in enumerate(available):
+        raw_qty = (total_qty * weight / weight_sum) + carry_qty
         qty = floor_to_multiple(raw_qty, filters.qty_step)
 
         valid = (
@@ -113,7 +129,7 @@ def _layered_orders(
         else:
             carry_qty = raw_qty
 
-        if index == len(weights) - 1 and carry_qty > Decimal("0") and plans:
+        if index == len(available) - 1 and carry_qty > Decimal("0") and plans:
             qty = floor_to_multiple(carry_qty, filters.qty_step)
             plans[-1] = replace(plans[-1], qty=plans[-1].qty + qty)
 
@@ -127,6 +143,7 @@ def plan_watch_orders(
     cfg: ExecutionConfig,
     symbol: str,
     quote_budget: Decimal | None,
+    existing_orders: tuple[OrderView, ...] = (),
 ) -> BuyPlan:
     total_qty = _max_affordable_qty(delta_bnb, ref_price, quote_budget, filters)
     if total_qty == Decimal("0"):
@@ -137,14 +154,13 @@ def plan_watch_orders(
         state=ReplenishmentState.WATCH,
         orders=_layered_orders(
             total_qty=total_qty,
-            ref_price=ref_price,
             symbol=symbol,
             filters=filters,
-            weights=cfg.layer_weights,
-            discounts=cfg.watch_discounts,
+            layers=ordinary_layers(ReplenishmentState.WATCH, ref_price, filters, cfg),
             order_type="LIMIT_MAKER",
             time_in_force="GTC",
             post_only=True,
+            existing_orders=existing_orders,
         ),
         reason="Layered WATCH accumulation",
     )
@@ -157,6 +173,7 @@ def plan_accumulate_orders(
     cfg: ExecutionConfig,
     symbol: str,
     quote_budget: Decimal | None,
+    existing_orders: tuple[OrderView, ...] = (),
 ) -> BuyPlan:
     total_qty = _max_affordable_qty(delta_bnb, ref_price, quote_budget, filters)
     if total_qty == Decimal("0"):
@@ -168,14 +185,13 @@ def plan_accumulate_orders(
         state=ReplenishmentState.ACCUMULATE,
         orders=_layered_orders(
             total_qty=total_qty,
-            ref_price=ref_price,
             symbol=symbol,
             filters=filters,
-            weights=cfg.layer_weights,
-            discounts=cfg.accumulate_discounts,
+            layers=ordinary_layers(ReplenishmentState.ACCUMULATE, ref_price, filters, cfg),
             order_type="LIMIT",
             time_in_force="GTC",
             post_only=False,
+            existing_orders=existing_orders,
         ),
         reason="Layered ACCUMULATE execution",
     )
@@ -228,6 +244,7 @@ def plan_buy_orders(
     filters: SymbolFilters,
     cfg: StrategyConfig,
     quote_budget: Decimal | None,
+    *, existing_orders: tuple[OrderView, ...] = (), queued_order: OrderPlan | None = None,
 ) -> BuyPlan:
     """Normalize demand; None is for funding estimates, never executable orders."""
     ref_price = compute_ref_price(market)
@@ -251,6 +268,32 @@ def plan_buy_orders(
             reason="Chase filter: keep lower existing bids only",
         )
 
+    owned = tuple(o for o in existing_orders if o.symbol == cfg.symbol and o.side == "BUY"
+                  and o.strategy_id == cfg.strategy_id and o.is_open and o.time_in_force != "IOC")
+    if queued_order is not None:
+        urgent = state_decision.confirmed_state == ReplenishmentState.URGENT
+        layers = () if urgent else ordinary_layers(
+            state_decision.confirmed_state, ref_price, filters, cfg.execution)
+        ceiling = (
+            ceil_to_multiple(max(market.best_ask, ref_price) * (1 + cfg.execution.urgent_ioc_buffer),
+                             filters.price_tick)
+            if urgent else max(price for _, price in layers)
+        )
+        available = urgent or (
+            len(owned) < len(layers)
+            and all(o.price != queued_order.price for o in owned)
+        )
+        valid = (
+            available and queued_order.symbol == cfg.symbol and queued_order.side == "BUY"
+            and queued_order.time_in_force == ("IOC" if urgent else "GTC")
+            and order_passes_filters(queued_order, filters)
+            and queued_order.price <= ceiling
+            and queued_order.qty <= _max_affordable_qty(
+                state_decision.delta_bnb, queued_order.price, quote_budget, filters)
+        )
+        return BuyPlan(state_decision.confirmed_state, (queued_order,) if valid else (),
+                       "Validate remaining group against current execution limits")
+
     if state_decision.confirmed_state == ReplenishmentState.WATCH:
         return plan_watch_orders(
             state_decision.delta_bnb,
@@ -259,6 +302,7 @@ def plan_buy_orders(
             cfg.execution,
             cfg.symbol,
             quote_budget,
+            owned,
         )
     if state_decision.confirmed_state == ReplenishmentState.ACCUMULATE:
         return plan_accumulate_orders(
@@ -268,6 +312,7 @@ def plan_buy_orders(
             cfg.execution,
             cfg.symbol,
             quote_budget,
+            owned,
         )
     return plan_urgent_orders(
         state_decision.delta_bnb,

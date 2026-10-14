@@ -32,6 +32,7 @@ class TransitionReason(str, Enum):
     DEPLETION_24H = "DEPLETION_24H"
     DEPLETION_72H = "DEPLETION_72H"
     HIGH_BALANCE = "HIGH_BALANCE"
+    REPLENISHMENT_ACTIVE = "REPLENISHMENT_ACTIVE"
     HYSTERESIS_CONFIRMED = "HYSTERESIS_CONFIRMED"
     EXIT_URGENT_BUFFER = "EXIT_URGENT_BUFFER"
     DATA_INVALID = "DATA_INVALID"
@@ -60,6 +61,7 @@ class RiskConfig:
     fee_reserve_rate: Decimal = Decimal("0.001")
     sweep_enabled: bool = True
     max_account_age_seconds: int = 10
+    # Legacy config compatibility only; margin losses no longer change the target.
     margin_drop_limit: Decimal = Decimal("500")
     margin_target_reduction: Decimal = Decimal("3")
 
@@ -153,6 +155,10 @@ class AccountSnapshot:
     contract_quote_balance: Decimal | None = None
     contract_bnb_updated_at: datetime | None = None
     contract_quote_updated_at: datetime | None = None
+    # Currency verified for the aggregate margin response; USD needs FX evidence.
+    contract_margin_asset: str | None = None
+    # Confirmed wallet events covered by this reconciled observation.
+    wallet_event_cursor: int | None = None
 
 
 @dataclass(frozen=True)
@@ -222,6 +228,13 @@ class MarketSnapshot:
     sample_continuity: str | None = None
     sample_stable_since: datetime | None = None
     sampled_at: datetime | None = None
+    # Public REST provenance travels with the exact snapshot used by the plan.
+    # avgPrice.closeTime is the last trade time, not the observation time.
+    quote_ts: datetime | None = None
+    vwap_requested_at: datetime | None = None
+    vwap_received_at: datetime | None = None
+    vwap_close_time: datetime | None = None
+    vwap_cache_hit: bool | None = None
 
     @property
     def windows_ready(self) -> bool:
@@ -346,6 +359,7 @@ class EngineInputs:
     now: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     orders: tuple[OrderView, ...] = ()
     crash_guard: CrashGuardState = field(default_factory=lambda: CrashGuardState())
+    # Retained for accounting diagnostics, never used to reduce replenishment.
     margin_change_24h: Decimal | None = None
     slice_state: SliceState = field(default_factory=lambda: SliceState())
     advance_state: bool = True
@@ -533,4 +547,5 @@ class RuntimeState:
     transfer_failures: int = 0
     pause_reason: str = ""
     resume_replenishment: bool = False
-    resume_repricing: bool = False
+    # Replan an unstarted group after cancellation or a prerequisite BNB return.
+    resume_replanning: bool = False

@@ -68,17 +68,36 @@ def test_every_unresolved_operation_blocks_new_actions(pending):
     assert plan.bnb_transfer_plan is None and plan.spot_usd_sweep_plan is None
 
 
-def test_watch_uses_batch_minimum_and_accumulate_does_not():
+@pytest.mark.parametrize("balance,state,spot,reserved,rate,amount", [
+    ("28", ReplenishmentState.ACCUMULATE, "0.8", "0", "0.04", None),
+    ("30", ReplenishmentState.WATCH, "1.5", "0", "0.04", None),
+    ("30", ReplenishmentState.ACCUMULATE, "1.5", "0", "0.04", None),
+    ("28", ReplenishmentState.ACCUMULATE, "2.5", "0", "0.04", "2"),
+    ("27.99", ReplenishmentState.WATCH, "0.8", "0", "0.04", "0.3"),
+    ("27.99", ReplenishmentState.ACCUMULATE, "0.8", "0", "0.04", "0.3"),
+    ("30", ReplenishmentState.URGENT, "0.8", "0", "2", "0.3"),
+    ("25", ReplenishmentState.WATCH, "0.8", "0", "0.04", "0.3"),
+    ("27.5", ReplenishmentState.ACCUMULATE, "0.59", "0", "0.04", None),
+    ("27.5", ReplenishmentState.ACCUMULATE, "1.0", "0.3", "0.04", "0.2"),
+    ("28", ReplenishmentState.ACCUMULATE, "2.6", "0.2", "0.04", None),
+    ("31.89", ReplenishmentState.ACCUMULATE, "0.69", "0", "0.04", "0.11"),
+    ("31.9", ReplenishmentState.ACCUMULATE, "0.60", "0", "0.04", "0.10"),
+    ("40", ReplenishmentState.ACCUMULATE, "3.5", "0", "0.04", None),
+])
+def test_bnb_return_batches_by_confirmed_inventory_and_urgency(
+    balance, state, spot, reserved, rate, amount
+):
     inputs = make_engine_inputs(
-        account=make_account(contract_bnb=D("30"), spot_bnb=D("1.5")),
-        previous_state=ReplenishmentState.WATCH,
+        account=replace(make_account(contract_bnb=D(balance), spot_bnb=D(spot)),
+                        reserved_spot_bnb=D(reserved)),
+        previous_state=state, consumption_rate=D(rate),
     )
-    assert build_cycle_plan(inputs, make_strategy_config()).bnb_transfer_plan is None
-    plan = build_cycle_plan(
-        replace(inputs, previous_state=ReplenishmentState.ACCUMULATE),
-        make_strategy_config(),
-    )
-    assert plan.bnb_transfer_plan.amount == D("1")
+    plan = build_cycle_plan(inputs, make_strategy_config())
+    if amount is None:
+        assert plan.bnb_transfer_plan is None
+    else:
+        assert plan.bnb_transfer_plan is not None
+        assert plan.bnb_transfer_plan.amount == D(amount)
 
 
 def test_exchange_transfer_minimum_applies_after_budget_clipping():
@@ -138,12 +157,52 @@ def test_idle_cancels_old_bids_even_when_zero_deficit():
     assert build_cycle_plan(inputs, make_strategy_config()).cancellations
 
 
-def test_margin_deterioration_reduces_target_and_cancels_excess():
+@pytest.mark.parametrize("margin_change", [None, D("-500"), D("-501"), D("-10000")])
+def test_margin_loss_keeps_target_and_valid_existing_bids(margin_change):
     plan = build_cycle_plan(
-        inputs_with_orders(order("large", qty="5"), margin_change_24h=D("-501")),
+        inputs_with_orders(order("large", qty="5"), margin_change_24h=margin_change),
         make_strategy_config(),
     )
-    assert plan.active_buy_target == D("29") and plan.cancellations
+    assert plan.active_buy_target == D("32")
+    assert plan.state_decision.delta_bnb == 0
+    assert not plan.cancellations and not plan.buy_plan.orders
+
+
+def test_margin_loss_keeps_full_bnb_transfer_target():
+    inputs = make_engine_inputs(
+        account=make_account(contract_bnb=D("24"), spot_bnb=D("12.5"))
+    )
+    plan = build_cycle_plan(
+        replace(inputs, margin_change_24h=D("-10000")), make_strategy_config()
+    )
+    assert plan.active_buy_target == D("32")
+    assert plan.bnb_transfer_plan.amount == D("8")
+
+
+@pytest.mark.parametrize(
+    "withdraw,budget_used,expected_gate,expected_level",
+    [
+        ("4000", "0", GateStatus.HARD_VETO, "WARNING"),
+        ("100000", "3000", GateStatus.BLOCKED, "BUDGET_EXHAUSTED"),
+    ],
+)
+def test_margin_loss_does_not_bypass_funding_limits(
+    withdraw, budget_used, expected_gate, expected_level
+):
+    inputs = make_engine_inputs(
+        account=make_account(
+            contract_bnb=D("27"), contract_max_withdraw_amount=D(withdraw)
+        ),
+        previous_state=ReplenishmentState.ACCUMULATE,
+        budget_used_24h=D(budget_used),
+    )
+    plan = build_cycle_plan(
+        replace(inputs, margin_change_24h=D("-10000")), make_strategy_config()
+    )
+    assert plan.active_buy_target == D("32")
+    assert plan.transfer_decision.gate_status == expected_gate
+    assert plan.transfer_decision.level == expected_level
+    assert not plan.transfer_decision.allow and not plan.buy_plan.orders
 
 
 def test_slice_persists_below_initial_threshold_and_waits():
@@ -238,7 +297,9 @@ def test_funding_requires_an_order_valid_at_its_final_price(state, gap, minimum)
         ),
         previous_state=state,
     )
-    inputs = replace(inputs, filters=replace(inputs.filters, min_notional=D(minimum)))
+    inputs = replace(inputs, filters=replace(
+        inputs.filters, min_notional=D(minimum), min_transfer_bnb=D("0.01")
+    ))
     plan = build_cycle_plan(inputs, make_strategy_config())
     # At notional 6 the IOC qualifies at its rounded limit, discounted bids do not.
     eligible = gap == "0.01" and minimum == "6" and state == ReplenishmentState.URGENT

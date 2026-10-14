@@ -1,4 +1,5 @@
 from dataclasses import replace
+from contextlib import contextmanager
 from datetime import timedelta
 from uuid import uuid4
 
@@ -11,7 +12,8 @@ from core.models import (
     OrderPlan,
     RunMode,
 )
-from core.time_utils import utc
+from core.time_utils import fresh, utc
+from core.validation import valid_account_snapshot
 
 from .exchange_adapter import ExchangeError, RequestRejected, order_matches_operation
 
@@ -35,6 +37,21 @@ class Executor:
     def __init__(self, exchange, repository, cfg, *, clock=None):
         self.exchange, self.repository, self.cfg = exchange, repository, cfg
         self.clock = clock or getattr(exchange, "clock", None)
+        self._income_batch = False
+        self._income_audited_at = None
+
+    @contextmanager
+    def income_batch(self):
+        self._income_batch, self._income_audited_at = True, None
+        try:
+            yield
+        finally:
+            self._income_batch, self._income_audited_at = False, None
+
+    def income_audited(self, now):
+        return self._income_batch and self._income_audited_at is not None and fresh(
+            self._income_audited_at, now, self.cfg.risk.max_account_age_seconds
+        )
 
     def cancel_due(self, payload, now):
         op = self.repository.cancel_operation(payload.symbol, payload.order_id)
@@ -44,7 +61,20 @@ class Executor:
             and utc(now) >= utc(op.cancel_retry_at or op.created_at + timedelta(seconds=2))
         )
 
-    def execute(self, payload, now, state, *, starts_slice=False, account=None):
+    def _require_reconciled(self):
+        runtime = self.repository.runtime()
+        if (
+            runtime.run_mode == RunMode.PAUSED
+            or self.repository.operations(unresolved_only=True)
+            or self.repository.load("spot_settlement_issue")
+            or self.repository.load("futures_settlement_issue")
+            or self.repository.load("spot_checkpoint") is None
+        ):
+            raise RuntimeError("New operations require an unpaused, reconciled runtime")
+        return runtime
+
+    def execute(self, payload, now, state, *, starts_slice=False, account=None,
+                resume_replanning=False):
         kind, scope = operation_scope(payload)
         if kind == OperationKind.CANCEL:
             existing = self.repository.cancel_operation(
@@ -57,20 +87,32 @@ class Executor:
             checker(
                 protective=kind == OperationKind.CANCEL
             )  # No unsent UNKNOWN intent.
-        previous_runtime = self.repository.runtime()
+        previous_runtime = (
+            self.repository.runtime() if kind == OperationKind.CANCEL else self._require_reconciled()
+        )
         runtime = previous_runtime
-        if kind != OperationKind.CANCEL:
-            if (
-                runtime.run_mode == RunMode.PAUSED
-                or self.repository.operations(unresolved_only=True)
-                or self.repository.load("spot_settlement_issue")
-                or self.repository.load("spot_checkpoint") is None
-            ):
-                raise RuntimeError(
-                    "New operations require an unpaused, reconciled runtime"
-                )
         if kind != OperationKind.CANCEL and account is None:
             account = self.exchange.fetch_account_snapshot()
+        if kind != OperationKind.CANCEL and (
+            not valid_account_snapshot(account, self.clock() if self.clock else now, self.cfg)
+            or (
+                account.contract_total_margin_balance is not None
+                and account.contract_margin_asset != self.cfg.quote_asset
+            )
+        ):
+            raise RuntimeError("New operations require a valid, supported account observation")
+        if account is not None and account.wallet_event_cursor is None:
+            account = replace(account, wallet_event_cursor=self.repository.wallet_cursor())
+        if kind != OperationKind.CANCEL and not self.income_audited(self.clock() if self.clock else now):
+            # Direct callers have no batch audit; reuse the supplied balance and
+            # the same reconciliation/storage code without another account read.
+            from .reconciliation import Reconciler
+
+            reconciler = Reconciler(self.exchange, self.repository, self.cfg, clock=self.clock)
+            if not reconciler.audit_income(account, self.clock() if self.clock else account.ts):
+                raise RuntimeError("New operations require reconciled futures income")
+            self._income_audited_at = account.ts
+            previous_runtime = runtime = self._require_reconciled()
         op = Operation(
             "bt-" + uuid4().hex,
             kind,
@@ -96,11 +138,14 @@ class Executor:
             )
         if kind == OperationKind.TRANSFER and payload.to_account == "SPOT":
             runtime = replace(runtime, resume_replenishment=True)
-        elif kind == OperationKind.CANCEL and payload.replenish_after_cancel:
-            runtime = replace(runtime, resume_repricing=True)
+        elif (
+            kind == OperationKind.CANCEL and payload.replenish_after_cancel
+            or kind == OperationKind.TRANSFER and payload.asset == "BNB" and resume_replanning
+        ):
+            runtime = replace(runtime, resume_replanning=True)
         elif kind == OperationKind.ORDER:
             runtime = replace(
-                runtime, resume_replenishment=False, resume_repricing=False
+                runtime, resume_replenishment=False, resume_replanning=False
             )
         self.repository.record_intent(op, runtime)
         if kind == OperationKind.CANCEL:
@@ -203,7 +248,7 @@ class Executor:
             runtime = replace(
                 self.repository.runtime(),
                 resume_replenishment=previous_runtime.resume_replenishment,
-                resume_repricing=previous_runtime.resume_repricing,
+                resume_replanning=previous_runtime.resume_replanning,
             )
         if cooldown is not None:
             runtime = runtime or self.repository.runtime()

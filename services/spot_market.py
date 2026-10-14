@@ -1,6 +1,9 @@
 """Public Spot market data and shared filter normalization; no account credentials."""
 
-from dataclasses import replace
+import json
+import logging
+from dataclasses import dataclass, replace
+from datetime import datetime
 from decimal import Decimal
 
 from binance_common.configuration import ConfigurationRestAPI
@@ -10,8 +13,18 @@ from core.models import MarketSnapshot, SymbolFilters
 from core.time_utils import fresh, utc
 from .exchange_adapter import ExchangeError
 from .sdk_transport import SDKTransport, millis, timestamp
+from .price_refresh import PriceRefresh
 
 D = Decimal
+
+
+@dataclass(frozen=True)
+class _AveragePrice:
+    price: Decimal
+    minutes: int
+    close_time: datetime
+    requested_at: datetime
+    received_at: datetime
 
 
 class SpotMarketData(SDKTransport):
@@ -26,6 +39,29 @@ class SpotMarketData(SDKTransport):
             timeout=5000, retries=0, backoff=0,
         )).rest_api
         self._order_count = order_count
+        self._price_refresh = None
+
+    def start_price_refresh(self, *, client=None):
+        if self._price_refresh is not None:
+            return
+        # Public reads own their session and never execute a repository callback.
+        client = client if client is not None else Spot(config_rest_api=ConfigurationRestAPI(
+            timeout=1000, retries=0, backoff=0,
+        )).rest_api
+        self._price_client = client
+        self._price_refresh = PriceRefresh(
+            clock=self.clock, lifetime=self.cfg.crash_guard.max_market_age_seconds,
+            close_client=lambda: client._session.close() if hasattr(client, "_session") else None,
+        )
+
+    def close_price_refresh(self):
+        if self._price_refresh is not None:
+            self._price_refresh.close()
+
+    def invalidate_filters(self, symbol):
+        self.cache.pop("filters:" + symbol, None)
+        if self._price_refresh is not None:
+            self._price_refresh.invalidate()
 
     def _filter_overrides(self, symbol):
         return {}
@@ -169,49 +205,18 @@ class SpotMarketData(SDKTransport):
             rules[k] for k in ("PERCENT_PRICE", "PERCENT_PRICE_BY_SIDE") if k in rules
         ]
         if percentage:
-            reference = self._call(self.spot.reference_price, symbol=symbol)
-            for rule in percentage:
-                if reference.get("referencePrice") is not None:
-                    anchor = D(reference["referencePrice"])
-                    if not fresh(
-                        timestamp(reference["timestamp"]),
-                        self.clock(),
-                        self.cfg.crash_guard.max_market_age_seconds,
-                    ):
-                        raise ExchangeError("Stale exchange reference price")
-                elif int(rule["avgPriceMins"]) == 0:
-                    anchor = D(
-                        self._call(self.spot.ticker_price, symbol=symbol)["price"]
-                    )
-                else:
-                    avg = self._call(self.spot.avg_price, symbol=symbol)
-                    if int(avg["mins"]) != int(rule["avgPriceMins"]) or not fresh(
-                        timestamp(avg["closeTime"]),
-                        self.clock(),
-                        self.cfg.crash_guard.max_market_age_seconds,
-                    ):
-                        raise ExchangeError(
-                            "No matching fresh average for percent-price filter"
-                        )
-                    anchor = D(avg["price"])
-                lower = (
-                    D(rule.get("bidMultiplierDown", rule.get("multiplierDown", "0")))
-                    * anchor
+            if self._price_refresh is None:
+                floor, ceiling, observed_at = self._percentage_bounds(
+                    symbol, percentage, floor, ceiling, self.spot, checkpoint=True,
                 )
-                upper = (
-                    D(rule.get("bidMultiplierUp", rule.get("multiplierUp", "0")))
-                    * anchor
+            else:
+                key = (symbol, json.dumps(percentage, sort_keys=True), floor, ceiling)
+                floor, ceiling, observed_at = self._price_refresh.read(
+                    key, lambda: self._percentage_bounds(
+                        symbol, percentage, normalized.min_price, normalized.max_price,
+                        self._price_client, checkpoint=False,
+                    ),
                 )
-                if (
-                    not anchor.is_finite()
-                    or anchor <= 0
-                    or not lower.is_finite()
-                    or not upper.is_finite()
-                    or not 0 <= lower <= upper
-                ):
-                    raise ExchangeError("Invalid percent-price bounds")
-                floor = max(floor, lower)
-                ceiling = upper if ceiling is None else min(ceiling, upper)
         slots = None
         if "EXCHANGE_MAX_NUM_ORDERS" in exchange_rules:
             slots = max(
@@ -227,7 +232,88 @@ class SpotMarketData(SDKTransport):
             observed_at=observed_at,
         )
 
+    def _percentage_bounds(self, symbol, percentage, floor, ceiling, client, *, checkpoint):
+        observed_at = self.clock()
+        reference = self._call(client.reference_price, checkpoint=checkpoint, symbol=symbol)
+        for rule in percentage:
+            if reference.get("referencePrice") is not None:
+                anchor = D(reference["referencePrice"])
+                if not fresh(
+                    timestamp(reference["timestamp"]),
+                    self.clock(),
+                    self.cfg.crash_guard.max_market_age_seconds,
+                ):
+                    raise ExchangeError("Stale exchange reference price")
+                observed_at = min(utc(observed_at), timestamp(reference["timestamp"]))
+            elif int(rule["avgPriceMins"]) == 0:
+                anchor = D(
+                    self._call(client.ticker_price, checkpoint=checkpoint, symbol=symbol)["price"]
+                )
+            else:
+                avg = self._call(client.avg_price, checkpoint=checkpoint, symbol=symbol)
+                if int(avg["mins"]) != int(rule["avgPriceMins"]) or not fresh(
+                    timestamp(avg["closeTime"]),
+                    self.clock(),
+                    self.cfg.crash_guard.max_market_age_seconds,
+                ):
+                    raise ExchangeError(
+                        "No matching fresh average for percent-price filter"
+                    )
+                anchor = D(avg["price"])
+            lower = (
+                D(rule.get("bidMultiplierDown", rule.get("multiplierDown", "0")))
+                * anchor
+            )
+            upper = (
+                D(rule.get("bidMultiplierUp", rule.get("multiplierUp", "0")))
+                * anchor
+            )
+            if (
+                not anchor.is_finite()
+                or anchor <= 0
+                or not lower.is_finite()
+                or not upper.is_finite()
+                or not 0 <= lower <= upper
+            ):
+                raise ExchangeError("Invalid percent-price bounds")
+            floor = max(floor, lower)
+            ceiling = upper if ceiling is None else min(ceiling, upper)
+        return floor, ceiling, observed_at
+
+    def _average_price(self, symbol):
+        key = "avg:" + symbol
+        cached = self.cache.get(key)
+        if cached is not None and not fresh(
+            cached[1].requested_at, self.clock(),
+            self.cfg.crash_guard.max_market_age_seconds,
+        ):
+            # A UTC jump must not turn a monotonic cache hit into fresh data.
+            self.cache.pop(key)
+
+        def fetch():
+            requested_at = utc(self.clock())
+            data = self._call(self.spot.avg_price, symbol=symbol)
+            received_at = utc(self.clock())
+            average = _AveragePrice(
+                D(data["price"]), data["mins"], timestamp(data["closeTime"]),
+                requested_at, received_at,
+            )
+            logging.getLogger("bnb_treasury.market").debug(
+                "AVG_PRICE symbol=%s price=%s mins=%s closeTime=%s "
+                "requested_at=%s received_at=%s",
+                symbol, average.price, average.minutes, data["closeTime"],
+                requested_at.isoformat(), received_at.isoformat(),
+            )
+            return average
+
+        average = self._cached(
+            key, min(2, self.cfg.crash_guard.max_market_age_seconds), fetch
+        )
+        return average, cached is not None and average is cached[1]
+
     def fetch_market_snapshot(self, symbol):
+        if self._price_refresh is not None:
+            self._price_refresh.kick()
         if self.feed is not None:
             streamed = self.feed.quote()
             quote_ts, bid, ask = streamed.ts, streamed.best_bid, streamed.best_ask
@@ -235,10 +321,8 @@ class SpotMarketData(SDKTransport):
             quote_ts = self.clock()
             book = self._call(self.spot.ticker_book_ticker, symbol=symbol)
             bid, ask = D(book["bidPrice"]), D(book["askPrice"])
-        avg = self._cached(
-            "avg:" + symbol, 2, lambda: self._call(self.spot.avg_price, symbol=symbol)
-        )
-        if avg["mins"] != 5:
+        avg, cache_hit = self._average_price(symbol)
+        if avg.minutes != 5:
             raise ExchangeError("Expected a 5 minute VWAP anchor")
         one = self._cached(
             "1h:" + symbol,
@@ -249,14 +333,22 @@ class SpotMarketData(SDKTransport):
             "24h:" + symbol, 10, lambda: self._call(self.spot.ticker24hr, symbol=symbol)
         )
         market = MarketSnapshot(
-            min(utc(quote_ts), timestamp(avg["closeTime"])),
+            # A successful read confirms the current average even when there
+            # has been no trade recently. Count network time and cached reuse
+            # against its lifetime; never retimestamp on receipt or cache hit.
+            min(utc(quote_ts), avg.requested_at),
             symbol,
             bid,
             ask,
             (bid + ask) / 2,
-            D(avg["price"]),
+            avg.price,
             D(one["priceChangePercent"]) / 100,
             D(day["priceChangePercent"]) / 100,
+            quote_ts=utc(quote_ts),
+            vwap_requested_at=avg.requested_at,
+            vwap_received_at=avg.received_at,
+            vwap_close_time=avg.close_time,
+            vwap_cache_hit=cache_hit,
         )
         if self.feed is not None:
             market = replace(

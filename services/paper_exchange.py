@@ -84,6 +84,14 @@ class PaperExchange:
     def account_identity(self):
         return self.ledger.identity()
 
+    def start_price_refresh(self):
+        if hasattr(self.market, "start_price_refresh"):
+            self.market.start_price_refresh()
+
+    def close_price_refresh(self):
+        if hasattr(self.market, "close_price_refresh"):
+            self.market.close_price_refresh()
+
     def fetch_market_snapshot(self, symbol):
         if symbol != self.cfg.symbol:
             raise ExchangeError("Unsupported paper symbol")

@@ -183,6 +183,7 @@ class PaperLedger:
             contract_quote_balance=state["contract_usd"], contract_total_margin_balance=state["contract_usd"],
             contract_bnb_updated_at=state["contract_bnb_updated_at"],
             contract_quote_updated_at=state["contract_quote_updated_at"],
+            contract_margin_asset=self.cfg.quote_asset,
         )
 
     @staticmethod

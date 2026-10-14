@@ -9,7 +9,7 @@ from core.models import OperationKind
 from services.market_stream import MarketStream
 from services.runner import Runner
 from storage.repository import Repository
-from tests.helpers import D, make_strategy_config
+from tests.helpers import D, depth_messages, make_strategy_config
 from tests.integration.test_execution_boundaries import accumulate_setup, seed_bid
 
 
@@ -29,10 +29,11 @@ def live_quotes(tmp_path, monkeypatch):
         for _ in range(count):
             exchange.now += timedelta(seconds=1)
             price = D(price)
-            stream.on_message({
-                "s": "BNBUSDT", "e": "24hrTicker", "E": int(exchange.now.timestamp() * 1000),
-                "b": str(price - D("0.5")), "a": str(price + D("0.5")), "P": "0",
-            })
+            snapshot, event = depth_messages(exchange.now, int(exchange.now.timestamp() * 1000))
+            snapshot["bids"][0][0] = str(price - D("0.5"))
+            snapshot["asks"][0][0] = str(price + D("0.5"))
+            stream.on_message(snapshot)
+            stream.on_message(event)
 
     emit("600", 901)
     assert stream.quote().windows_ready

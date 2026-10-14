@@ -7,7 +7,12 @@ from uuid import uuid4
 
 from core.crash_guard import trigger_reasons
 from core.models import CrashGuardConfig, MarketSnapshot
-from core.time_utils import age_seconds, fresh, utc
+from core.time_utils import fresh, utc
+
+
+# Event timestamps define source continuity; allow only bounded changes in
+# delivery latency at the receipt-time boundary, never longer source gaps.
+MAX_DELIVERY_JITTER = timedelta(milliseconds=100)
 
 
 class MarketWindows:
@@ -56,19 +61,26 @@ class MarketWindows:
             # Replaying one quote must not manufacture a continuous window.
             self.reset()
             return market
-        if (
-            self.raw
-            and age_seconds(ts, self.raw[-1][0]) > self.cfg.max_sample_gap_seconds
-        ):
-            self.reset()
+        if self.raw:
+            limit = timedelta(seconds=self.cfg.max_sample_gap_seconds)
+            source_gap = utc(market.ts) - self.last_source_ts
+            received_gap = ts - self.raw[-1][0]
+            if source_gap > limit or (
+                received_gap > limit
+                and received_gap > source_gap + MAX_DELIVERY_JITTER
+            ):
+                self.reset()
         self.last_source_ts = utc(market.ts)
         self.raw.append((ts, market.mid_price))
         while self.raw[0][0] < ts - timedelta(seconds=self.cfg.smooth_seconds):
             self.raw.popleft()
         price = median(p for _, p in self.raw)
         self.smoothed.append((ts, price))
-        cutoff = ts - timedelta(seconds=900 + self.cfg.max_sample_gap_seconds)
-        while self.smoothed[0][0] < cutoff:
+        # Keep the last actual sample at/before the longest window boundary.
+        # Fixed 900 + max_gap retention can drop that point by microseconds
+        # after allowed delivery jitter, briefly turning a warm window cold.
+        cutoff = ts - timedelta(seconds=900)
+        while len(self.smoothed) > 1 and self.smoothed[1][0] <= cutoff:
             self.smoothed.popleft()
         drawdowns = []
         for seconds in (60, 300, 900):

@@ -52,10 +52,11 @@ def test_confirmed_idle_with_deficit_does_not_fund_buys(
     assert all(alert.code != "TRANSFER_GATE" for alert in plan.alerts)
 
 
-def test_idle_with_deficit_can_still_return_spot_assets_to_futures() -> None:
+@pytest.mark.parametrize("balance,spot_bnb,bnb_return", [("30", "1.5", None), ("29", "2.5", "2")])
+def test_idle_with_deficit_can_still_return_spot_assets_to_futures(balance, spot_bnb, bnb_return) -> None:
     inputs = make_engine_inputs(
         account=make_account(
-            contract_bnb=D("30"), spot_bnb=D("1.5"), spot_usd=D("2000")
+            contract_bnb=D(balance), spot_bnb=D(spot_bnb), spot_usd=D("2000")
         ),
         previous_state=ReplenishmentState.IDLE,
     )
@@ -64,9 +65,12 @@ def test_idle_with_deficit_can_still_return_spot_assets_to_futures() -> None:
     assert plan.state_decision.delta_bnb == D("1")
     assert plan.buy_plan.orders == ()
     assert plan.transfer_decision.allow is False
-    assert plan.bnb_transfer_plan is not None
-    assert plan.bnb_transfer_plan.amount == D("1")
-    assert plan.bnb_transfer_plan.to_account == "USDⓈ-M Futures"
+    if bnb_return is None:
+        assert plan.bnb_transfer_plan is None
+    else:
+        assert plan.bnb_transfer_plan is not None
+        assert plan.bnb_transfer_plan.amount == D(bnb_return)
+        assert plan.bnb_transfer_plan.to_account == "USDⓈ-M Futures"
     assert plan.spot_usd_sweep_plan is not None
     assert plan.spot_usd_sweep_plan.amount == D("1500")
     assert plan.spot_usd_sweep_plan.to_account == "USDⓈ-M Futures"
