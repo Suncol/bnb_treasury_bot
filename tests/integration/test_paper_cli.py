@@ -56,7 +56,7 @@ def public_http(monkeypatch):
 
 
 class PublicFeed:
-    def __init__(self, *args):
+    def __init__(self, *args, **kwargs):
         self.book = ExecutionQuote(datetime.now(timezone.utc), "BNBUSDT", D("599"), D("601"), D("10"))
 
     def start(self):
@@ -174,19 +174,17 @@ def test_market_stream_exposes_original_quote_and_invalidates_it(monkeypatch):
             return now
     monkeypatch.setattr("services.market_stream.datetime", Clock)
     snapshot, event = depth_messages(now)
-    stream.on_message(snapshot)
     stream.on_message(event)
+    stream.on_snapshot(snapshot)
     q = stream.execution_quote()
     assert q.ask_qty == D("3.5") and int(q.ts.timestamp() * 1000) == event["E"]
     # Distinct observed source times; replaying one timestamp cannot renew it.
     for i, qty in enumerate([None, "invalid"], 2):
         now += timedelta(seconds=1)
         snapshot, event = depth_messages(now, i, qty)
-        stream.on_message(snapshot)
         stream.on_message(event)
-        assert stream.execution_quote().ask_qty is None
-    assert stream.execution_quote().ask_qty is None
-    assert stream.execution_quote().ask_qty is None and stream.quote().best_ask == 601
+        assert stream.execution_quote() is None
+    assert stream.execution_quote() is None
     stream._invalidate()
     assert stream.execution_quote() is None
 
@@ -310,3 +308,51 @@ def test_status_pins_one_snapshot_during_transfer_settlement(tmp_path, monkeypat
         assert len(status["pending_transfers"]) == 1
     finally:
         p.repo.close()
+
+
+def test_reconstructed_book_does_not_replenish_paper_liquidity_on_replay_or_restart(tmp_path, monkeypatch):
+    from tests.paper_helpers import PaperClock, order_operation
+    clock = PaperClock()
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock.now
+    monkeypatch.setattr("services.market_stream.datetime", Clock)
+    stream = MarketStream("BNBUSDT", make_strategy_config().crash_guard, client=object())
+    def emit(version, ask="601", qty="10"):
+        snapshot, event = depth_messages(clock.now, version, qty)
+        snapshot["asks"] = [[ask, qty], ["700", "1"]]
+        snapshot["bids"] = [["500", "1"]]
+        event["a"] = [["601", "0"], [ask, qty]] if ask != "601" else [[ask, qty]]
+        event["b"] = [["500", "1"]]
+        stream.on_message(event)
+        if stream.depth.needs_snapshot:
+            stream.on_snapshot(snapshot)
+        return snapshot, event
+    emit(1)
+    paper = paper_setup(tmp_path / "depth-paper.db", clock=clock, feed=stream)
+    try:
+        order = paper.ex.submit(order_operation(clock, price="590", qty="3"))
+        clock.elapse(1)
+        snapshot, event = emit(3, ask="580")
+        paper.ex.advance()
+        assert paper.ex.fetch_order("BNBUSDT", order_id=order.exchange_id).filled_qty == 1
+        for _ in range(3):
+            stream.on_message(event)
+            paper.ex.advance()
+        assert paper.ex.fetch_order("BNBUSDT", order_id=order.exchange_id).filled_qty == 1
+        stream._invalidate("RECONNECT")
+        stream.on_message(event)
+        stream.on_snapshot(snapshot)
+        paper.ex.advance()
+        assert paper.ex.fetch_order("BNBUSDT", order_id=order.exchange_id).filled_qty == 1
+        paper.repo.close()
+        paper = paper_setup(paper.path, config=paper.config, cfg=paper.cfg, clock=clock, feed=stream)
+        assert paper.ex.fetch_order("BNBUSDT", order_id=order.exchange_id).filled_qty == 1
+        clock.elapse(1)
+        emit(5, ask="580")
+        paper.ex.advance()
+        assert paper.ex.fetch_order("BNBUSDT", order_id=order.exchange_id).filled_qty == 2
+    finally:
+        paper.repo.close()
+        stream.close()

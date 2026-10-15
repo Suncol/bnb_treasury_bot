@@ -33,7 +33,8 @@ def depth_messages(now=None, update_id=1, ask_qty="3.5"):
     return (
         {"lastUpdateId": update_id, "bids": [["599", "1"]], "asks": [["601", ask_qty]]},
         {"e": "depthUpdate", "s": "BNBUSDT", "E": int(now.timestamp() * 1000),
-         "U": update_id, "u": update_id, "b": [], "a": []},
+         "U": update_id, "u": update_id + 1,
+         "b": [["599", "1"]], "a": [["601", ask_qty]]},
     )
 
 

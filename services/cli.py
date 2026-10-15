@@ -194,7 +194,8 @@ def main():
             )
             clear_read_backoff(repository)
             return
-        feed = MarketStream(cfg.symbol, cfg.crash_guard).start()
+        feed = MarketStream(cfg.symbol, cfg.crash_guard,
+                            transport=exchange.market if args.paper else exchange).start()
         exchange.feed = feed
         if hasattr(exchange, "start_price_refresh"):
             exchange.start_price_refresh()
