@@ -25,6 +25,7 @@ from core.models import (
 from core.time_utils import utc
 
 from .exchange_adapter import (
+    AccountObservationInconsistent,
     ExchangeError,
     RequestRejected,
     order_matches_operation,
@@ -114,12 +115,20 @@ class BinanceAdapter(SpotMarketData):
             raise ExchangeError("Quote asset does not expose futures maxWithdrawAmount")
         margin_assets = {a["asset"]: a for a in margin.get("assets", ())}
         margin_quote = margin_assets.get(self.cfg.quote_asset)
+        if margin_quote is None:
+            raise ExchangeError("Futures margin observation is missing the quote asset")
+        if not all(D(value).is_finite() for value in (
+            margin_quote["walletBalance"], quote["balance"],
+        )):
+            raise ExchangeError("Futures quote wallet balance is nonfinite")
         if (
-            margin_quote is None
-            or D(margin_quote["walletBalance"]) != D(quote["balance"])
+            D(margin_quote["walletBalance"]) != D(quote["balance"])
             or margin_quote.get("updateTime") != quote.get("updateTime")
         ):
-            raise ExchangeError("Futures balance and margin observations disagree")
+            raise AccountObservationInconsistent(
+                "Futures balance and margin observations disagree",
+                endpoint="futures_account_observation",
+            )
         mode = self._cached("futures_margin_mode", 300, lambda: self._call(
             self.futures.get_current_multi_assets_mode, recv_window=5000
         ))

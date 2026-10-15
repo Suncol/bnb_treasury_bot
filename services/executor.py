@@ -279,7 +279,12 @@ class Executor:
         elif op.status == OperationStatus.CONFIRMED:
             runtime = replace(
                 runtime,
-                api_errors=0 if submission else runtime.api_errors,
+                # Protection can succeed while the account observation is still
+                # invalid. Only normal reconciliation or a new financial write
+                # demonstrates recovery; cancelling risk must not hide failures.
+                api_errors=0
+                if submission and op.kind != OperationKind.CANCEL
+                else runtime.api_errors,
                 transfer_failures=0
                 if op.kind == OperationKind.TRANSFER
                 else runtime.transfer_failures,

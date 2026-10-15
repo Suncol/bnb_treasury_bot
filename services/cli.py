@@ -18,7 +18,7 @@ from storage.paper_ledger import PaperLedger, check_environment
 
 from .alert_service import AlertService, LogSink, WebhookSink
 from .binance_adapter import BinanceAdapter
-from .exchange_adapter import ExchangeError, RequestDeferred
+from .exchange_adapter import AccountObservationInconsistent, ExchangeError, RequestDeferred
 from .executor import Executor
 from .market_stream import MarketStream
 from .paper_exchange import PaperExchange
@@ -231,7 +231,7 @@ def main():
             repository, exc, datetime.now(timezone.utc),
             authenticated=authenticated, exchange=exchange,
         )
-        if authenticated and not isinstance(exc, RequestDeferred):
+        if authenticated and not isinstance(exc, (RequestDeferred, AccountObservationInconsistent)):
             Executor(exchange, repository, cfg).note_failure(reason=type(exc).__name__)
         raise
     finally:
