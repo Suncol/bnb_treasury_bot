@@ -27,7 +27,6 @@ class Reconciler:
         self.executor = executor or Executor(exchange, repository, cfg, clock=self.clock)
         self.executor.reconciler = self
         self.history = (ZERO, None)
-        self.income_refreshed = False
         self._funding_orders = None
 
     def prepare_execution(self, now, *, account=None):
@@ -236,7 +235,6 @@ class Reconciler:
             raise
 
     def _refresh(self, now, *, force_income=False):
-        self.income_refreshed = False
         self._funding_orders = None
         repo, exchange, cfg = self.repository, self.exchange, self.cfg
         tracked = repo.tracked_orders(active_only=True)
@@ -674,12 +672,10 @@ class Reconciler:
                 if utc(issue["since"]) <= upper <= utc(account.ts) + timedelta(seconds=1):
                     windows.append((utc(issue["since"]), upper))
         if not windows:
-            self.income_refreshed = True
-            if self.executor._income_batch:
-                self.executor._income_scan = {
-                    "since": None, "until": None, "checked_at": now,
-                    "completed_at": now, "source_account": account,
-                }
+            token = self.executor.begin_income_scan(now)
+            self.executor.complete_income_scan(
+                token, {"since": None, "until": None, "checked_at": now}, account, now,
+            )
             return None
         since, until = min(w[0] for w in windows), max(w[1] for w in windows)
         scan = self.executor.income_scan(now)
@@ -695,27 +691,23 @@ class Reconciler:
         start = since
         if not recheck and coverage["since"] <= since <= coverage["until"] <= until:
             start = coverage["until"]  # Inclusive overlap preserves timestamp ties.
+        coverage = {"since": since, "until": until,
+                    "checked_at": now if start == since else checked}
         if start <= until:
-            revision = self.executor._income_revision
+            token = self.executor.begin_income_scan(now)
             repo.save_futures_income(
                 self._read(self.exchange.fetch_futures_income, start, until)
             )
-            completed = self.clock() if self.clock else account.ts
-            if (self.executor._income_batch and revision == self.executor._income_revision
-                    and utc(completed) >= now):
-                self.executor._income_scan = {
-                    "since": since, "until": until,
-                    "checked_at": now if start == since else checked,
-                    "completed_at": completed, "source_account": account,
-                } if start == since or same_scan else None
-        self.income_refreshed = start == since
-        return {"since": since, "until": until,
-                "checked_at": now if self.income_refreshed else checked}
+            self.executor.complete_income_scan(
+                token, coverage if start == since or same_scan else None, account,
+                self.clock() if self.clock else account.ts,
+            )
+        return coverage
 
     def audit_income(self, account, now):
         """Refresh only income before a new batch; reuse the observed account."""
         repo, cfg = self.repository, self.cfg
-        self.executor._income_account = None
+        self.executor.invalidate_income_qualification()
         if account.contract_total_margin_balance is None:
             self._refresh_income([], account, force=True)
             self.executor.qualify_income(account, self.clock() if self.clock else now)

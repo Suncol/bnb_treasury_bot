@@ -76,8 +76,30 @@ class Executor:
 
     def invalidate_income_audit(self):
         self._income_scan = self._income_checked_at = None
-        self._income_account = None
+        self.invalidate_income_qualification()
         self._income_revision += 1
+
+    def invalidate_income_qualification(self):
+        self._income_account = None
+
+    def begin_income_scan(self, now):
+        """Capture a batch token so invalidation during reads defeats completion."""
+        self.income_scan(now)
+        self.invalidate_income_qualification()
+        return (self._income_revision, now) if self._income_batch else None
+
+    def complete_income_scan(self, token, coverage, account, now):
+        """Publish committed receipts only within the batch that requested them."""
+        if token is None or not self._income_batch:
+            return
+        revision, started_at = token
+        if revision != self._income_revision:
+            return
+        if utc(now) < utc(started_at):
+            self.invalidate_income_audit()
+            return
+        self._income_scan = ({**coverage, "completed_at": now, "source_account": account}
+                             if coverage is not None else None)
 
     def income_scan(self, now):
         if not self._income_batch:
@@ -177,18 +199,23 @@ class Executor:
         if funding:
             account, now = self._prepare_funding(payload, account, runtime, now, inputs)
             previous_runtime = runtime = self.repository.runtime()
-        elif kind != OperationKind.CANCEL and not self.income_audited(
-            self.clock() if self.clock else now, account=account,
-        ):
-            # Fast direct calls retain their supplied account. A completed slow
-            # audit requires a fresh full observation before it can authorize intent.
-            reconciler = self._reconciliation()
-            original = account
-            account, _ = reconciler.prepare_execution(
-                self.clock() if self.clock else now, account=account,
+        elif kind != OperationKind.CANCEL:
+            if not self.income_audited(self.clock() if self.clock else now, account=account):
+                # Fast direct calls retain their supplied account. A slow audit
+                # must verify both the refreshed account and the old candidate.
+                original = account
+                account, orders = self._reconciliation().prepare_execution(
+                    self.clock() if self.clock else now, account=account,
+                )
+                if account is not original:
+                    now = self.clock() if self.clock else now
+                    self._require_unchanged_demand(original, account, orders, inputs)
+                    if inputs is None and orders:
+                        raise ExecutionBlocked("Refreshed orders lack candidate context; replan the candidate")
+            self._require_current_constraints(
+                runtime, account, self.clock() if self.clock else now, inputs,
+                needs_market=not (kind == OperationKind.TRANSFER and payload.asset == "BNB"),
             )
-            if account is not original:
-                now = self.clock() if self.clock else now
             previous_runtime = runtime = self._require_reconciled()
         op = Operation(
             "bt-" + uuid4().hex,
@@ -245,25 +272,7 @@ class Executor:
             self.clock() if self.clock else now
         )
         now = self.clock() if self.clock else now
-        if not valid_account_snapshot(account, now, self.cfg):
-            raise ExecutionBlocked("Final account observation expired before funding submission")
-        current = self.repository.runtime()
-        if current.run_mode == RunMode.PAUSED or (
-            current.run_mode == RunMode.URGENT_ONLY
-            and current.state != ReplenishmentState.URGENT
-        ):
-            raise ExecutionBlocked("USD funding is blocked by the current run mode")
-        guard_fields = ("active", "episode_id", "keep_price_ceiling", "filled_bnb")
-        if any(getattr(runtime.guard, field) != getattr(current.guard, field)
-               for field in guard_fields):
-            raise ExecutionBlocked("Risk protection changed during funding preparation")
-        if inputs is not None and (
-            not fresh(inputs.market.ts, now, self.cfg.crash_guard.max_market_age_seconds)
-            or inputs.filters.observed_at is not None and not fresh(
-                inputs.filters.observed_at, now, self.cfg.crash_guard.max_market_age_seconds
-            )
-        ):
-            raise ExecutionBlocked("Market or filter observation expired during funding preparation")
+        self._require_current_constraints(runtime, account, now, inputs)
         decision = evaluate_transfer_gate(
             payload.amount, account.contract_max_withdraw_amount,
             self.repository.budget_used(now, self.cfg.quote_asset), self.cfg.risk, minimum,
@@ -273,15 +282,39 @@ class Executor:
         if decision.adjusted_amount != payload.amount:
             raise ExecutionBlocked("Transfer amount requires replanning: " + decision.message,
                                    decision=decision)
-        # Fresh balances/orders can make the old funding demand obsolete even
-        # when the monetary limits still allow it. Let normal planning decide.
+        self._require_unchanged_demand(original, account, orders, inputs)
+        return account, now
+
+    def _require_current_constraints(self, runtime, account, now, inputs, *, needs_market=True):
+        if not valid_account_snapshot(account, now, self.cfg):
+            raise ExecutionBlocked("Final account observation expired before submission")
+        current = self.repository.runtime()
+        if current.run_mode == RunMode.PAUSED or (
+            current.run_mode == RunMode.URGENT_ONLY
+            and current.state != ReplenishmentState.URGENT
+        ):
+            raise ExecutionBlocked("Execution is blocked by the current run mode")
+        guard_fields = ("active", "episode_id", "keep_price_ceiling", "filled_bnb")
+        if any(getattr(runtime.guard, field) != getattr(current.guard, field)
+               for field in guard_fields):
+            raise ExecutionBlocked("Risk protection changed during execution preparation")
+        if inputs is not None and (
+            needs_market and not fresh(inputs.market.ts, now, self.cfg.crash_guard.max_market_age_seconds)
+            or inputs.filters.observed_at is not None and not fresh(
+                inputs.filters.observed_at, now, self.cfg.crash_guard.max_market_age_seconds
+            )
+        ):
+            raise ExecutionBlocked("Market or filter observation expired during execution preparation")
+
+    def _require_unchanged_demand(self, original, account, orders, inputs):
+        # New reconciliation can invalidate an old quantity even when all
+        # settlement and monetary gates pass. Let normal planning decide.
         fields = ("contract_bnb", "spot_bnb", "spot_usd", "reserved_spot_bnb", "reserved_spot_usd")
         if any(getattr(original, field) != getattr(account, field) for field in fields) or (
             inputs is not None and {o.order_id: o for o in inputs.orders}
             != {o.order_id: o for o in orders}
         ):
-            raise ExecutionBlocked("Funding balances or orders changed; replan the candidate")
-        return account, now
+            raise ExecutionBlocked("Execution balances or orders changed; replan the candidate")
 
     def _recover_cancel(self, op, now):
         if not self.cancel_due(op.payload, now):
