@@ -106,6 +106,7 @@ def test_reason_becomes_exit_urgent_buffer_when_buffer_blocks_exit() -> None:
     )
     assert decision.raw_candidate_state == ReplenishmentState.ACCUMULATE
     assert decision.candidate_state == ReplenishmentState.URGENT
+    assert decision.confirmed_state == ReplenishmentState.URGENT
     assert decision.reason == TransitionReason.EXIT_URGENT_BUFFER
 
 

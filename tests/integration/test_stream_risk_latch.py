@@ -10,7 +10,7 @@ from services.market_stream import MarketStream
 from services.runner import Runner
 from storage.repository import Repository
 from tests.helpers import D, depth_messages, make_strategy_config
-from tests.integration.test_execution_boundaries import accumulate_setup, seed_bid
+from tests.execution_helpers import accumulate_setup, seed_bid
 
 
 @pytest.fixture

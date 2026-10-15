@@ -8,7 +8,6 @@ import requests
 
 from core.models import ExecutionQuote
 from services import binance_adapter, cli
-from services.exchange_adapter import ExchangeError
 from services.market_stream import MarketStream
 from services.paper_exchange import PaperExchange
 from services.spot_market import SpotMarketData

@@ -10,7 +10,7 @@ from services.runner import Runner
 from storage.repository import Repository
 from tests.fake_exchange import FakeExchange
 from tests.helpers import D, make_account, make_strategy_config
-from tests.integration.test_execution import setup
+from tests.execution_helpers import setup
 
 
 def margin_setup(tmp_path, *, spot_usd="0", baseline_hours=24):

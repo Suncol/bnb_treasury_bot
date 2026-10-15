@@ -10,43 +10,16 @@ from core.models import (
     OperationKind,
     OperationResult,
     OperationStatus,
-    OrderPlan,
     ReplenishmentState,
     RunMode,
     SliceState,
 )
 from services.alert_service import AlertService
-from services.executor import Executor
 from services.runner import Runner
 from storage.repository import Repository
 from tests.fake_exchange import FakeExchange
 from tests.helpers import D, make_account, make_strategy_config
-from tests.integration.test_execution import run, setup
-
-
-def accumulate_setup(tmp_path):
-    return setup(
-        tmp_path,
-        FakeExchange(make_account(contract_bnb=D("27"), spot_usd=D("5000"))),
-        ReplenishmentState.ACCUMULATE,
-    )
-
-
-def seed_bid(exchange, repo, *, age_hours=0, qty="1"):
-    cfg = make_strategy_config()
-    # Each seeded submission must cover the previous order's wallet changes.
-    from services.reconciliation import Reconciler
-
-    Reconciler(exchange, repo, cfg).refresh(exchange.now)
-    op = Executor(exchange, repo, cfg, clock=lambda: exchange.now).execute(
-        OrderPlan(cfg.symbol, "BUY", "LIMIT_MAKER", D(qty), D("598"), "GTC", True),
-        exchange.now - timedelta(hours=age_hours),
-        ReplenishmentState.ACCUMULATE,
-    )
-    exchange.orders[op.exchange_id] = replace(
-        exchange.orders[op.exchange_id], created_at=op.created_at
-    )
-    return op
+from tests.execution_helpers import accumulate_setup, seed_bid, run, setup
 
 
 def test_timeout_slice_wait_survives_fast_ticks_and_reconciliation(tmp_path):

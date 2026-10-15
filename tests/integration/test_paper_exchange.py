@@ -6,7 +6,7 @@ import pytest
 
 from core.config import load_paper_config, validate_paper_config
 from core.models import AssetTransferPlan, CancelPlan, Operation, OperationKind, OperationStatus, PaperConfig
-from services.exchange_adapter import ExchangeError, RequestRejected
+from services.exchange_adapter import RequestRejected
 from storage.paper_ledger import PAPER_ENVIRONMENT
 from storage.repository import Repository
 from tests.helpers import D

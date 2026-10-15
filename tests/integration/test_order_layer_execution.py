@@ -4,7 +4,7 @@ from core.models import OperationKind, ReplenishmentState
 from storage.codec import loads
 from tests.fake_exchange import FakeExchange
 from tests.helpers import D, make_account
-from tests.integration.test_execution import run, setup
+from tests.execution_helpers import run, setup
 
 
 def watch_setup(tmp_path, contract_bnb="31", spot_usd="1000"):

@@ -7,8 +7,7 @@ from core.crash_guard import update_crash_guard
 from core.models import CrashGuardState
 from core.replenishment_engine import build_cycle_plan
 from services.market_data import MarketWindows
-from tests.helpers import D, make_account, make_engine_inputs, make_strategy_config
-from tests.unit.test_lifecycle import inputs_with_orders, order
+from tests.helpers import D, make_account, make_engine_inputs, make_strategy_config, inputs_with_orders, order
 
 
 @pytest.mark.parametrize(

@@ -6,8 +6,7 @@ import pytest
 from core.models import OrderPlan, OrderView, ReplenishmentState, RunMode
 from core.order_planner import plan_buy_orders
 from core.replenishment_engine import build_cycle_plan
-from tests.helpers import D, make_account, make_engine_inputs, make_strategy_config
-from tests.unit.test_order_planner import make_state_decision
+from tests.helpers import D, make_account, make_engine_inputs, make_strategy_config, make_state_decision
 
 
 def layer_inputs(*, age=0, contract="30.98", spot_usd="10000"):

@@ -3,10 +3,10 @@ import sqlite3
 
 import pytest
 
-from core.models import FuturesIncome, OperationStatus
+from core.models import FuturesIncome
 from services.executor import Executor
 from storage.repository import Repository
-from tests.integration.test_review_recovery import funded, initialize, transfer
+from tests.recovery_helpers import funded, initialize, transfer
 from tests.helpers import D, make_strategy_config
 
 

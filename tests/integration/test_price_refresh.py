@@ -10,7 +10,7 @@ from binance_common.errors import TooManyRequestsError
 
 from core.models import AssetTransferPlan, GateStatus, Operation, OperationKind, OperationStatus
 from core.time_utils import fresh
-from services.exchange_adapter import ExchangeError, RequestDeferred
+from services.exchange_adapter import RequestDeferred
 from services.price_refresh import PriceRefreshPending
 from services.runner import Runner
 from services.sdk_transport import millis

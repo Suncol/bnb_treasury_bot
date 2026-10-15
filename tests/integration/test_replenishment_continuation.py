@@ -8,8 +8,7 @@ from services.runner import Runner
 from storage.repository import Repository
 from tests.fake_exchange import FakeExchange
 from tests.helpers import D, make_account, make_strategy_config
-from tests.integration.test_execution import run, setup
-from tests.integration.test_execution_boundaries import seed_bid
+from tests.execution_helpers import run, setup, seed_bid
 
 
 @pytest.mark.parametrize("spot_usd", ["0", "3000"])

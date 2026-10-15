@@ -13,23 +13,8 @@ from services.executor import Executor
 from services.runner import Runner
 from storage.repository import Repository
 from tests.fake_exchange import FakeExchange
-from tests.helpers import D, make_account, make_strategy_config
-from tests.unit.test_order_planner import make_state_decision
-
-
-def setup(tmp_path, exchange=None, state=ReplenishmentState.URGENT):
-    exchange = exchange or FakeExchange()
-    repo = Repository(tmp_path / "test.sqlite3")
-    repo.initialize_spot_checkpoint(exchange.fetch_account_snapshot(), {"operator": "test", "reason": "quiescent fixture"})
-    repo.save("runtime", replace(repo.runtime(), state=state))
-    runner = Runner(exchange, repo, make_strategy_config(), clock=lambda: exchange.now)
-    return exchange, repo, runner
-
-
-def run(runner, exchange, inventory=True):
-    return runner.run_once(
-        market=exchange.fetch_market_snapshot("BNBUSDT"), inventory_cycle=inventory
-    )
+from tests.helpers import D, make_account, make_strategy_config, make_state_decision
+from tests.execution_helpers import setup, run
 
 
 def test_transfer_buy_and_bnb_return_use_refreshed_confirmed_balances(tmp_path):

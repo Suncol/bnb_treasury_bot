@@ -9,7 +9,7 @@ from core.models import GateStatus, OperationKind, ReplenishmentState
 from core.replenishment_engine import build_cycle_plan
 from tests.fake_exchange import FakeExchange
 from tests.helpers import D, make_account, make_engine_inputs, make_strategy_config
-from tests.integration.test_execution import setup
+from tests.execution_helpers import setup
 
 
 @pytest.mark.parametrize(

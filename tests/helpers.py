@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -8,15 +9,18 @@ from core.models import (
     EngineInputs,
     ExecutionConfig,
     MarketSnapshot,
+    OrderView,
     PendingState,
     ReplenishmentState,
     RiskConfig,
     RunMode,
     SchedulerConfig,
+    StateDecision,
     StateInputs,
     StrategyConfig,
     SymbolFilters,
     ThresholdConfig,
+    TransitionReason,
 )
 
 
@@ -129,6 +133,55 @@ def make_pending(
         filled_untransferred_bnb=filled_untransferred_bnb,
         has_unknown_orders=has_unknown_orders,
         has_unknown_transfers=has_unknown_transfers,
+    )
+
+
+def make_state_decision(state: ReplenishmentState, delta_bnb: str = "7") -> StateDecision:
+    return StateDecision(
+        current_state=state,
+        raw_candidate_state=state,
+        candidate_state=state,
+        confirmed_state=state,
+        transitioned=False,
+        reason=TransitionReason.HIGH_BALANCE,
+        candidate_reason=TransitionReason.HIGH_BALANCE,
+        t_depletion=None,
+        effective_supply=D("0"),
+        delta_bnb=D(delta_bnb),
+        candidate_streak=0,
+    )
+
+
+def inputs_with_orders(*orders, **changes):
+    inputs = make_engine_inputs(
+        account=make_account(contract_bnb=D("27"), spot_usd=D("10000")),
+        previous_state=ReplenishmentState.ACCUMULATE,
+    )
+    return replace(
+        inputs,
+        orders=orders,
+        pending=replace(
+            inputs.pending,
+            open_buy_remaining_qty=sum((o.remaining_qty for o in orders), D("0")),
+        ),
+        **changes,
+    )
+
+
+def order(key, price="580", qty="1", **changes):
+    now = make_engine_inputs().now
+    return replace(
+        OrderView(
+            "BNBUSDT",
+            key,
+            "client-" + key,
+            "bnb-treasury",
+            D(price),
+            D(qty),
+            D("0"),
+            now,
+        ),
+        **changes,
     )
 
 

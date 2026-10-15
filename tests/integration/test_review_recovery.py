@@ -5,37 +5,19 @@ from datetime import timedelta
 
 import pytest
 
-from core.models import AssetTransferPlan, CancelPlan, Fill, OperationKind, OperationStatus, OrderPlan, ReplenishmentState
+from core.models import CancelPlan, Fill, OperationKind, OperationStatus, OrderPlan, ReplenishmentState
 from services.exchange_adapter import ExchangeError
 from services.executor import Executor, MAX_CANCEL_ATTEMPTS
 from services.reconciliation import Reconciler
 from services.runner import Runner
 from storage.repository import Repository
 from tests.fake_exchange import FakeExchange
-from tests.helpers import D, make_account, make_strategy_config
-
-
-def funded(cls=FakeExchange):
-    return cls(make_account(contract_bnb=D("24"), contract_max_withdraw_amount=D("50000"),
-                            spot_bnb=D("10"), spot_usd=D("3000")))
-
-
-def initialize(repo, ex):
-    repo.initialize_spot_checkpoint(ex.fetch_account_snapshot(), {
-        "operator": "offline-test", "reason": "quiescent simulation",
-    })
+from tests.helpers import D, make_strategy_config
+from tests.recovery_helpers import funded, initialize, transfer
 
 
 def refresh(repo, ex, cfg=None):
     return Reconciler(ex, repo, cfg or make_strategy_config()).refresh(ex.now)
-
-
-def transfer(repo, ex, asset, to_account, amount):
-    source = "SPOT" if to_account != "SPOT" else "USDⓈ-M Futures"
-    return Executor(ex, repo, make_strategy_config()).execute(
-        AssetTransferPlan(asset, D(amount), source, to_account, "recovery test"),
-        ex.now, ReplenishmentState.URGENT, account=ex.fetch_account_snapshot(),
-    )
 
 
 @pytest.mark.parametrize("failure", ["before_send", "after_send", "crash", "429"])

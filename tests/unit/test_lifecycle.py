@@ -3,42 +3,9 @@ from datetime import timedelta
 
 import pytest
 
-from core.models import GateStatus, OrderView, ReplenishmentState, RunMode, SliceState
+from core.models import GateStatus, ReplenishmentState, RunMode, SliceState
 from core.replenishment_engine import build_cycle_plan
-from tests.helpers import D, make_account, make_engine_inputs, make_strategy_config
-
-
-def inputs_with_orders(*orders, **changes):
-    inputs = make_engine_inputs(
-        account=make_account(contract_bnb=D("27"), spot_usd=D("10000")),
-        previous_state=ReplenishmentState.ACCUMULATE,
-    )
-    return replace(
-        inputs,
-        orders=orders,
-        pending=replace(
-            inputs.pending,
-            open_buy_remaining_qty=sum((o.remaining_qty for o in orders), D("0")),
-        ),
-        **changes,
-    )
-
-
-def order(key, price="580", qty="1", **changes):
-    now = make_engine_inputs().now
-    return replace(
-        OrderView(
-            "BNBUSDT",
-            key,
-            "client-" + key,
-            "bnb-treasury",
-            D(price),
-            D(qty),
-            D("0"),
-            now,
-        ),
-        **changes,
-    )
+from tests.helpers import D, make_account, make_engine_inputs, make_strategy_config, inputs_with_orders, order
 
 
 @pytest.mark.parametrize(

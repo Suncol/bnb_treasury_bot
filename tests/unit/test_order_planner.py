@@ -4,25 +4,9 @@ from dataclasses import replace
 
 import pytest
 
-from core.models import ReplenishmentState, StateDecision, TransitionReason
+from core.models import ReplenishmentState
 from core.order_planner import plan_buy_orders
-from tests.helpers import D, make_filters, make_market, make_strategy_config
-
-
-def make_state_decision(state: ReplenishmentState, delta_bnb: str = "7") -> StateDecision:
-    return StateDecision(
-        current_state=state,
-        raw_candidate_state=state,
-        candidate_state=state,
-        confirmed_state=state,
-        transitioned=False,
-        reason=TransitionReason.HIGH_BALANCE,
-        candidate_reason=TransitionReason.HIGH_BALANCE,
-        t_depletion=None,
-        effective_supply=D("0"),
-        delta_bnb=D(delta_bnb),
-        candidate_streak=0,
-    )
+from tests.helpers import D, make_filters, make_market, make_strategy_config, make_state_decision
 
 
 def test_watch_orders_are_three_layer_maker_bids_below_ref_price() -> None:
