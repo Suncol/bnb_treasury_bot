@@ -354,19 +354,25 @@ def test_oneof_market_responses_are_normalized(sdk):
     assert market.mid_price == D("600")
 
 
-@pytest.mark.parametrize(
-    "order_type,tif,message",
-    [
-        ("LIMIT_MAKER", "GTC", "Order would immediately match and take."),
-        (
-            "LIMIT_MAKER",
-            "GTC",
-            "Account has insufficient balance for requested action.",
-        ),
-        ("LIMIT", "GTC", "Account has insufficient balance for requested action."),
-        ("LIMIT", "IOC", "Account has insufficient balance for requested action."),
-    ],
+# Exact matching-engine reasons documented for the plain limit forms we send.
+PLAIN_LIMIT_REJECTIONS = (
+    "Account has insufficient balance for requested action.",
+    "Market is closed.",
+    "Price * QTY is zero or less.",
+    "This action is disabled on this account.",
+    "This account may not place or cancel orders.",
+    "Unsupported order combination",
+    "This symbol is not permitted for this account.",
+    "This symbol is restricted for this account.",
+    "Rest API trading is not enabled.",
 )
+
+
+@pytest.mark.parametrize("order_type,tif,message", [
+    (order_type, tif, message)
+    for order_type, tif in (("LIMIT_MAKER", "GTC"), ("LIMIT", "GTC"), ("LIMIT", "IOC"))
+    for message in PLAIN_LIMIT_REJECTIONS
+] + [("LIMIT_MAKER", "GTC", "Order would immediately match and take.")])
 def test_sdk_definite_order_rejection_does_not_block_next_order(
     sdk, tmp_path, order_type, tif, message
 ):
@@ -377,6 +383,7 @@ def test_sdk_definite_order_rejection_does_not_block_next_order(
     )
     repo = Repository(tmp_path / "sdk.sqlite3")
     repo.initialize_spot_checkpoint(FakeExchange().fetch_account_snapshot(), {"operator": "test", "reason": "quiescent fixture"})
+    repo.save("runtime", replace(repo.runtime(), resume_replenishment=True, resume_replanning=True))
     executor = Executor(adapter, repo, make_strategy_config())
     rejected = executor.execute(
         payload,
@@ -386,6 +393,11 @@ def test_sdk_definite_order_rejection_does_not_block_next_order(
     )
     assert rejected.status == OperationStatus.FAILED
     assert "-2010" in rejected.error and message in rejected.error
+    assert not rejected.not_sent and rejected.failure_recorded
+    assert repo.runtime().api_errors == 1 and repo.runtime().transfer_failures == 0
+    assert repo.runtime().resume_replenishment and repo.runtime().resume_replanning
+    executor.record_result(rejected)
+    assert repo.runtime().api_errors == 1
     assert not repo.operations(unresolved_only=True)
     # A definitive failure is not queried back into UNKNOWN when it is absent.
     exchange = FakeExchange()
@@ -406,6 +418,7 @@ def test_sdk_definite_order_rejection_does_not_block_next_order(
     assert accepted.status == OperationStatus.CONFIRMED
     assert accepted.client_id != rejected.client_id
     assert len(calls) == 2
+    repo.close()
 
 
 @pytest.mark.parametrize(
@@ -449,6 +462,89 @@ def test_ambiguous_sdk_rejections_and_absence_keep_journal_unresolved(
             account=FakeExchange().fetch_account_snapshot(),
         )
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize("message", PLAIN_LIMIT_REJECTIONS + ("Order would immediately match and take.",))
+def test_matching_engine_reason_in_server_error_never_proves_rejection(sdk, tmp_path, message):
+    adapter, calls, responses = sdk
+    responses["POST", "/api/v3/order"] = (503, {"code": -2010, "msg": message})
+    repo = Repository(tmp_path / "server-error.db")
+    account = FakeExchange().fetch_account_snapshot()
+    repo.initialize_spot_checkpoint(account, {"operator": "test", "reason": "quiescent fixture"})
+    result = Executor(adapter, repo, make_strategy_config()).execute(
+        OrderPlan("BNBUSDT", "BUY", "LIMIT_MAKER", D("1"), D("600"), "GTC", True),
+        NOW, ReplenishmentState.ACCUMULATE, account=account,
+    )
+    assert result.status == OperationStatus.UNKNOWN and not result.not_sent
+    assert repo.operations(unresolved_only=True) == (result,)
+    assert len(calls) == 1
+    repo.close()
+
+
+@pytest.mark.parametrize("case", ["cancel", "transfer", "sell", "fok", "maker_reason_on_limit", "other_endpoint", "401", "403", "500", "wrong_code", "changed_reason"])
+def test_order_rejection_allowlist_requires_complete_protocol_match(sdk, tmp_path, case):
+    adapter, calls, responses = sdk
+    message = "Account has insufficient balance for requested action."
+    code, status, method, path = -2010, 400, "POST", "/api/v3/order"
+    payload = OrderPlan("BNBUSDT", "BUY", "LIMIT", D("1"), D("600"), "GTC", False)
+    if case == "cancel":
+        payload, method = CancelPlan("BNBUSDT", "123", "protect"), "DELETE"
+    elif case == "transfer":
+        payload = AssetTransferPlan("USDT", D("500"), "USDⓈ-M Futures", "SPOT", "test")
+        path = "/sapi/v1/asset/transfer"
+    elif case == "sell":
+        payload = replace(payload, side="SELL")
+    elif case == "fok":
+        payload = replace(payload, time_in_force="FOK")
+    elif case == "maker_reason_on_limit":
+        message = "Order would immediately match and take."
+    elif case == "other_endpoint":
+        new_order = adapter.spot.new_order
+
+        def unknown_mutation_endpoint(**params):
+            return new_order(**params)
+
+        adapter.spot.new_order = unknown_mutation_endpoint
+    elif case in {"401", "403", "500"}:
+        status = int(case)
+    elif case == "wrong_code":
+        code = -2011
+    elif case == "changed_reason":
+        message = "Market is closed. Unknown prior execution."
+    responses[method, path] = (status, {"code": code, "msg": message})
+    repo = Repository(tmp_path / "protocol-scope.db")
+    account = FakeExchange().fetch_account_snapshot()
+    repo.initialize_spot_checkpoint(account, {"operator": "test", "reason": "quiescent fixture"})
+    result = Executor(adapter, repo, make_strategy_config()).execute(
+        payload, NOW, ReplenishmentState.ACCUMULATE, account=account,
+    )
+    assert result.status == OperationStatus.UNKNOWN and not result.not_sent
+    assert repo.operations(unresolved_only=True) == (result,)
+    assert len(calls) == 1
+    repo.close()
+
+
+def test_persistent_account_permission_rejections_pause_once_per_intent(sdk, tmp_path):
+    adapter, calls, responses = sdk
+    responses["POST", "/api/v3/order"] = (
+        400, {"code": -2010, "msg": "This symbol is not permitted for this account."},
+    )
+    repo = Repository(tmp_path / "permission.db")
+    account = FakeExchange().fetch_account_snapshot()
+    repo.initialize_spot_checkpoint(account, {"operator": "test", "reason": "quiescent fixture"})
+    executor = Executor(adapter, repo, make_strategy_config())
+    payload = OrderPlan("BNBUSDT", "BUY", "LIMIT_MAKER", D("1"), D("600"), "GTC", True)
+    for expected in (1, 2, 3):
+        result = executor.execute(payload, NOW, ReplenishmentState.ACCUMULATE, account=account)
+        assert result.status == OperationStatus.FAILED
+        executor.record_result(result)
+        assert repo.runtime().api_errors == expected
+    assert repo.runtime().run_mode == RunMode.PAUSED
+    assert not repo.operations(unresolved_only=True)
+    with pytest.raises(RuntimeError, match="reconciled"):
+        executor.execute(payload, NOW, ReplenishmentState.ACCUMULATE, account=account)
+    assert len(calls) == 3
+    repo.close()
 
 
 def test_definite_transfer_limit_rejection_can_reconcile_and_counts_failures(
@@ -715,6 +811,26 @@ def test_sdk_percent_bounds_are_fresh_and_account_asset_limits_apply(sdk):
     second = adapter.fetch_symbol_filters("BNBUSDT")
     assert (second.min_price, second.max_price) == (D("450"), D("550"))
     assert sum(urlsplit(c["url"]).path == "/api/v3/exchangeInfo" for c in calls) == 1
+
+
+def test_explicit_rule_rejection_refreshes_cached_filters_and_retains_diagnostics(sdk):
+    adapter, calls, responses = sdk
+    filter_responses(responses)
+    assert adapter.fetch_symbol_filters("BNBUSDT").price_tick == D("0.01")
+    responses["GET", "/api/v3/exchangeInfo"][1]["symbols"][0]["filters"][0]["tickSize"] = "0.05"
+    # Confirm the new exchange rule is not visible through the old cached view.
+    assert adapter.fetch_symbol_filters("BNBUSDT").price_tick == D("0.01")
+    responses["POST", "/api/v3/order"] = (
+        400, {"code": -2010, "msg": "Price * QTY is zero or less."},
+    )
+    with pytest.raises(RequestRejected) as raised:
+        adapter.submit(operation(OperationKind.ORDER,
+            OrderPlan("BNBUSDT", "BUY", "LIMIT_MAKER", D("1"), D("600"), "GTC", True)))
+    assert (raised.value.endpoint, raised.value.http_status, raised.value.code) == (
+        "new_order", 400, -2010,
+    )
+    assert adapter.fetch_symbol_filters("BNBUSDT").price_tick == D("0.05")
+    assert sum(urlsplit(call["url"]).path == "/api/v3/exchangeInfo" for call in calls) == 2
 
 
 def test_sdk_additional_buyer_commission_is_not_hidden_by_discount(sdk):

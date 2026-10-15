@@ -1,14 +1,105 @@
 from dataclasses import replace
 from datetime import timedelta
+import json
+import sqlite3
+from urllib.parse import urlsplit
 
 import pytest
+import requests
 
-from core.models import OperationKind, OperationStatus, ReplenishmentState
+from core.models import OperationKind, OperationStatus, ReplenishmentState, SliceState
+from services.binance_adapter import BinanceAdapter
 from services.runner import Runner
 from storage.repository import Repository
 from tests.fake_exchange import FakeExchange
 from tests.helpers import D, make_account, make_strategy_config
 from tests.execution_helpers import run, setup, seed_bid
+
+
+@pytest.mark.parametrize("message", ["Market is closed.", "This symbol is not permitted for this account."])
+@pytest.mark.parametrize("continuation", ["funded", "replanning"])
+@pytest.mark.parametrize("result_commit_fails", [False, True])
+def test_sdk_rejection_preserves_first_group_continuation_and_slice_after_restart(
+    tmp_path, monkeypatch, message, continuation, result_commit_fails,
+):
+    calls = []
+
+    def request(self, **kwargs):
+        assert (kwargs["method"], urlsplit(kwargs["url"]).path) == ("POST", "/api/v3/order")
+        calls.append(kwargs)
+        response = requests.Response()
+        response.status_code = 400
+        response.headers["Content-Type"] = "application/json"
+        response._content = json.dumps({"code": -2010, "msg": message}).encode()
+        return response
+
+    monkeypatch.setattr(requests.Session, "request", request)
+
+    class RejectFirstGroup(FakeExchange):
+        armed = False
+
+        def submit(self, op):
+            if op.kind == OperationKind.ORDER and self.armed:
+                self.armed = False
+                return adapter.submit(op)
+            return super().submit(op)
+
+    ex, repo, runner = setup(
+        tmp_path, RejectFirstGroup(make_account(
+            contract_bnb=D("27"), spot_usd=D("0") if continuation == "funded" else D("5000"),
+            contract_max_withdraw_amount=D("50000"),
+        )), ReplenishmentState.ACCUMULATE,
+    )
+    adapter = BinanceAdapter("fixture-key", "fixture-secret", make_strategy_config(),
+                             live=True, clock=lambda: ex.now)
+    if continuation == "replanning":
+        seed_bid(ex, repo, age_hours=2, qty="3")
+    repo.save("runtime", replace(repo.runtime(), slice_state=SliceState(active=True)))
+    ex.armed = True
+    if result_commit_fails:
+        repo.db.executescript("""
+            CREATE TRIGGER fail_rejection_result BEFORE UPDATE ON kv
+            WHEN NEW.key='runtime' AND EXISTS (
+                SELECT 1 FROM operations WHERE status='FAILED'
+            ) BEGIN SELECT RAISE(ABORT, 'rejection result failed'); END;
+        """)
+        with pytest.raises(sqlite3.IntegrityError, match="rejection result failed"):
+            run(runner, ex)
+    else:
+        run(runner, ex)
+    assert len(calls) == 1
+    rejected = [op for op in repo.operations() if op.kind == OperationKind.ORDER][-1]
+    deadline = repo.runtime().slice_state.next_at
+    assert deadline == ex.now + timedelta(minutes=30)
+    assert rejected.status == (OperationStatus.PENDING if result_commit_fails else OperationStatus.FAILED)
+    assert not rejected.not_sent
+    flag = "resume_replenishment" if continuation == "funded" else "resume_replanning"
+    assert getattr(repo.runtime(), flag) == (not result_commit_fails)
+    assert repo.runtime().api_errors == (0 if result_commit_fails else 1)
+    prior_writes = len(ex.writes)
+    repo.close()
+    repo = Repository(tmp_path / "test.sqlite3")
+    if result_commit_fails:
+        repo.db.execute("DROP TRIGGER fail_rejection_result")
+        repo.db.commit()
+    runner = Runner(ex, repo, make_strategy_config(), clock=lambda: ex.now)
+    ex.now += timedelta(seconds=11)
+    run(runner, ex, inventory=False)
+    assert len(ex.writes) == prior_writes
+    assert repo.runtime().slice_state.next_at == deadline
+    ex.now = deadline
+    run(runner, ex, inventory=False)
+    if result_commit_fails:
+        assert len(ex.writes) == prior_writes
+        assert repo.operation(rejected.client_id).unresolved
+    else:
+        assert sum(op.payload.qty for op in ex.writes[prior_writes:]
+                   if op.kind == OperationKind.ORDER) == D("3")
+        assert not getattr(repo.runtime(), flag)
+    assert len(calls) == 1
+    assert sum(op.kind == OperationKind.TRANSFER and op.payload.asset == "USDT"
+               for op in ex.writes) == (1 if continuation == "funded" else 0)
+    repo.close()
 
 
 @pytest.mark.parametrize("spot_usd", ["0", "3000"])
