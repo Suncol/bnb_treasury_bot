@@ -8,7 +8,7 @@ from datetime import timedelta
 
 from core.time_utils import utc
 
-from .exchange_adapter import RequestDeferred
+from .exchange_adapter import AccountObservationInconsistent, RequestDeferred
 
 
 def retry_deadline(repository):
@@ -20,20 +20,33 @@ def retry_deadline(repository):
 def record_read_failure(repository, exc, now, *, authenticated=True, exchange=None):
     runtime = repository.runtime()
     transport = repository.load("transport_backoff", {})
+    inconsistent = isinstance(exc, AccountObservationInconsistent)
     failures = max(transport.get("failures", 0), runtime.read_failures)
-    failures += not isinstance(exc, RequestDeferred)
+    failures += not isinstance(exc, (RequestDeferred, AccountObservationInconsistent))
+    observation_retries = transport.get("observation_retries", 0) + 1 if inconsistent else 0
     delay = max(float(getattr(exc, "retry_after", None) or 0),
-                min(60, 2 ** min(failures, 6)))
+                min(60, 2 ** min(max(failures, observation_retries), 6)))
     retry_at = utc(now) + timedelta(seconds=delay + random.uniform(0, 1))
     for deadline in (retry_deadline(repository), getattr(exchange, "request_not_before", None)):
         if deadline is not None:
             retry_at = max(retry_at, utc(deadline))
     # This key contains no account identity or trading state. Authentication can
     # fail before business-journal ownership has been verified.
-    repository.save("transport_backoff", {"failures": failures, "retry_at": retry_at})
+    backoff = {"failures": failures, "retry_at": retry_at}
+    if inconsistent:
+        backoff["observation_retries"] = observation_retries
+    repository.save("transport_backoff", backoff)
     if authenticated:
         repository.save("runtime", replace(runtime, read_failures=failures, read_retry_at=retry_at))
-    repository.event(now, "REST_DEFERRED" if isinstance(exc, RequestDeferred) else "API_ERROR", {
+        if inconsistent:
+            issues = dict(repository.load("futures_settlement_issue") or {})
+            issues["observation"] = {"reason": str(exc)}
+            repository.save("futures_settlement_issue", issues)
+    event = (
+        "ACCOUNT_INCONSISTENT" if inconsistent else
+        "REST_DEFERRED" if isinstance(exc, RequestDeferred) else "API_ERROR"
+    )
+    repository.event(now, event, {
         "type": type(exc).__name__, "endpoint": getattr(exc, "endpoint", None),
         "http_status": getattr(exc, "http_status", None), "code": getattr(exc, "code", None),
         "retry_at": retry_at, "authenticated": authenticated,
@@ -41,7 +54,8 @@ def record_read_failure(repository, exc, now, *, authenticated=True, exchange=No
         "trace": tuple(f"{f.filename}:{f.lineno}:{f.name}" for f in traceback.extract_tb(exc.__traceback__)),
     })
     logging.getLogger("bnb_treasury").warning(
-        "REST failure %s endpoint=%s status=%s; retry at %s (authenticated=%s)",
+        "%s %s endpoint=%s status=%s; retry at %s (authenticated=%s)",
+        "Account observation deferred" if inconsistent else "REST failure",
         type(exc).__name__, getattr(exc, "endpoint", None),
         getattr(exc, "http_status", None), retry_at, authenticated,
     )

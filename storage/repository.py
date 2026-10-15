@@ -105,6 +105,7 @@ class Repository:
                 "CREATE INDEX IF NOT EXISTS operations_active ON operations(created,client_id) WHERE active=1",
                 "CREATE INDEX IF NOT EXISTS operations_exchange ON operations(kind,exchange_id)",
                 "CREATE INDEX IF NOT EXISTS operations_scope ON operations(scope,status)",
+                "CREATE INDEX IF NOT EXISTS operations_scope_created ON operations(scope,created DESC)",
                 "CREATE INDEX IF NOT EXISTS fills_time ON fills(ts,trade_id)",
                 "CREATE INDEX IF NOT EXISTS fills_order ON fills(symbol,order_id)",
                 "CREATE INDEX IF NOT EXISTS transfers_time ON transfers(ts,transfer_id)",
@@ -338,6 +339,52 @@ class Repository:
         if row is None:
             raise KeyError(client_id)
         return loads(row[0])
+
+    def current_funding(self, quote_asset, symbol):
+        runtime = self.runtime()
+        if not runtime.resume_replenishment:
+            return None
+        if runtime.funding_client_id is not None:
+            try:
+                return self.operation(runtime.funding_client_id)
+            except KeyError:
+                return None
+        # Legacy booleans have no identity. Only the most recent funding intent,
+        # with no later possibly accepted buy, can anchor that unstarted group.
+        row = self.db.execute(
+            "SELECT rowid,data FROM operations WHERE scope=? ORDER BY created DESC,rowid DESC LIMIT 1",
+            (f"transfer:{quote_asset}:USDⓈ-M Futures:SPOT",),
+        ).fetchone()
+        if row is None:
+            return None
+        funding = loads(row[1])
+        created = utc(funding.created_at).timestamp()
+        if self.db.execute(
+            "SELECT 1 FROM operations WHERE scope=? AND created>=? "
+            "AND (created>? OR rowid>?) AND status!='FAILED' LIMIT 1",
+            (f"order:{symbol}", created, created, row[0]),
+        ).fetchone():
+            return None
+        return funding
+
+    def end_funded_continuation(self, funding_id, now, evidence):
+        """Retire the funded permission and journal the next-cycle barrier together."""
+        with self.db:
+            runtime = self.runtime()
+            funding = self.current_funding(evidence["quote_asset"], evidence["symbol"])
+            if funding is None or funding.client_id != funding_id:
+                return False
+            runtime = replace(
+                runtime, resume_replenishment=False, resume_replanning=False,
+                funding_client_id=None, funding_exhausted_at=now,
+            )
+            self.db.execute(
+                "INSERT INTO kv VALUES ('runtime',?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
+                (dumps(runtime),),
+            )
+            self.db.execute("INSERT INTO events(ts,kind,data) VALUES (?,?,?)",
+                            (utc(now).timestamp(), "FUNDING_EXTERNAL_USAGE", dumps(evidence)))
+        return True
 
     def order_operation(self, exchange_id):
         row = self.db.execute(

@@ -10,8 +10,10 @@ from core.models import (
     OperationKind,
     OperationStatus,
     OrderPlan,
+    ReplenishmentState,
     RunMode,
 )
+from core.risk_checks import evaluate_transfer_gate
 from core.time_utils import fresh, utc
 from core.validation import valid_account_snapshot
 
@@ -20,6 +22,14 @@ from .exchange_adapter import (
 )
 
 MAX_CANCEL_ATTEMPTS = 5
+
+
+class ExecutionBlocked(RuntimeError):
+    """An unsent candidate needs new planning, not an API failure retry."""
+
+    def __init__(self, reason, *, decision=None):
+        super().__init__(reason)
+        self.decision = decision
 
 
 def operation_scope(payload):
@@ -41,6 +51,15 @@ class Executor:
         self.clock = clock or getattr(exchange, "clock", None)
         self._income_batch = False
         self._income_audited_at = None
+        self.reconciler = None
+
+    def _reconciliation(self):
+        if self.reconciler is None:
+            from .reconciliation import Reconciler
+
+            Reconciler(self.exchange, self.repository, self.cfg, clock=self.clock,
+                       executor=self)
+        return self.reconciler
 
     @contextmanager
     def income_batch(self):
@@ -76,7 +95,7 @@ class Executor:
         return runtime
 
     def execute(self, payload, now, state, *, starts_slice=False, account=None,
-                resume_replanning=False):
+                resume_replanning=False, inputs=None):
         kind, scope = operation_scope(payload)
         if kind == OperationKind.CANCEL:
             existing = self.repository.cancel_operation(
@@ -92,6 +111,9 @@ class Executor:
         previous_runtime = (
             self.repository.runtime() if kind == OperationKind.CANCEL else self._require_reconciled()
         )
+        if (kind == OperationKind.TRANSFER and payload.to_account == "SPOT"
+                and previous_runtime.funding_exhausted_at is not None):
+            raise ExecutionBlocked("Funding must wait for a later valid inventory cycle")
         runtime = previous_runtime
         if kind != OperationKind.CANCEL and account is None:
             account = self.exchange.fetch_account_snapshot()
@@ -105,12 +127,16 @@ class Executor:
             raise RuntimeError("New operations require a valid, supported account observation")
         if account is not None and account.wallet_event_cursor is None:
             account = replace(account, wallet_event_cursor=self.repository.wallet_cursor())
-        if kind != OperationKind.CANCEL and not self.income_audited(self.clock() if self.clock else now):
+        funding = kind == OperationKind.TRANSFER and (
+            payload.asset, payload.from_account, payload.to_account
+        ) == (self.cfg.quote_asset, "USDⓈ-M Futures", "SPOT")
+        if funding:
+            account, now = self._prepare_funding(payload, account, runtime, now, inputs)
+            previous_runtime = runtime = self.repository.runtime()
+        elif kind != OperationKind.CANCEL and not self.income_audited(self.clock() if self.clock else now):
             # Direct callers have no batch audit; reuse the supplied balance and
             # the same reconciliation/storage code without another account read.
-            from .reconciliation import Reconciler
-
-            reconciler = Reconciler(self.exchange, self.repository, self.cfg, clock=self.clock)
+            reconciler = self._reconciliation()
             if not reconciler.audit_income(account, self.clock() if self.clock else account.ts):
                 raise RuntimeError("New operations require reconciled futures income")
             self._income_audited_at = account.ts
@@ -139,7 +165,8 @@ class Executor:
                 ),
             )
         if kind == OperationKind.TRANSFER and payload.to_account == "SPOT":
-            runtime = replace(runtime, resume_replenishment=True)
+            runtime = replace(runtime, resume_replenishment=True,
+                              funding_client_id=op.client_id)
         elif (
             kind == OperationKind.CANCEL and payload.replenish_after_cancel
             or kind == OperationKind.TRANSFER and payload.asset == "BNB" and resume_replanning
@@ -147,7 +174,8 @@ class Executor:
             runtime = replace(runtime, resume_replanning=True)
         elif kind == OperationKind.ORDER:
             runtime = replace(
-                runtime, resume_replenishment=False, resume_replanning=False
+                runtime, resume_replenishment=False, resume_replanning=False,
+                funding_client_id=None,
             )
         self.repository.record_intent(op, runtime)
         if kind == OperationKind.CANCEL:
@@ -157,6 +185,54 @@ class Executor:
                 {"client_id": op.client_id, "order_id": payload.order_id},
             )
         return self._submit(op, now, previous_runtime, new_intent=True)
+
+    def _prepare_funding(self, payload, original, runtime, now, inputs):
+        # Read configuration before final account/history preparation. No slow
+        # exchange work may be inserted between the final gate and the intent.
+        minimum = getattr(self.exchange, "min_transfer_usd", None)
+        if minimum is None:
+            minimum = self.exchange.fetch_symbol_filters(self.cfg.symbol).min_transfer_usd
+        account, orders = self._reconciliation().prepare_execution(
+            self.clock() if self.clock else now
+        )
+        now = self.clock() if self.clock else now
+        if not valid_account_snapshot(account, now, self.cfg):
+            raise ExecutionBlocked("Final account observation expired before funding submission")
+        current = self.repository.runtime()
+        if current.run_mode == RunMode.PAUSED or (
+            current.run_mode == RunMode.URGENT_ONLY
+            and current.state != ReplenishmentState.URGENT
+        ):
+            raise ExecutionBlocked("USD funding is blocked by the current run mode")
+        guard_fields = ("active", "episode_id", "keep_price_ceiling", "filled_bnb")
+        if any(getattr(runtime.guard, field) != getattr(current.guard, field)
+               for field in guard_fields):
+            raise ExecutionBlocked("Risk protection changed during funding preparation")
+        if inputs is not None and (
+            not fresh(inputs.market.ts, now, self.cfg.crash_guard.max_market_age_seconds)
+            or inputs.filters.observed_at is not None and not fresh(
+                inputs.filters.observed_at, now, self.cfg.crash_guard.max_market_age_seconds
+            )
+        ):
+            raise ExecutionBlocked("Market or filter observation expired during funding preparation")
+        decision = evaluate_transfer_gate(
+            payload.amount, account.contract_max_withdraw_amount,
+            self.repository.budget_used(now, self.cfg.quote_asset), self.cfg.risk, minimum,
+        )
+        if not decision.allow:
+            raise ExecutionBlocked(decision.message, decision=decision)
+        if decision.adjusted_amount != payload.amount:
+            raise ExecutionBlocked("Transfer amount requires replanning: " + decision.message,
+                                   decision=decision)
+        # Fresh balances/orders can make the old funding demand obsolete even
+        # when the monetary limits still allow it. Let normal planning decide.
+        fields = ("contract_bnb", "spot_bnb", "spot_usd", "reserved_spot_bnb", "reserved_spot_usd")
+        if any(getattr(original, field) != getattr(account, field) for field in fields) or (
+            inputs is not None and {o.order_id: o for o in inputs.orders}
+            != {o.order_id: o for o in orders}
+        ):
+            raise ExecutionBlocked("Funding balances or orders changed; replan the candidate")
+        return account, now
 
     def _recover_cancel(self, op, now):
         if not self.cancel_due(op.payload, now):
@@ -271,6 +347,8 @@ class Executor:
                 self.repository.runtime(),
                 resume_replenishment=previous_runtime.resume_replenishment,
                 resume_replanning=previous_runtime.resume_replanning,
+                funding_client_id=previous_runtime.funding_client_id,
+                funding_exhausted_at=previous_runtime.funding_exhausted_at,
             )
         if cooldown is not None:
             runtime = runtime or self.repository.runtime()
@@ -292,7 +370,7 @@ class Executor:
         if (op.status == OperationStatus.FAILED and not op.not_sent
                 and op.kind == OperationKind.TRANSFER):
             if op.payload.to_account == "SPOT":
-                runtime = replace(runtime, resume_replenishment=False)
+                runtime = replace(runtime, resume_replenishment=False, funding_client_id=None)
         if (
             op.status == OperationStatus.FAILED
             or (submission and op.status == OperationStatus.UNKNOWN)
@@ -306,7 +384,12 @@ class Executor:
         elif op.status == OperationStatus.CONFIRMED:
             runtime = replace(
                 runtime,
-                api_errors=0 if submission else runtime.api_errors,
+                # Protection can succeed while the account observation is still
+                # invalid. Only normal reconciliation or a new financial write
+                # demonstrates recovery; cancelling risk must not hide failures.
+                api_errors=0
+                if submission and op.kind != OperationKind.CANCEL
+                else runtime.api_errors,
                 transfer_failures=0
                 if op.kind == OperationKind.TRANSFER
                 else runtime.transfer_failures,

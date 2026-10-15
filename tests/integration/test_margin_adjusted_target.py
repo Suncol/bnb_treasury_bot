@@ -655,18 +655,23 @@ def test_new_inventory_batch_rechecks_partial_income_before_advancing_state(
     AssetTransferPlan("USDT", D("500"), "USDⓈ-M Futures", "SPOT", "test"),
     OrderPlan("BNBUSDT", "BUY", "LIMIT", D("1"), D("500"), "GTC", False),
 ])
-def test_direct_execution_rechecks_partial_income_without_an_account_query(tmp_path, payload):
+def test_direct_execution_rechecks_partial_income_and_funding_account(tmp_path, payload):
     exchange, repo, runner, receipts, calls = partial_capital_setup(tmp_path)
     exchange.income = receipts
     account = exchange.fetch_account_snapshot()
 
-    def unexpected_account():
-        pytest.fail("Income audit must reuse the supplied account")
+    fetch = exchange.fetch_account_snapshot
+    accounts = []
 
-    exchange.fetch_account_snapshot = unexpected_account
+    def final_account():
+        accounts.append(fetch())
+        return accounts[-1]
+
+    exchange.fetch_account_snapshot = final_account
     with pytest.raises(RuntimeError, match="reconciled futures income"):
         runner.executor.execute(payload, exchange.now, repo.runtime().state, account=account)
     assert len(calls) == 2 and repo.load("futures_settlement_issue")
+    assert len(accounts) == int(isinstance(payload, AssetTransferPlan))
     assert not repo.operations() and not exchange.writes
     repo.close()
 

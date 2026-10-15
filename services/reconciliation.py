@@ -7,7 +7,7 @@ from core.time_utils import utc
 from core.validation import valid_account_snapshot
 
 from .exchange_adapter import ExchangeError, RequestDeferred, order_matches_operation
-from .executor import Executor
+from .executor import ExecutionBlocked, Executor
 from .history import (
     futures_settlement_evidence,
     historical_metrics,
@@ -20,13 +20,36 @@ ZERO = Decimal("0")
 
 
 class Reconciler:
-    def __init__(self, exchange, repository, cfg, *, clock=None):
+    def __init__(self, exchange, repository, cfg, *, clock=None, executor=None):
         self.exchange, self.repository, self.cfg = exchange, repository, cfg
         self.clock = clock or getattr(exchange, "clock", None)
         self.read_checkpoint = None
-        self.executor = Executor(exchange, repository, cfg, clock=self.clock)
+        self.executor = executor or Executor(exchange, repository, cfg, clock=self.clock)
+        self.executor.reconciler = self
         self.history = (ZERO, None)
         self.income_refreshed = False
+        self._funding_orders = None
+
+    def prepare_execution(self, now):
+        """Return a newly verified account and orders for the current write batch.
+
+        Keep the shared executor's audit and priority read checkpoints. Callers
+        must still check their candidate against the returned financial evidence.
+        """
+        account, orders, pending, consistent = self.refresh(now, force_income=True)
+        checked_at = self.clock() if self.clock else now
+        if not (
+            consistent and not pending.unresolved
+            and valid_account_snapshot(account, checked_at, self.cfg)
+            and (account.contract_total_margin_balance is None
+                 or account.contract_margin_asset == self.cfg.quote_asset)
+            and not self.repository.operations(unresolved_only=True)
+            and not self.repository.load("spot_settlement_issue")
+            and not self.repository.load("futures_settlement_issue")
+            and self.repository.load("spot_checkpoint") is not None
+        ):
+            raise ExecutionBlocked("New operations require reconciled futures income and a valid account")
+        return account, orders
 
     def protective_cancellations(self, *, guard=None, now=None, retries_only=False):
         """Best-effort known-order management when a complete view is unavailable.
@@ -175,6 +198,7 @@ class Reconciler:
 
     def refresh(self, now, *, force_income=False):
         self.income_refreshed = False
+        self._funding_orders = None
         repo, exchange, cfg = self.repository, self.exchange, self.cfg
         tracked = repo.tracked_orders(active_only=True)
         for op in repo.operations(unresolved_only=True):
@@ -261,6 +285,17 @@ class Reconciler:
         orders = {
             o.order_id: o for o in self._read(exchange.fetch_open_orders, cfg.symbol)
         }
+        # Only a live funded continuation needs other symbols' reservation
+        # proof. Keep these orders outside BNB exposure and cancellation policy.
+        extra_symbols = tuple(dict.fromkeys(
+            symbol for symbol in cfg.spot_activity_symbols
+            if symbol != cfg.symbol and symbol.endswith(cfg.quote_asset)
+        )) if repo.runtime().resume_replenishment else ()
+        extra_before = tuple(
+            replace(order, strategy_id=None)
+            for symbol in extra_symbols
+            for order in self._read(exchange.fetch_open_orders, symbol)
+        )
         for client_id, op in buys.items():
             previous = tracked.get(client_id) or repo.tracked_order(client_id)
             if op.status == OperationStatus.FAILED or (
@@ -393,11 +428,22 @@ class Reconciler:
             if valid_account_snapshot(account, checked_at, cfg) else None
         )
         after = self._read(exchange.fetch_open_orders, cfg.symbol)
+        extra_after = tuple(
+            replace(order, strategy_id=None)
+            for symbol in extra_symbols
+            for order in self._read(exchange.fetch_open_orders, symbol)
+        )
         before_open = {
             k: (o.qty, o.filled_qty, o.status) for k, o in orders.items() if o.is_open
         }
         after_open = {o.order_id: (o.qty, o.filled_qty, o.status) for o in after}
-        consistent = before_open == after_open
+        # Price, side and identity must also be stable when assigning quote locks.
+        def reservation_view(rows):
+            return {(o.symbol, o.order_id): (o.client_id, o.side, o.price, o.qty,
+                                            o.filled_qty, o.status, o.created_at)
+                    for o in rows if o.is_open}
+        consistent = before_open == after_open and reservation_view(extra_before) == reservation_view(extra_after)
+        reservation_consistent = reservation_view(orders.values()) == reservation_view(after)
         # Cumulative order fills must be covered by the deduplicated trade ledger.
         if tracked:
             totals = repo.fill_totals(
@@ -541,6 +587,8 @@ class Reconciler:
                 "runtime",
                 replace(runtime, guard=self.guard_with_fills(runtime.guard, now)),
             )
+        if consistent and observation_valid and reservation_consistent and not pending.unresolved:
+            self._funding_orders = active + extra_after
         return account, active, pending, consistent
 
     def _save_income_coverage(self, coverage, futures_issues, observation_valid):
@@ -746,6 +794,58 @@ class Reconciler:
             and owner.payload.side == fill.side
         )
         return replace(fill, strategy_id=self.cfg.strategy_id if owned else None)
+
+    def funding_occupation(self, account):
+        """Positive, balance-covered external quote usage since this funding intent."""
+        repo, cfg = self.repository, self.cfg
+        funding = repo.current_funding(cfg.quote_asset, cfg.symbol)
+        if funding is None:
+            return None
+        if (funding.kind != OperationKind.TRANSFER or funding.status != OperationStatus.CONFIRMED
+                or funding.unresolved or funding.payload.asset != cfg.quote_asset
+                or funding.payload.from_account != "USDⓈ-M Futures"
+                or funding.payload.to_account != "SPOT"
+                or funding.balance_before is None or funding.balance_fill_cursor is None
+                or funding.balance_before.wallet_event_cursor is None
+                or account.wallet_event_cursor is None):
+            return None
+        external = {
+            f"trade:{f.symbol}:{f.trade_id}": f for f in repo.fills_after(funding.balance_fill_cursor)
+            if f.strategy_id != cfg.strategy_id and utc(f.ts) >= utc(funding.created_at)
+        }
+        changes = [
+            (reference, deltas[cfg.quote_asset])
+            for _, reference, deltas in repo.wallet_changes(
+                funding.balance_before.wallet_event_cursor, through=account.wallet_event_cursor)
+            if reference in external and deltas.get(cfg.quote_asset) is not None
+        ]
+        spent = max(-sum((amount for _, amount in changes), ZERO), ZERO)
+        frozen = ZERO
+        frozen_orders = ()
+        if self._funding_orders is not None:
+            bids = tuple(o for o in self._funding_orders if o.side == "BUY")
+            valid = all(o.price.is_finite() and o.price > 0 and o.qty.is_finite()
+                        and o.filled_qty.is_finite() and ZERO <= o.filled_qty <= o.qty
+                        and o.status in {"NEW", "PARTIALLY_FILLED"} and not o.cancel_pending
+                        and utc(o.created_at) <= utc(account.ts) for o in bids)
+            if valid and sum((o.remaining_qty * o.price for o in bids), ZERO) == account.reserved_spot_usd:
+                frozen_orders = tuple(o for o in bids if o.strategy_id != cfg.strategy_id
+                                      and utc(o.created_at) > utc(funding.created_at))
+                frozen = sum((o.remaining_qty * o.price for o in frozen_orders), ZERO)
+        before_free = max(funding.balance_before.spot_usd
+                          - funding.balance_before.reserved_spot_usd, ZERO)
+        current_free = max(account.spot_usd - account.reserved_spot_usd, ZERO)
+        # Later credits can replace external spending. Historical receipts alone
+        # cannot turn a subsequent price/lot-size obstacle into funding loss.
+        missing = max(before_free + funding.payload.amount - current_free, ZERO)
+        amount = min(funding.payload.amount, spent + frozen, missing)
+        if amount <= 0:
+            return None
+        return {"funding_client_id": funding.client_id, "amount": amount,
+                "quote_asset": cfg.quote_asset, "symbol": cfg.symbol,
+                "spent": spent, "frozen": frozen, "trade_references": tuple(r for r, _ in changes),
+                "orders": tuple((o.symbol, o.order_id) for o in frozen_orders),
+                "wallet_cursor": account.wallet_event_cursor, "account_at": account.ts}
 
     def import_spot_trades(self, symbols, *, operator, reason, now):
         """Maintenance-only evidence repair; no arbitrary balance overrides.

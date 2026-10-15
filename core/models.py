@@ -550,3 +550,7 @@ class RuntimeState:
     resume_replenishment: bool = False
     # Replan an unstarted group after cancellation or a prerequisite BNB return.
     resume_replanning: bool = False
+    # Bind unstarted funding to its own settled transfer and defer replacement
+    # funding until a later valid inventory cycle after proven external usage.
+    funding_client_id: str | None = None
+    funding_exhausted_at: datetime | None = None
