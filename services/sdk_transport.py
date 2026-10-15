@@ -11,7 +11,7 @@ from binance_common.errors import (
 )
 
 from core.time_utils import utc
-from .exchange_adapter import ExchangeError, RequestDeferred
+from .exchange_adapter import ExchangeError, RequestDeferred, RequestNotSent
 
 D = Decimal
 
@@ -144,7 +144,18 @@ class SDKTransport:
             if owner is not None and owner is getattr(self, "wallet", None)
             else "spot"
         )
-        self.ensure_request_allowed(protective=endpoint == "delete_order", scope=scope)
+        try:
+            self.ensure_request_allowed(protective=endpoint == "delete_order", scope=scope)
+        except RequestDeferred as exc:
+            if not mutation:
+                raise
+            # This is the last boundary before invoking the SDK. Exceptions
+            # raised by the SDK itself are handled below and cannot prove that
+            # nothing reached the exchange, even if they have the same name.
+            raise RequestNotSent(
+                str(exc), endpoint=endpoint, retry_after=exc.retry_after,
+                request_weights=exc.request_weights,
+            ) from exc
         try:
             response = method(**params)
             weights = {
