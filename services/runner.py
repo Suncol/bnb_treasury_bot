@@ -24,7 +24,7 @@ from core.replenishment_engine import build_cycle_plan
 from core.time_utils import age_seconds, fresh, utc
 from core.validation import valid_account_snapshot
 
-from .exchange_adapter import ExchangeError, RequestDeferred
+from .exchange_adapter import AccountObservationInconsistent, ExchangeError, RequestDeferred
 from .executor import MAX_CANCEL_ATTEMPTS
 from .market_data import MarketWindows
 from .reconciliation import Reconciler
@@ -236,7 +236,7 @@ class Runner:
             )
             raise exc
         record_read_failure(self.repository, exc, self.clock(), exchange=self.exchange)
-        if not isinstance(exc, RequestDeferred):
+        if not isinstance(exc, (RequestDeferred, AccountObservationInconsistent)):
             self.executor.note_failure(reason=type(exc).__name__)
         # Never reuse a partially reconciled view for trading or guard recovery.
         self.cached_inputs = None
@@ -269,8 +269,10 @@ class Runner:
         alerts = (
             Alert(
                 "WARNING",
-                "API_ERROR",
-                "Exchange reconciliation or data validation failed",
+                "ACCOUNT_INCONSISTENT" if isinstance(exc, AccountObservationInconsistent) else "API_ERROR",
+                "Account reads disagree; waiting for a consistent observation"
+                if isinstance(exc, AccountObservationInconsistent)
+                else "Exchange reconciliation or data validation failed",
             ),
             Alert(
                 "WARNING",
