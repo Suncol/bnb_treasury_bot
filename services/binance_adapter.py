@@ -35,6 +35,29 @@ from .spot_market import SpotMarketData
 
 D = Decimal
 
+# Matching-engine reasons for the plain BUY limit orders this adapter submits:
+# https://github.com/binance/binance-spot-api-docs/blob/master/errors.md#other-errors
+# Exact messages matter: duplicate IDs and other engine errors do not prove
+# that the journaled request has no live order.
+_PLAIN_LIMIT_REJECTIONS = frozenset({
+    "Account has insufficient balance for requested action.",
+    "Market is closed.",
+    "Price * QTY is zero or less.",
+    "This action is disabled on this account.",
+    "This account may not place or cancel orders.",
+    "Unsupported order combination",
+    "This symbol is not permitted for this account.",
+    "This symbol is restricted for this account.",
+    "Rest API trading is not enabled.",
+})
+_NEW_ORDER_REJECTIONS = {
+    ("LIMIT", "GTC"): _PLAIN_LIMIT_REJECTIONS,
+    ("LIMIT", "IOC"): _PLAIN_LIMIT_REJECTIONS,
+    ("LIMIT_MAKER", "GTC"): _PLAIN_LIMIT_REJECTIONS | {
+        "Order would immediately match and take.",
+    },
+}
+
 
 class BinanceAdapter(SpotMarketData):
     """Official binance-connector-python modular SDKs, with retries disabled."""
@@ -440,14 +463,12 @@ class BinanceAdapter(SpotMarketData):
             }
             order_rejected = (
                 operation.kind == OperationKind.ORDER
+                and exc.endpoint == "new_order"
+                and exc.http_status == 400
                 and exc.code == -2010
-                and (
-                    exc.message
-                    == "Account has insufficient balance for requested action."
-                    or (
-                        p.order_type == "LIMIT_MAKER"
-                        and exc.message == "Order would immediately match and take."
-                    )
+                and p.side == "BUY"
+                and exc.message in _NEW_ORDER_REJECTIONS.get(
+                    (p.order_type, p.time_in_force), (),
                 )
             )
             transfer_rejected = (
@@ -456,7 +477,11 @@ class BinanceAdapter(SpotMarketData):
             if exc.definitive and (
                 exc.code in definite or order_rejected or transfer_rejected
             ):
-                raise RequestRejected(str(exc)) from None
+                raise RequestRejected(
+                    str(exc), endpoint=exc.endpoint, http_status=exc.http_status,
+                    code=exc.code, retry_after=exc.retry_after,
+                    request_weights=exc.request_weights,
+                ) from None
             raise
 
     def query_operation(self, operation):

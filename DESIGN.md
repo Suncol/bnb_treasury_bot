@@ -724,7 +724,9 @@ schema `user_version=2` 在事务内迁移原库（含 v1），新增带唯一�
 
 三个 REST SDK 均设置 `retries=0`，SDK 内部不会自动重试删除订单；应用层撤单恢复须先重新查询核验，并遵守第 14.2 节的持久化尝试规则。钱款参数以十进制字符串交给 SDK，避免转为 float；测试通过 SDK 的实际序列化路径核对最终请求。超时、5xx、未知错误以及成功响应解析失败都不等价于失败，须先对账。只有明确的拒绝码才标为 FAILED。适配器检查系统时钟与两个服务的时间偏差，超过 1 秒停止；由系统时间同步服务校准，不篡改 SDK 的全局时钟。
 
-适配器保留 SDK 的 Binance 错误码和错误原因。根据 [Binance 官方错误说明](https://github.com/binance/binance-spot-api-docs/blob/master/errors.md)，新订单提交收到明确的 `-2010` 且原因为 `Account has insufficient balance for requested action.` 时记为 FAILED；`LIMIT_MAKER` 的 `Order would immediately match and take.` 拒单同样处理。后续对账不会把明确拒单重新置为 UNKNOWN，后续周期仍需刷新余额、行情并重新规划。该分类只适用于明确的新订单拒绝响应；5xx、`-2010` 的重复客户端 ID、未识别原因及超时继续按 UNKNOWN 处理，不能仅凭相同错误码判定无订单，也不能用查询“订单不存在”解除未知提交的门禁。
+适配器保留 SDK 的 Binance 错误码、完整原因、端点及 HTTP 状态。根据 [Binance 官方错误说明](https://github.com/binance/binance-spot-api-docs/blob/master/errors.md#other-errors)，匹配引擎拒绝使用可审计的精确原因表：仅 `new_order`（`POST /api/v3/order`）、HTTP 400、业务码 `-2010`、BUY 方向及当前使用的 `LIMIT_MAKER/GTC`、`LIMIT/GTC`、`LIMIT/IOC` 订单组合共同匹配时，才按该表记为 FAILED。通用原因覆盖余额不足、市场关闭、价格乘数量过低、账户动作禁用、账户交易禁用、订单组合不支持、交易对权限不匹配、交易对受限及 REST 交易未启用；Maker 会立即成交的原因仅匹配 `LIMIT_MAKER`。原文及订单组合映射保存在 `services/binance_adapter.py`，不用子串、前缀或大小写归一化放宽匹配。
+
+明确拒单保持 `not_sent=False`，失败与此前未开始的续作恢复原子提交，同一意图只累计一次失败，不回退切片截止时间。权限/配置拒绝保留完整原因并继续适用连续失败暂停；规则相关拒绝仍失效过滤器缓存，下周期重读重规划。后续对账不会把明确拒单重新置为 UNKNOWN，其他门禁开放时可在后续有效周期重新规划。该新订单原因表不用于撤单、划转或未使用的订单形式；5xx、HTTP 类别不匹配、重复客户端 ID、未识别/变更原因及超时继续按 UNKNOWN 处理，不能仅凭相同错误码判定无订单，也不能用查询“订单不存在”解除未知提交的门禁。
 
 划转请求收到明确的非 5xx 拒绝响应 `-3020 EXCEED_MAX_ROLLOUT`（划出金额超过上限）时，根据 [Wallet 错误码说明](https://developers.binance.com/en/docs/products/wallet/error-code#-3020-exceed_max_rollout)记为 FAILED，并计入连续划转失败熔断，不要求绑定不存在的流水号。5xx 携带相同错误码、`-5012` 等待执行及 `-3029` 泛化划转失败仍按 UNKNOWN 处理，不据此重发。
 
