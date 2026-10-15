@@ -1,6 +1,6 @@
 import json
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -869,6 +869,181 @@ def test_write_rate_limit_persists_cooldown_with_unknown_intent(sdk, tmp_path):
     repo = Repository(path)
     assert repo.runtime().read_retry_at == NOW + timedelta(seconds=90)
     assert repo.operations(unresolved_only=True)[0].client_id == result.client_id
+    assert len(calls) == 1
+    repo.close()
+
+
+@pytest.mark.parametrize("action", ["buy", "fund", "bnb", "sweep", "cancel"])
+def test_quota_exhausted_after_intent_is_audited_as_not_sent(sdk, tmp_path, action):
+    adapter, calls, responses = sdk
+    payload = {
+        "buy": OrderPlan("BNBUSDT", "BUY", "LIMIT", D("1"), D("600"), "IOC", False),
+        "fund": AssetTransferPlan("USDT", D("500"), "USDⓈ-M Futures", "SPOT", "test"),
+        "bnb": AssetTransferPlan("BNB", D("1"), "SPOT", "USDⓈ-M Futures", "test"),
+        "sweep": AssetTransferPlan("USDT", D("500"), "SPOT", "USDⓈ-M Futures", "test"),
+        "cancel": CancelPlan("BNBUSDT", "123", "reprice", replenish_after_cancel=True),
+    }[action]
+    path = tmp_path / "unsent.db"
+    repo = Repository(path)
+    account = FakeExchange().fetch_account_snapshot()
+    repo.initialize_spot_checkpoint(account, {"operator": "test", "reason": "quiescent fixture"})
+    before = replace(repo.runtime(), api_errors=1, transfer_failures=1,
+                     resume_replenishment=action == "buy", resume_replanning=action == "buy")
+    repo.save("runtime", before)
+    responses["GET", "/api/v3/exchangeInfo"] = (
+        (429, {"code": -1003, "msg": "limited"}, {"Retry-After": "90"})
+        if action != "buy" else
+        (200, {"symbols": [], "rateLimits": [{"rateLimitType": "REQUEST_WEIGHT",
+         "interval": "MINUTE", "intervalNum": 1, "limit": 6000}]},
+         {"X-MBX-USED-WEIGHT-1M": "5400"})
+    )
+    submit = adapter.submit
+
+    def concurrent_public_response(op):
+        # This public response arrives after the first preflight and the durable
+        # intent, just before the real adapter performs its final send check.
+        assert repo.operation(op.client_id).status == OperationStatus.PENDING
+        try:
+            adapter._call(adapter.spot.exchange_info, checkpoint=False)
+        except ExchangeError:
+            assert action != "buy"
+        return submit(op)
+
+    adapter.submit = concurrent_public_response
+    result = Executor(adapter, repo, make_strategy_config(), clock=lambda: NOW).execute(
+        payload, NOW, ReplenishmentState.URGENT, account=account,
+        starts_slice=action == "buy", resume_replanning=action == "bnb",
+    )
+    assert [call["method"] for call in calls] == ["GET"]
+    assert result.status == OperationStatus.FAILED
+    assert result.not_sent and not result.failure_recorded and not result.balance_pending
+    assert not repo.operations(unresolved_only=True)
+    assert not repo.operations(active_only=True)
+    assert repo.budget_used(NOW, "USDT") == 0
+    runtime = repo.runtime()
+    assert (runtime.api_errors, runtime.transfer_failures) == (1, 1)
+    assert (runtime.resume_replenishment, runtime.resume_replanning) == (
+        before.resume_replenishment, before.resume_replanning,
+    )
+    assert runtime.read_retry_at == NOW + timedelta(seconds=61 if action == "buy" else 90)
+    if action == "buy":
+        assert runtime.slice_state.next_at == NOW + timedelta(minutes=30)
+    if action == "cancel":
+        assert result.cancel_attempts == 0
+        assert repo.cancel_operation("BNBUSDT", "123") is None
+        assert repo.db.execute("SELECT COUNT(*) FROM events WHERE kind='CANCEL_SENT'").fetchone()[0] == 0
+    assert [call["method"] for call in calls] == ["GET"]
+    repo.close()
+    repo = Repository(path)
+    assert repo.operation(result.client_id) == result
+    assert repo.runtime() == runtime
+    assert not repo.operations(unresolved_only=True)
+    Reconciler(FakeExchange(), repo, make_strategy_config()).refresh(NOW)
+    assert repo.operation(result.client_id) == result
+    if action == "cancel":
+        assert not repo.cancel_recorded("BNBUSDT", "123")
+    repo.close()
+
+
+@pytest.mark.parametrize("initial_status", [OperationStatus.PENDING, OperationStatus.UNKNOWN])
+def test_unsent_cancel_recovery_preserves_identity_and_real_attempts(sdk, tmp_path, initial_status):
+    adapter, calls, responses = sdk
+    now = [NOW]
+    adapter.clock = lambda: now[0]
+    path = tmp_path / "cancel-quota.db"
+    repo = Repository(path)
+    account = FakeExchange().fetch_account_snapshot()
+    repo.initialize_spot_checkpoint(account, {"operator": "test", "reason": "quiescent fixture"})
+    executor = Executor(adapter, repo, make_strategy_config())
+    responses["POST", "/api/v3/order"] = (200, {"orderId": 123, "status": "NEW"})
+    buy = executor.execute(
+        OrderPlan("BNBUSDT", "BUY", "LIMIT_MAKER", D("1"), D("590"), "GTC", True),
+        now[0], ReplenishmentState.WATCH, account=account,
+    )
+    responses["GET", "/api/v3/order"] = (200, {
+        "symbol": "BNBUSDT", "orderId": 123, "clientOrderId": buy.client_id,
+        "side": "BUY", "price": "590", "origQty": "1", "executedQty": "0",
+        "status": "NEW", "timeInForce": "GTC", "time": millis(NOW),
+    })
+    responses["DELETE", "/api/v3/order"] = (
+        (200, {"orderId": 123, "status": "PENDING_CANCEL"})
+        if initial_status == OperationStatus.PENDING else (503, {"msg": "unknown"})
+    )
+    payload = CancelPlan("BNBUSDT", "123", "reprice", replenish_after_cancel=True)
+    original = executor.execute(payload, now[0], ReplenishmentState.WATCH)
+    assert original.status == initial_status
+    prior_runtime = repo.runtime()
+    responses["GET", "/api/v3/exchangeInfo"] = (
+        429, {"code": -1003, "msg": "limited"}, {"Retry-After": "90"},
+    )
+    submit = adapter.submit
+
+    def blocked_after_identity_check(op):
+        try:
+            adapter._call(adapter.spot.exchange_info, checkpoint=False)
+        except ExchangeError:
+            pass
+        return submit(op)
+
+    adapter.submit = blocked_after_identity_check
+    for _ in range(6):
+        now[0] += timedelta(seconds=91)
+        result = executor.execute(payload, now[0], ReplenishmentState.WATCH)
+        assert result.status == initial_status and result.unresolved
+        assert result.client_id == original.client_id and result.exchange_id == original.exchange_id
+        assert result.cancel_attempts == 1 and not result.not_sent
+        assert result.failure_recorded == original.failure_recorded
+        assert repo.runtime().api_errors == prior_runtime.api_errors
+        assert repo.runtime().resume_replanning == prior_runtime.resume_replanning
+        assert result.cancel_retry_at == now[0] + timedelta(seconds=90)
+        repo.close()
+        repo = Repository(path)
+        executor = Executor(adapter, repo, make_strategy_config())
+        assert repo.cancel_operation("BNBUSDT", "123") == result
+    assert sum(call["method"] == "DELETE" for call in calls) == 1
+    adapter.submit = submit
+    responses["DELETE", "/api/v3/order"] = (503, {"msg": "unknown"})
+    for _ in range(6):
+        now[0] += timedelta(seconds=91)
+        executor.execute(payload, now[0], ReplenishmentState.WATCH)
+    assert sum(call["method"] == "DELETE" for call in calls) == 5
+    assert repo.cancel_operation("BNBUSDT", "123").cancel_attempts == 5
+    repo.close()
+
+
+@pytest.mark.parametrize("failure", ["deferred_after_send", "not_sent_after_send", "timeout", "5xx", "decode", "429", "418"])
+def test_only_transport_preflight_proves_unsent_order(sdk, tmp_path, failure):
+    from services.exchange_adapter import RequestDeferred, RequestNotSent
+
+    adapter, calls, responses = sdk
+    responses["POST", "/api/v3/order"] = {
+        "deferred_after_send": RequestDeferred("named deferred after SDK invocation", retry_after=90),
+        "not_sent_after_send": RequestNotSent("untrusted exception after SDK invocation", retry_after=90),
+        "timeout": requests.Timeout("response lost"),
+        "5xx": (503, {"msg": "unknown"}),
+        "decode": (200, {"orderId": 123}),
+        "429": (429, {"code": -1003, "msg": "limited"}, {"Retry-After": "90"}),
+        "418": (418, {"code": -1003, "msg": "banned"}, {"Retry-After": "90"}),
+    }[failure]
+    path = tmp_path / "possibly-sent.db"
+    repo = Repository(path)
+    account = FakeExchange().fetch_account_snapshot()
+    repo.initialize_spot_checkpoint(account, {"operator": "test", "reason": "quiescent fixture"})
+    repo.save("runtime", replace(repo.runtime(), resume_replenishment=True))
+    result = Executor(adapter, repo, make_strategy_config()).execute(
+        OrderPlan("BNBUSDT", "BUY", "LIMIT", D("1"), D("600"), "IOC", False),
+        NOW, ReplenishmentState.URGENT, account=account,
+    )
+    assert result.status == OperationStatus.UNKNOWN and not result.not_sent
+    assert result.failure_recorded and repo.runtime().api_errors == 1
+    assert not repo.runtime().resume_replenishment
+    repo.close()
+    repo = Repository(path)
+    assert repo.operations(unresolved_only=True) == (result,)
+    with pytest.raises((RuntimeError, RequestDeferred)):
+        Executor(adapter, repo, make_strategy_config()).execute(
+            result.payload, NOW, ReplenishmentState.URGENT, account=account,
+        )
     assert len(calls) == 1
     repo.close()
 

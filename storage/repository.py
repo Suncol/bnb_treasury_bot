@@ -382,7 +382,7 @@ class Repository:
 
     def update_operation(
         self, operation: Operation, runtime: RuntimeState | None = None,
-        *, transfer=None, event=None,
+        *, transfer=None, event=None, events=(),
     ):
         with self.db:
             if transfer is not None:
@@ -414,8 +414,7 @@ class Repository:
                     "INSERT INTO kv VALUES ('runtime',?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
                     (dumps(runtime),),
                 )
-            if event is not None:
-                at, kind, data = event
+            for at, kind, data in ((event,) if event is not None else ()) + events:
                 self.db.execute(
                     "INSERT INTO events(ts,kind,data) VALUES (?,?,?)",
                     (utc(at).timestamp(), kind, dumps(data)),

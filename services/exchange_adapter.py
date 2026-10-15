@@ -45,6 +45,14 @@ class AccountObservationInconsistent(ExchangeError):
     """
 
 
+class RequestNotSent(RequestDeferred):
+    """Final transport preflight proved this SDK mutation was never invoked.
+
+    Only the boundary immediately before the SDK call may issue this evidence;
+    an arbitrary RequestDeferred from a submit implementation is insufficient.
+    """
+
+
 class RequestRejected(ExchangeError):
     """A documented, definitive rejection before execution."""
 
