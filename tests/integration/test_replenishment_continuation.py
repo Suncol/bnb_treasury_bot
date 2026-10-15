@@ -589,14 +589,14 @@ def test_funding_after_the_next_inventory_remains_unique_when_its_response_is_lo
 
 
 def test_executor_cannot_bypass_the_persisted_next_inventory_barrier(tmp_path):
-    from services.executor import Executor
+    from services.executor import ExecutionBlocked, Executor
     ex, repo, runner, funding = funded_setup(tmp_path)
     try:
         external_spend(ex, funding.payload.amount)
         ex.now += timedelta(hours=25)
         run(runner, ex, inventory=False)
         executor = Executor(ex, repo, runner.cfg, clock=lambda: ex.now)
-        with pytest.raises(RuntimeError, match="inventory cycle"):
+        with pytest.raises(ExecutionBlocked, match="inventory cycle"):
             executor.execute(funding.payload, ex.now, ReplenishmentState.ACCUMULATE)
         assert len(ex.writes) == 1
         assert len(repo.operations()) == 1

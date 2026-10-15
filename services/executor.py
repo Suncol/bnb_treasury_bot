@@ -113,7 +113,7 @@ class Executor:
         )
         if (kind == OperationKind.TRANSFER and payload.to_account == "SPOT"
                 and previous_runtime.funding_exhausted_at is not None):
-            raise RuntimeError("Funding must wait for a later valid inventory cycle")
+            raise ExecutionBlocked("Funding must wait for a later valid inventory cycle")
         runtime = previous_runtime
         if kind != OperationKind.CANCEL and account is None:
             account = self.exchange.fetch_account_snapshot()
