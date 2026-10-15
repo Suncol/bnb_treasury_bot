@@ -9,7 +9,9 @@ from core.models import ReplenishmentState, RunMode, SliceState
 from services.runner import Runner
 from storage.repository import Repository
 from tests.helpers import make_market, make_strategy_config
-from tests.integration.test_binance_sdk import NOW, account_responses, filter_responses, millis, sdk
+from tests.integration.test_binance_sdk import (
+    NOW, account_responses, filter_responses, funding_account_responses, millis, sdk,
+)
 
 
 @pytest.fixture
@@ -38,6 +40,74 @@ def observed_account(sdk, tmp_path):
 
 def observe(runner, current):
     return runner.run_once(market=replace(make_market(), ts=current[0]))
+
+
+def test_withdrawal_limit_disagreement_cannot_return_the_earlier_high_limit(observed_account):
+    from services.exchange_adapter import AccountObservationInconsistent
+
+    adapter, repo, runner, current, calls, responses = observed_account
+    balance = responses['GET', '/fapi/v3/balance'][1][1]
+    margin = responses['GET', '/fapi/v3/account'][1]['assets'][0]
+    balance['maxWithdrawAmount'] = '50000'
+    margin['maxWithdrawAmount'] = '4000'
+    with pytest.raises(AccountObservationInconsistent):
+        adapter.fetch_account_snapshot()
+    for _ in range(3):
+        assert observe(runner, current) is None
+        assert repo.runtime().run_mode == RunMode.AUTO
+        assert repo.runtime().api_errors == 0
+        current[0] = repo.runtime().read_retry_at
+    margin['maxWithdrawAmount'] = '50000'
+    plan = observe(runner, current)
+    assert plan.inventory_valid
+    assert runner.cached_inputs.account.contract_max_withdraw_amount == 50000
+    assert not repo.operations()
+    assert all(call['method'] == 'GET' for call in calls)
+
+
+def test_real_sdk_final_preflight_vetoes_a_consistent_lower_limit(sdk, tmp_path):
+    adapter, calls, responses = sdk
+    account = funding_account_responses(sdk)
+    filter_responses(responses)
+    balance_response = responses['GET', '/fapi/v3/balance']
+    account_asset = responses['GET', '/fapi/v3/account'][1]['assets'][0]
+    observations = []
+
+    def lower_limit_after_planning(request):
+        maximum = '50000' if not observations else '4000'
+        observations.append(maximum)
+        balance_response[1][1]['maxWithdrawAmount'] = maximum
+        account_asset['maxWithdrawAmount'] = maximum
+        return balance_response
+
+    responses['GET', '/fapi/v3/balance'] = lower_limit_after_planning
+    repo = Repository(tmp_path / 'final-sdk-preflight.db')
+    repo.initialize_spot_checkpoint(account, {'operator': 'test', 'reason': 'quiescent fixture'})
+    repo.save('runtime', replace(repo.runtime(), state=ReplenishmentState.URGENT, api_errors=2))
+    runner = Runner(adapter, repo, make_strategy_config(), clock=lambda: NOW)
+    plan = runner.run_once(market=replace(make_market(), ts=NOW))
+    assert plan is not None and not plan.transfer_decision.allow
+    assert 'Minimum transfer unit' in plan.transfer_decision.message
+    assert observations == ['50000', '4000']
+    assert not repo.operations()
+    assert repo.runtime().api_errors == 2 and repo.runtime().run_mode == RunMode.AUTO
+    assert all(call['method'] == 'GET' for call in calls)
+    repo.close()
+
+
+@pytest.mark.parametrize('value', [None, 'NaN', '-1'])
+def test_missing_or_invalid_account_maximum_remains_real_data_failure(sdk, value):
+    from services.exchange_adapter import AccountObservationInconsistent, ExchangeError
+
+    adapter, calls, responses = account_responses(sdk)
+    asset = responses['GET', '/fapi/v3/account'][1]['assets'][0]
+    if value is None:
+        asset.pop('maxWithdrawAmount')
+    else:
+        asset['maxWithdrawAmount'] = value
+    with pytest.raises(ExchangeError) as failure:
+        adapter.fetch_account_snapshot()
+    assert not isinstance(failure.value, AccountObservationInconsistent)
 
 
 @pytest.mark.parametrize('field,value', [('walletBalance', '9999'), ('updateTime', millis(NOW) + 1)])
