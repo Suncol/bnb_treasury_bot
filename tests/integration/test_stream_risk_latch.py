@@ -25,15 +25,25 @@ def live_quotes(tmp_path, monkeypatch):
 
     monkeypatch.setattr("services.market_stream.datetime", Clock)
 
+    version = 0
+    previous_price = D("600")
+
     def emit(price, count=1):
+        nonlocal version, previous_price
         for _ in range(count):
             exchange.now += timedelta(seconds=1)
             price = D(price)
-            snapshot, event = depth_messages(exchange.now, int(exchange.now.timestamp() * 1000))
-            snapshot["bids"][0][0] = str(price - D("0.5"))
-            snapshot["asks"][0][0] = str(price + D("0.5"))
-            stream.on_message(snapshot)
+            version += 1
+            snapshot, event = depth_messages(exchange.now, version)
+            bids = {str(previous_price - D("0.5")): "0", str(price - D("0.5")): "1"}
+            asks = {str(previous_price + D("0.5")): "0", str(price + D("0.5")): "3.5"}
+            event["b"], event["a"] = list(map(list, bids.items())), list(map(list, asks.items()))
             stream.on_message(event)
+            if stream.depth.needs_snapshot:
+                snapshot["bids"] = [["1", "1"], [str(price - D("0.5")), "1"]]
+                snapshot["asks"] = [[str(price + D("0.5")), "3.5"], ["10000", "1"]]
+                stream.on_snapshot(snapshot)
+            previous_price = price
 
     emit("600", 901)
     assert stream.quote().windows_ready
@@ -154,3 +164,18 @@ def test_new_drop_after_closed_episode_gets_new_identity(live_quotes):
     assert current.active and current.episode_id != previous.episode_id
     assert current.started_at > previous.last_trigger_at
     assert current.filled_bnb == 0
+
+
+def test_continuous_local_book_can_trigger_and_finish_protection(live_quotes):
+    exchange, repo, runner, stream, emit = live_quotes
+    emit("570", 4)
+    runner.run_once()
+    guard = repo.runtime().guard
+    assert guard.active and guard.filled_bnb == 0
+    # The old high must leave the 15-minute window before the final trigger's
+    # 300-second cooldown and stable observation can complete.
+    emit("570", 1201)
+    assert stream.quote().windows_ready
+    runner.run_once()
+    assert not repo.runtime().guard.active
+    assert repo.runtime().guard.episode_id == guard.episode_id
