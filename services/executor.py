@@ -50,7 +50,7 @@ class Executor:
         self.exchange, self.repository, self.cfg = exchange, repository, cfg
         self.clock = clock or getattr(exchange, "clock", None)
         self._income_batch = False
-        self._income_audited_at = None
+        self._income_account = None
         self._income_scan = None
         self._income_revision = 0
         self._income_checked_at = None
@@ -75,7 +75,8 @@ class Executor:
             self._income_batch = False
 
     def invalidate_income_audit(self):
-        self._income_audited_at = self._income_scan = self._income_checked_at = None
+        self._income_scan = self._income_checked_at = None
+        self._income_account = None
         self._income_revision += 1
 
     def income_scan(self, now):
@@ -90,10 +91,13 @@ class Executor:
             return None
         return scan
 
-    def income_audited(self, now):
-        return self.income_scan(now) is not None and self._income_audited_at is not None and fresh(
-            self._income_audited_at, now, self.cfg.risk.max_account_age_seconds
-        )
+    def qualify_income(self, account, now):
+        self._income_account = account if self.income_scan(now) is not None else None
+
+    def income_audited(self, now, *, account=None):
+        return (self.income_scan(now) is not None and self._income_account is not None
+                and (account is None or account == self._income_account)
+                and valid_account_snapshot(self._income_account, now, self.cfg))
 
     def cancel_due(self, payload, now):
         op = self.repository.cancel_operation(payload.symbol, payload.order_id)
@@ -117,6 +121,25 @@ class Executor:
 
     def execute(self, payload, now, state, *, starts_slice=False, account=None,
                 resume_replanning=False, inputs=None):
+        try:
+            if isinstance(payload, CancelPlan):
+                # A cancellation can change the orders/balances observed by an
+                # in-progress scan. Protection never waits for income evidence.
+                self.invalidate_income_audit()
+            elif not self._income_batch:
+                with self.income_batch():
+                    return self._execute(payload, now, state, starts_slice=starts_slice,
+                                         account=account, resume_replanning=resume_replanning,
+                                         inputs=inputs)
+            return self._execute(payload, now, state, starts_slice=starts_slice,
+                                 account=account, resume_replanning=resume_replanning,
+                                 inputs=inputs)
+        except BaseException:
+            self.invalidate_income_audit()
+            raise
+
+    def _execute(self, payload, now, state, *, starts_slice=False, account=None,
+                 resume_replanning=False, inputs=None):
         kind, scope = operation_scope(payload)
         if kind == OperationKind.CANCEL:
             existing = self.repository.cancel_operation(
@@ -154,13 +177,18 @@ class Executor:
         if funding:
             account, now = self._prepare_funding(payload, account, runtime, now, inputs)
             previous_runtime = runtime = self.repository.runtime()
-        elif kind != OperationKind.CANCEL and not self.income_audited(self.clock() if self.clock else now):
-            # Direct callers have no batch audit; reuse the supplied balance and
-            # the same reconciliation/storage code without another account read.
+        elif kind != OperationKind.CANCEL and not self.income_audited(
+            self.clock() if self.clock else now, account=account,
+        ):
+            # Fast direct calls retain their supplied account. A completed slow
+            # audit requires a fresh full observation before it can authorize intent.
             reconciler = self._reconciliation()
-            if not reconciler.audit_income(account, self.clock() if self.clock else account.ts):
-                raise RuntimeError("New operations require reconciled futures income")
-            self._income_audited_at = account.ts
+            original = account
+            account, _ = reconciler.prepare_execution(
+                self.clock() if self.clock else now, account=account,
+            )
+            if account is not original:
+                now = self.clock() if self.clock else now
             previous_runtime = runtime = self._require_reconciled()
         op = Operation(
             "bt-" + uuid4().hex,
