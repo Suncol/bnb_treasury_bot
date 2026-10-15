@@ -500,6 +500,10 @@ class Runner:
                 last_inventory_attempt_at=now
                 if inventory
                 else runtime.last_inventory_attempt_at,
+                funding_exhausted_at=None
+                if (inventory and plan.inventory_valid and runtime.funding_exhausted_at is not None
+                    and utc(now) > utc(runtime.funding_exhausted_at))
+                else runtime.funding_exhausted_at,
                 guard=plan.crash_guard,
                 slice_state=plan.slice_state
                 if update_slice and plan.inventory_valid
@@ -658,6 +662,8 @@ class Runner:
                     "fund" not in used
                     and queue is None
                     and not self.repository.runtime().resume_replenishment
+                    and (runtime.funding_exhausted_at is None
+                         or advance_inventory and utc(inputs.now) > utc(runtime.funding_exhausted_at))
                 ),
                 slice_state=replace(saved_slice, next_at=None)
                 if queue
@@ -813,6 +819,20 @@ class Runner:
                             and not plan.crash_guard.active
                         )
                     )
+                    if (runtime.resume_replenishment and continuing
+                            and plan.gates.run_mode_gate == GateStatus.OPEN
+                            and not plan.buy_plan.orders and not plan.cancellations):
+                        evidence = self.reconciler.funding_occupation(inputs.account)
+                        if evidence is not None:
+                            restored = build_cycle_plan(replace(
+                                inputs, account=replace(inputs.account,
+                                    spot_usd=inputs.account.spot_usd + evidence["amount"]),
+                                allow_usd_funding=False,
+                            ), self.cfg)
+                            if restored.buy_plan.orders and self.repository.end_funded_continuation(
+                                evidence["funding_client_id"], inputs.now, evidence,
+                            ):
+                                return plan
                     self.repository.save(
                         "runtime",
                         replace(
@@ -823,6 +843,7 @@ class Runner:
                             resume_replanning=runtime.resume_replanning
                             and continuing
                             and state != ReplenishmentState.URGENT,
+                            funding_client_id=runtime.funding_client_id if continuing else None,
                         ),
                     )
                 return plan
