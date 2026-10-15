@@ -15,7 +15,9 @@ from core.models import (
 from core.time_utils import fresh, utc
 from core.validation import valid_account_snapshot
 
-from .exchange_adapter import ExchangeError, RequestRejected, order_matches_operation
+from .exchange_adapter import (
+    ExchangeError, RequestNotSent, RequestRejected, order_matches_operation,
+)
 
 MAX_CANCEL_ATTEMPTS = 5
 
@@ -154,7 +156,7 @@ class Executor:
                 "CANCEL_INTENT",
                 {"client_id": op.client_id, "order_id": payload.order_id},
             )
-        return self._submit(op, now, previous_runtime)
+        return self._submit(op, now, previous_runtime, new_intent=True)
 
     def _recover_cancel(self, op, now):
         if not self.cancel_due(op.payload, now):
@@ -201,8 +203,9 @@ class Executor:
             op, self.clock() if self.clock else now, self.repository.runtime()
         )
 
-    def _submit(self, op, now, previous_runtime):
+    def _submit(self, op, now, previous_runtime, *, new_intent=False):
         kind = op.kind
+        previous_op = op
         if kind == OperationKind.CANCEL:
             attempts = op.cancel_attempts + 1
             op = replace(
@@ -211,18 +214,35 @@ class Executor:
             )
             # Intent, deadline and attempt number commit before the network.
             self.repository.update_operation(
-                op, event=(now, "CANCEL_SENT", {
+                op, event=(now, "CANCEL_ATTEMPT_RESERVED", {
                     "client_id": op.client_id, "order_id": op.payload.order_id,
                     "attempt": attempts,
                 }),
             )
         cooldown = None
         transfer = None
+        not_sent = False
         try:
             result = self.exchange.submit(op)
             transfer = result.transfer
             op = replace(
                 op, status=result.status, exchange_id=result.exchange_id, checked_at=now
+            )
+        except RequestNotSent as exc:
+            not_sent = True
+            cooldown = (self.clock() if self.clock else now) + timedelta(
+                seconds=max(1, float(exc.retry_after or 1))
+            )
+            # Never infer that a durable PENDING/UNKNOWN from an earlier
+            # attempt was unsent. Only this call's newly created intent can
+            # become terminal; recovered cancels keep their original evidence.
+            op = replace(
+                op,
+                status=OperationStatus.FAILED if new_intent else previous_op.status,
+                not_sent=True if new_intent else previous_op.not_sent,
+                balance_pending=False if new_intent else previous_op.balance_pending,
+                cancel_attempts=previous_op.cancel_attempts,
+                error=f"Not sent: {exc}",
             )
         except RequestRejected as exc:
             op = replace(
@@ -242,9 +262,11 @@ class Executor:
                 checked_at=now,
             )
         runtime = None
-        if op.status == OperationStatus.FAILED and kind == OperationKind.ORDER:
-            # Only a definite rejection restores the unstarted continuation.
-            # Commit it with FAILED so a restart cannot lose the retry/fund reserve.
+        if (not_sent and new_intent) or (
+            op.status == OperationStatus.FAILED and kind == OperationKind.ORDER
+        ):
+            # A definite rejection or a proven unsent new intent restores the
+            # unstarted continuation together with its terminal result.
             runtime = replace(
                 self.repository.runtime(),
                 resume_replenishment=previous_runtime.resume_replenishment,
@@ -258,18 +280,23 @@ class Executor:
             if kind == OperationKind.CANCEL:
                 op = replace(op, cancel_retry_at=max(op.cancel_retry_at, cooldown))
         op = replace(op, checked_at=self.clock() if self.clock else now)
-        return self.record_result(op, runtime=runtime, submission=True, transfer=transfer)
+        return self.record_result(
+            op, runtime=runtime, submission=not not_sent, transfer=transfer,
+            not_sent=not_sent,
+        )
 
-    def record_result(self, op, *, runtime=None, submission=False, transfer=None):
+    def record_result(self, op, *, runtime=None, submission=False, transfer=None,
+                      not_sent=False):
         """Commit a result and its continuation/circuit-breaker effects together."""
         runtime = runtime or self.repository.runtime()
-        if op.status == OperationStatus.FAILED and op.kind == OperationKind.TRANSFER:
+        if (op.status == OperationStatus.FAILED and not op.not_sent
+                and op.kind == OperationKind.TRANSFER):
             if op.payload.to_account == "SPOT":
                 runtime = replace(runtime, resume_replenishment=False)
         if (
             op.status == OperationStatus.FAILED
             or (submission and op.status == OperationStatus.UNKNOWN)
-        ) and not op.failure_recorded:
+        ) and not op.failure_recorded and not op.not_sent:
             runtime = self._failure_runtime(
                 runtime,
                 transfer=op.kind == OperationKind.TRANSFER,
@@ -285,9 +312,11 @@ class Executor:
                 else runtime.transfer_failures,
             )
         event = None
+        events = ()
         if op.kind == OperationKind.CANCEL:
             event = (
                 op.checked_at,
+                "CANCEL_NOT_SENT" if not_sent else
                 "CANCEL_TERMINAL" if op.status == OperationStatus.CONFIRMED else "CANCEL_RESULT",
                 {
                     "client_id": op.client_id, "order_id": op.payload.order_id,
@@ -295,7 +324,14 @@ class Executor:
                     "error": op.error,
                 },
             )
-        self.repository.update_operation(op, runtime, transfer=transfer, event=event)
+            if submission:
+                events = ((op.checked_at, "CANCEL_SENT", {
+                    "client_id": op.client_id, "order_id": op.payload.order_id,
+                    "attempt": op.cancel_attempts,
+                }),)
+        self.repository.update_operation(
+            op, runtime, transfer=transfer, event=event, events=events,
+        )
         return op
 
     @staticmethod

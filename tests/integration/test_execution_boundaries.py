@@ -1,6 +1,7 @@
 from dataclasses import replace
 from datetime import timedelta
 from threading import Event, Thread
+import sqlite3
 
 import pytest
 
@@ -15,6 +16,7 @@ from core.models import (
     SliceState,
 )
 from services.alert_service import AlertService
+from services.exchange_adapter import RequestNotSent
 from services.runner import Runner
 from storage.repository import Repository
 from tests.fake_exchange import FakeExchange
@@ -42,6 +44,98 @@ def test_timeout_slice_wait_survives_fast_ticks_and_reconciliation(tmp_path):
     assert sum(
         o.payload.qty for o in exchange.writes if o.kind == OperationKind.ORDER
     ) == D("6")
+
+
+@pytest.mark.parametrize("result_commit_fails", [False, True])
+def test_unsent_first_buy_restores_continuation_atomically_across_restart(tmp_path, result_commit_fails):
+    class UnsentFirstOrder(FakeExchange):
+        deferred = False
+
+        def submit(self, op):
+            if op.kind == OperationKind.ORDER and not self.deferred:
+                self.deferred = True
+                raise RequestNotSent("final local quota check", retry_after=60)
+            return super().submit(op)
+
+    exchange, repo, runner = setup(
+        tmp_path, UnsentFirstOrder(make_account(contract_bnb=D("19"), spot_usd=D("30000"))),
+    )
+    repo.save("runtime", replace(repo.runtime(), resume_replenishment=True))
+    if result_commit_fails:
+        # Fail the runtime half after the operation UPDATE, inside the same real
+        # result transaction. The preceding intent transaction must survive.
+        repo.db.executescript("""
+            CREATE TRIGGER fail_unsent_result BEFORE UPDATE ON kv
+            WHEN NEW.key='runtime' AND EXISTS (
+                SELECT 1 FROM operations WHERE status='FAILED'
+            ) BEGIN SELECT RAISE(ABORT, 'result transaction failed'); END;
+        """)
+        with pytest.raises(sqlite3.IntegrityError, match="result transaction failed"):
+            runner.tick()
+    else:
+        runner.tick()
+    assert not exchange.writes
+    original = repo.operations()[0]
+    deadline = repo.runtime().slice_state.next_at
+    assert deadline == exchange.now + timedelta(minutes=30)
+    if result_commit_fails:
+        assert original.status == OperationStatus.PENDING and not original.not_sent
+        assert not repo.runtime().resume_replenishment
+        assert repo.runtime().read_retry_at is None
+    else:
+        assert original.status == OperationStatus.FAILED and original.not_sent
+        assert repo.runtime().resume_replenishment
+        assert repo.runtime().read_retry_at == exchange.now + timedelta(seconds=60)
+    assert repo.runtime().api_errors == 0 and repo.runtime().transfer_failures == 0
+    repo.close()
+    repo = Repository(tmp_path / "test.sqlite3")
+    if result_commit_fails:
+        repo.db.execute("DROP TRIGGER fail_unsent_result")
+        repo.db.commit()
+    runner = Runner(exchange, repo, make_strategy_config(), clock=lambda: exchange.now)
+    for seconds in (1, 59, 1):
+        exchange.now += timedelta(seconds=seconds)
+        runner.tick()
+        assert not exchange.writes
+        assert repo.runtime().slice_state.next_at == deadline
+    exchange.now = deadline
+    runner.tick()
+    if result_commit_fails:
+        # A restart cannot recover the lost proof by guessing from absent orders.
+        assert not exchange.writes
+        assert repo.operation(original.client_id).unresolved
+    else:
+        assert sum(op.payload.qty for op in exchange.writes if op.kind == OperationKind.ORDER) == D("3")
+        assert not any(op.kind == OperationKind.TRANSFER and op.payload.asset == "USDT"
+                       for op in exchange.writes)
+        assert all(op.client_id != original.client_id for op in exchange.writes)
+        assert not repo.runtime().resume_replenishment
+        assert not repo.operations(unresolved_only=True)
+    repo.close()
+
+
+def test_unsent_new_cancel_stops_the_current_cycle_until_cooldown(tmp_path):
+    class UnsentFirstCancel(FakeExchange):
+        deferred = False
+
+        def submit(self, op):
+            if op.kind == OperationKind.CANCEL and not self.deferred:
+                self.deferred = True
+                raise RequestNotSent("final local cooldown", retry_after=60)
+            return super().submit(op)
+
+    exchange, repo, runner = setup(
+        tmp_path, UnsentFirstCancel(make_account(contract_bnb=D("27"), spot_usd=D("5000"))),
+        ReplenishmentState.ACCUMULATE,
+    )
+    bid = seed_bid(exchange, repo, age_hours=2, qty="5")
+    run(runner, exchange, inventory=False)
+    assert len(exchange.writes) == 1
+    cancels = [op for op in repo.operations() if op.kind == OperationKind.CANCEL]
+    assert len(cancels) == 1 and cancels[0].not_sent
+    assert not repo.runtime().resume_replanning
+    assert exchange.orders[bid.exchange_id].is_open
+    repo.close()
 
 
 @pytest.mark.parametrize("action", ["buy", "fund", "bnb", "sweep"])
