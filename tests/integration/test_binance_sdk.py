@@ -171,6 +171,7 @@ def account_responses(sdk):
     responses["GET", "/fapi/v3/account"] = (200, {
         "totalMarginBalance": "12345", "totalWalletBalance": "10000",
         "assets": [{"asset": "USDT", "walletBalance": "10000", "marginBalance": "12345",
+                    "maxWithdrawAmount": "4567.89",
                     "unrealizedProfit": "2345", "updateTime": millis(NOW)}],
     })
     responses["GET", "/fapi/v1/multiAssetsMargin"] = (200, {"multiAssetsMargin": False})
@@ -184,6 +185,29 @@ def account_responses(sdk):
         },
     )
     return adapter, calls, responses
+
+
+def funding_account_responses(sdk):
+    """A real SDK account/history observation for Executor's mandatory preflight."""
+    adapter, calls, responses = account_responses(sdk)
+    responses["GET", "/fapi/v3/balance"][1][0]["balance"] = "24"
+    quote = responses["GET", "/fapi/v3/balance"][1][1]
+    quote.update(balance="50000", maxWithdrawAmount="50000")
+    margin = responses["GET", "/fapi/v3/account"][1]
+    margin.update(totalMarginBalance="50000", totalWalletBalance="50000")
+    margin["assets"][0].update(walletBalance="50000", marginBalance="50000",
+                               maxWithdrawAmount="50000", unrealizedProfit="0")
+    responses["GET", "/api/v3/account"][1]["balances"] = [
+        {"asset": "BNB", "free": "0.5", "locked": "0"},
+        {"asset": "USDT", "free": "0", "locked": "0"},
+    ]
+    responses["GET", "/api/v3/openOrders"] = (200, [])
+    responses["GET", "/api/v3/myTrades"] = (200, [])
+    responses["GET", "/sapi/v1/asset/transfer"] = (200, {"rows": [], "total": 0})
+    responses["GET", "/fapi/v1/income"] = (200, [])
+    account = adapter.fetch_account_snapshot()
+    calls.clear()
+    return account
 
 
 def test_account_uses_asset_max_withdraw_and_total_spot_balances(sdk):
@@ -513,14 +537,14 @@ def test_order_rejection_allowlist_requires_complete_protocol_match(sdk, tmp_pat
         message = "Market is closed. Unknown prior execution."
     responses[method, path] = (status, {"code": code, "msg": message})
     repo = Repository(tmp_path / "protocol-scope.db")
-    account = FakeExchange().fetch_account_snapshot()
+    account = funding_account_responses(sdk) if case == "transfer" else FakeExchange().fetch_account_snapshot()
     repo.initialize_spot_checkpoint(account, {"operator": "test", "reason": "quiescent fixture"})
     result = Executor(adapter, repo, make_strategy_config()).execute(
         payload, NOW, ReplenishmentState.ACCUMULATE, account=account,
     )
     assert result.status == OperationStatus.UNKNOWN and not result.not_sent
     assert repo.operations(unresolved_only=True) == (result,)
-    assert len(calls) == 1
+    assert sum(call["method"] != "GET" for call in calls) == 1
     repo.close()
 
 
@@ -556,7 +580,8 @@ def test_definite_transfer_limit_rejection_can_reconcile_and_counts_failures(
         {"code": -3020, "msg": "Transfer out amount exceeds max amount."},
     )
     repo = Repository(tmp_path / "sdk.sqlite3")
-    repo.initialize_spot_checkpoint(FakeExchange().fetch_account_snapshot(), {"operator": "test", "reason": "quiescent fixture"})
+    account = funding_account_responses(sdk)
+    repo.initialize_spot_checkpoint(account, {"operator": "test", "reason": "quiescent fixture"})
     executor = Executor(adapter, repo, make_strategy_config())
     payload = AssetTransferPlan("USDT", D("500"), "USDⓈ-M Futures", "SPOT", "fund")
     for attempt in range(2):
@@ -564,13 +589,13 @@ def test_definite_transfer_limit_rejection_can_reconcile_and_counts_failures(
             payload,
             NOW,
             ReplenishmentState.URGENT,
-            account=FakeExchange().fetch_account_snapshot(),
+            account=account,
         )
         assert op.status == OperationStatus.FAILED and "-3020" in op.error
         assert not repo.operations(unresolved_only=True)
         assert not repo.runtime().resume_replenishment
-        Reconciler(FakeExchange(), repo, make_strategy_config()).refresh(NOW)
-        assert len(calls) == attempt + 1  # No retry or lookup of a rejected transfer.
+        Reconciler(adapter, repo, make_strategy_config()).refresh(NOW)
+        assert sum(call["method"] == "POST" for call in calls) == attempt + 1
     assert repo.runtime().run_mode == RunMode.PAUSED
     repo.close()
 
@@ -583,20 +608,21 @@ def test_uncertain_transfer_responses_keep_the_gate_closed(sdk, tmp_path, status
         {"code": code, "msg": "transfer response"},
     )
     repo = Repository(tmp_path / "sdk.sqlite3")
-    repo.initialize_spot_checkpoint(FakeExchange().fetch_account_snapshot(), {"operator": "test", "reason": "quiescent fixture"})
+    account = funding_account_responses(sdk)
+    repo.initialize_spot_checkpoint(account, {"operator": "test", "reason": "quiescent fixture"})
     executor = Executor(adapter, repo, make_strategy_config())
     payload = AssetTransferPlan("USDT", D("500"), "USDⓈ-M Futures", "SPOT", "fund")
     op = executor.execute(
         payload,
         NOW,
         ReplenishmentState.URGENT,
-        account=FakeExchange().fetch_account_snapshot(),
+        account=account,
     )
     assert op.status == OperationStatus.UNKNOWN
     assert adapter.query_operation(op).status == OperationStatus.UNKNOWN
     with pytest.raises(RuntimeError, match="reconciled"):
         executor.execute(payload, NOW, ReplenishmentState.URGENT)
-    assert len(calls) == 1
+    assert sum(call["method"] == "POST" for call in calls) == 1
     repo.close()
 
 
@@ -1001,7 +1027,7 @@ def test_quota_exhausted_after_intent_is_audited_as_not_sent(sdk, tmp_path, acti
     }[action]
     path = tmp_path / "unsent.db"
     repo = Repository(path)
-    account = FakeExchange().fetch_account_snapshot()
+    account = funding_account_responses(sdk) if action == "fund" else FakeExchange().fetch_account_snapshot()
     repo.initialize_spot_checkpoint(account, {"operator": "test", "reason": "quiescent fixture"})
     before = replace(repo.runtime(), api_errors=1, transfer_failures=1,
                      resume_replenishment=action == "buy", resume_replanning=action == "buy")
@@ -1030,7 +1056,7 @@ def test_quota_exhausted_after_intent_is_audited_as_not_sent(sdk, tmp_path, acti
         payload, NOW, ReplenishmentState.URGENT, account=account,
         starts_slice=action == "buy", resume_replanning=action == "bnb",
     )
-    assert [call["method"] for call in calls] == ["GET"]
+    assert calls and all(call["method"] == "GET" for call in calls)
     assert result.status == OperationStatus.FAILED
     assert result.not_sent and not result.failure_recorded and not result.balance_pending
     assert not repo.operations(unresolved_only=True)
@@ -1048,7 +1074,7 @@ def test_quota_exhausted_after_intent_is_audited_as_not_sent(sdk, tmp_path, acti
         assert result.cancel_attempts == 0
         assert repo.cancel_operation("BNBUSDT", "123") is None
         assert repo.db.execute("SELECT COUNT(*) FROM events WHERE kind='CANCEL_SENT'").fetchone()[0] == 0
-    assert [call["method"] for call in calls] == ["GET"]
+    assert calls and all(call["method"] == "GET" for call in calls)
     repo.close()
     repo = Repository(path)
     assert repo.operation(result.client_id) == result

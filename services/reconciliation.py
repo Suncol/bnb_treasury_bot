@@ -7,7 +7,7 @@ from core.time_utils import utc
 from core.validation import valid_account_snapshot
 
 from .exchange_adapter import ExchangeError, RequestDeferred, order_matches_operation
-from .executor import Executor
+from .executor import ExecutionBlocked, Executor
 from .history import (
     futures_settlement_evidence,
     historical_metrics,
@@ -20,13 +20,35 @@ ZERO = Decimal("0")
 
 
 class Reconciler:
-    def __init__(self, exchange, repository, cfg, *, clock=None):
+    def __init__(self, exchange, repository, cfg, *, clock=None, executor=None):
         self.exchange, self.repository, self.cfg = exchange, repository, cfg
         self.clock = clock or getattr(exchange, "clock", None)
         self.read_checkpoint = None
-        self.executor = Executor(exchange, repository, cfg, clock=self.clock)
+        self.executor = executor or Executor(exchange, repository, cfg, clock=self.clock)
+        self.executor.reconciler = self
         self.history = (ZERO, None)
         self.income_refreshed = False
+
+    def prepare_execution(self, now):
+        """Return a newly verified account and orders for the current write batch.
+
+        Keep the shared executor's audit and priority read checkpoints. Callers
+        must still check their candidate against the returned financial evidence.
+        """
+        account, orders, pending, consistent = self.refresh(now, force_income=True)
+        checked_at = self.clock() if self.clock else now
+        if not (
+            consistent and not pending.unresolved
+            and valid_account_snapshot(account, checked_at, self.cfg)
+            and (account.contract_total_margin_balance is None
+                 or account.contract_margin_asset == self.cfg.quote_asset)
+            and not self.repository.operations(unresolved_only=True)
+            and not self.repository.load("spot_settlement_issue")
+            and not self.repository.load("futures_settlement_issue")
+            and self.repository.load("spot_checkpoint") is not None
+        ):
+            raise ExecutionBlocked("New operations require reconciled futures income and a valid account")
+        return account, orders
 
     def protective_cancellations(self, *, guard=None, now=None, retries_only=False):
         """Best-effort known-order management when a complete view is unavailable.

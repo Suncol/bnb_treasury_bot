@@ -144,9 +144,15 @@ class BinanceAdapter(SpotMarketData):
             margin_quote["walletBalance"], quote["balance"],
         )):
             raise ExchangeError("Futures quote wallet balance is nonfinite")
+        if "maxWithdrawAmount" not in margin_quote or not all(
+            D(value).is_finite() and D(value) >= 0
+            for value in (quote["maxWithdrawAmount"], margin_quote["maxWithdrawAmount"])
+        ):
+            raise ExchangeError("Futures quote asset withdrawal limits are invalid")
         if (
             D(margin_quote["walletBalance"]) != D(quote["balance"])
             or margin_quote.get("updateTime") != quote.get("updateTime")
+            or D(margin_quote["maxWithdrawAmount"]) != D(quote["maxWithdrawAmount"])
         ):
             raise AccountObservationInconsistent(
                 "Futures balance and margin observations disagree",
