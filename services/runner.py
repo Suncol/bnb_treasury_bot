@@ -159,6 +159,7 @@ class Runner:
                         and not reconcile_due
                         and not risk_changed
                         and not plan.cancellations
+                        and not self._inventory_change(plan)
                     ):
                         self._log_data_gate(inputs, plan)
                         self._publish(plan.alerts)
@@ -479,16 +480,28 @@ class Runner:
         if self.alerts is not None:
             self.alerts.notify()
 
+    def _inventory_change(self, plan):
+        runtime = self.repository.runtime()
+        return plan.inventory_valid and (
+            plan.state_decision.confirmed_state != runtime.state
+            or plan.slice_state != runtime.slice_state
+            or plan.state_decision.transitioned and (
+                plan.state_decision.candidate_state != runtime.candidate
+                or plan.state_decision.candidate_streak != runtime.candidate_streak
+            )
+        )
+
     def _persist_plan(self, plan, *, inventory, now, update_slice=True):
         runtime = self.repository.runtime()
-        advance_candidate = plan.inventory_valid and (
+        verified = plan.inventory_valid and self.executor.income_audited(self.clock())
+        advance_candidate = verified and (
             inventory or plan.state_decision.transitioned
         )
         self.repository.save_guard(
             replace(
                 runtime,
                 state=plan.state_decision.confirmed_state
-                if plan.inventory_valid
+                if verified
                 else runtime.state,
                 candidate=plan.state_decision.candidate_state
                 if advance_candidate
@@ -497,18 +510,18 @@ class Runner:
                 if advance_candidate
                 else runtime.candidate_streak,
                 last_inventory_at=now
-                if inventory and plan.inventory_valid
+                if inventory and verified
                 else runtime.last_inventory_at,
                 last_inventory_attempt_at=now
                 if inventory
                 else runtime.last_inventory_attempt_at,
                 funding_exhausted_at=None
-                if (inventory and plan.inventory_valid and runtime.funding_exhausted_at is not None
+                if (inventory and verified and runtime.funding_exhausted_at is not None
                     and utc(now) > utc(runtime.funding_exhausted_at))
                 else runtime.funding_exhausted_at,
                 guard=plan.crash_guard,
                 slice_state=plan.slice_state
-                if update_slice and plan.inventory_valid
+                if update_slice and verified
                 else runtime.slice_state,
             ),
             now,
@@ -565,7 +578,25 @@ class Runner:
             consumed = True
         return consumed
 
-    def _inputs(self, market, inventory, *, continuing=False):
+    def _continuation_audit_due(self, market, continuing):
+        if not self.execute_enabled or not continuing or self.cached_inputs is None:
+            return False
+        runtime = self.repository.runtime()
+        preview = build_cycle_plan(replace(
+            self.cached_inputs, market=market, now=self.clock(),
+            run_mode=runtime.run_mode, crash_guard=runtime.guard,
+            previous_state=runtime.state, previous_candidate_state=runtime.candidate,
+            candidate_streak=runtime.candidate_streak, slice_state=runtime.slice_state,
+            advance_state=False, allow_new_cycle=True,
+            allow_usd_funding=not runtime.resume_replenishment,
+            reserve_replenishment_funds=runtime.resume_replanning or runtime.resume_replenishment,
+        ), self.cfg)
+        return not preview.cancellations and bool(
+            preview.buy_plan.orders or preview.transfer_decision.allow
+            or preview.bnb_transfer_plan or preview.spot_usd_sweep_plan
+        )
+
+    def _inputs(self, market, inventory, *, continuing=False, force_income=False):
         started = self.clock()
         self._consume_stream_risk()
         now = self.clock()
@@ -577,7 +608,7 @@ class Runner:
         self._priority_market = market
         self._priority_checkpoint()
         account, orders, pending, consistent = self.reconciler.refresh(
-            now, force_income=inventory or self.execute_enabled,
+            now, force_income=force_income or inventory or self._continuation_audit_due(market, continuing),
         )
         filters = self.exchange.fetch_symbol_filters(self.cfg.symbol)
         # Reconciliation may be slow. Never timestamp an old quote as a new one.
@@ -674,15 +705,18 @@ class Runner:
             candidate = queue[0] if queue else None
             plan = build_cycle_plan(inputs, self.cfg, queued_order=candidate)
             if not self.executor.income_audited(self.clock()) and (
-                advance_inventory or self.execute_enabled and (
+                advance_inventory or self._inventory_change(plan) or self.execute_enabled and (
                     plan.buy_plan.orders or plan.transfer_decision.allow
                     or plan.bnb_transfer_plan or plan.spot_usd_sweep_plan
                 )
             ) and plan.inventory_valid and not inputs.pending.unresolved and not plan.cancellations:
-                consistent = self.reconciler.audit_income(inputs.account, self.clock())
-                rate, margin = self.reconciler.history
-                inputs = replace(inputs, snapshot_consistent=consistent,
-                                 consumption_rate=rate, margin_change_24h=margin)
+                # A maintenance observation can reveal a new decision. Promote
+                # it to a full audit and rebuild from its final fresh account.
+                audited = self._inputs(inputs.market, advance_inventory,
+                                       continuing=inputs.allow_new_cycle, force_income=True)
+                inputs = replace(audited, allow_usd_funding=inputs.allow_usd_funding,
+                                 slice_state=replace(audited.slice_state, next_at=None)
+                                 if queue else audited.slice_state)
                 self.cached_inputs = inputs
                 plan = build_cycle_plan(inputs, self.cfg, queued_order=candidate)
             if self._priority_revision != priority_revision:
@@ -690,7 +724,7 @@ class Runner:
                 if submitted_qty:
                     used.add("buys")
                 queue = None
-                self.executor._income_audited_at = None
+                self.executor.invalidate_income_audit()
                 market = inputs.market
                 continue
             if queue:
@@ -698,7 +732,7 @@ class Runner:
                     plan,
                     slice_state=replace(plan.slice_state, next_at=saved_slice.next_at),
                 )
-            if advance_inventory and plan.inventory_valid:
+            if advance_inventory and plan.inventory_valid and self.executor.income_audited(self.clock()):
                 self.repository.save_snapshot(inputs.account)
             self._persist_plan(plan, inventory=advance_inventory, now=inputs.now)
             if plan.inventory_valid:
