@@ -2,11 +2,12 @@
 
 from dataclasses import replace
 from datetime import timedelta
+import sqlite3
 
 import pytest
 
 from core.models import CancelPlan, Fill, OperationKind, OperationStatus, OrderPlan, ReplenishmentState
-from services.exchange_adapter import ExchangeError
+from services.exchange_adapter import ExchangeError, RequestNotSent
 from services.executor import Executor, MAX_CANCEL_ATTEMPTS
 from services.reconciliation import Reconciler
 from services.runner import Runner
@@ -104,6 +105,58 @@ def test_cancel_attempts_are_bounded_and_audited_without_releasing_exposure(tmp_
     runner = Runner(ex, repo, cfg, clock=lambda: ex.now)
     runner.run_once(inventory_cycle=False)
     assert any(a.code == "CANCEL_RECOVERY_EXHAUSTED" for _, a in repo.pending_alerts())
+    repo.close()
+
+
+@pytest.mark.parametrize("recovering", [False, True])
+def test_unsent_cancel_result_rollback_keeps_original_intent_after_restart(tmp_path, recovering):
+    ex, cfg = funded(), make_strategy_config()
+    path = tmp_path / "unsent-cancel-rollback.db"
+    repo = Repository(path)
+    initialize(repo, ex)
+    executor = Executor(ex, repo, cfg)
+    buy = executor.execute(
+        OrderPlan(cfg.symbol, "BUY", "LIMIT", D("1"), D("590"), "GTC", False),
+        ex.now, ReplenishmentState.WATCH,
+    )
+    refresh(repo, ex)
+    payload = CancelPlan(cfg.symbol, buy.exchange_id, "reprice", replenish_after_cancel=True)
+    submit = ex.submit
+    if recovering:
+        def uncertain(op):
+            raise TimeoutError("no conclusive send evidence")
+
+        ex.submit = uncertain
+        executor.execute(payload, ex.now, ReplenishmentState.WATCH)
+        ex.now += timedelta(seconds=10)
+
+    def unsent(op):
+        raise RequestNotSent("final preflight cooldown", retry_after=90)
+
+    ex.submit = unsent
+    repo.db.executescript("""
+        CREATE TRIGGER fail_cancel_result BEFORE INSERT ON events
+        WHEN NEW.kind='CANCEL_NOT_SENT'
+        BEGIN SELECT RAISE(ABORT, 'cancel result transaction failed'); END;
+    """)
+    with pytest.raises(sqlite3.IntegrityError, match="cancel result transaction failed"):
+        executor.execute(payload, ex.now, ReplenishmentState.WATCH)
+    original = repo.cancel_operation(cfg.symbol, buy.exchange_id)
+    assert original.status == (OperationStatus.UNKNOWN if recovering else OperationStatus.PENDING)
+    assert original.cancel_attempts == (2 if recovering else 1)
+    assert not original.not_sent and original.unresolved
+    assert repo.runtime().resume_replanning and repo.runtime().read_retry_at is None
+    assert repo.runtime().api_errors == (1 if recovering else 0)
+    repo.close()
+    repo = Repository(path)
+    ex.submit = submit
+    ex.now += timedelta(seconds=91)
+    result = Executor(ex, repo, cfg).execute(payload, ex.now, ReplenishmentState.WATCH)
+    assert result.status == OperationStatus.CONFIRMED
+    assert result.client_id == original.client_id
+    assert len([op for op in repo.operations() if op.kind == OperationKind.CANCEL]) == 1
+    assert len([op for op in ex.writes if op.kind == OperationKind.CANCEL]) == 1
+    assert not ex.orders[buy.exchange_id].is_open
     repo.close()
 
 
