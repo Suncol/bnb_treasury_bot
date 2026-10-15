@@ -7,12 +7,31 @@
 需要 Python 3.11+。项目使用 `.venv/bin/python`；Binance 接入采用[官方模块化 SDK](https://github.com/binance/binance-connector-python)，固定版本见 `requirements.txt`。
 
 ```bash
-uv pip install --python .venv/bin/python -r requirements.txt
+uv venv --python 3.11 .venv
+uv pip install --python .venv/bin/python -r requirements-test.txt
 .venv/bin/python -m pytest -q
 .venv/bin/python -m services.cli --help
 ```
 
-测试通过模拟交易所和官方 SDK 的模拟 HTTP/WebSocket 传输运行，不需要凭据，不发真实订单、划转或通知。测试环境需要 pytest。
+测试通过模拟交易所和官方 SDK 的模拟 HTTP/WebSocket 传输运行，不需要凭据，不发真实订单、划转或通知。`requirements-test.txt` 包含原有 SDK 依赖，以及固定版本的 pytest 和 pytest-socket；只安装运行依赖时仍使用 `requirements.txt`。
+
+### 自动化离线回归
+
+[GitHub Actions 工作流](.github/workflows/tests.yml) 在每次 push 和 pull request 时使用 Ubuntu 24.04、Python 3.11，串行执行全部现有 pytest 测试，包括订单幂等、UNKNOWN/重启恢复、划转风控、账户对账、行情时效及两套 30 天虚拟时间模拟。没有按路径筛选测试，也不启动常驻交易进程。
+
+CI 不使用 Binance 密钥或告警 Webhook，测试期间通过 pytest-socket 禁用 Python 网络 socket；仅允许 asyncio 事件循环需要的本地 Unix socket。SDK HTTP/WebSocket 与 Paper 行情仍使用现有模拟传输，安装依赖和上传报告需要联网。
+
+与 CI 相同的测试命令可在仓库根目录运行：
+
+```bash
+.venv/bin/python -m pytest -v -ra --tb=short --color=no \
+  --durations=20 --junitxml=test-results/pytest.xml \
+  -o faulthandler_timeout=300 --disable-socket --allow-unix-socket
+```
+
+每次运行先执行 `pip check` 检查依赖一致性。日志显示具体用例、失败摘要、捕获输出和最慢的 20 项；单个用例超过 300 秒时输出 Python 线程栈以辅助定位卡住的测试。测试步骤上限 15 分钟，整个任务上限 20 分钟；全量耗时以当次 runner 日志为准。CI 使用启用 pipefail 的 bash 保留 pytest 失败退出码，不自动重试失败测试。
+
+无论测试成功或失败，工作流都会尝试上传 `test-results/` 中的 JUnit XML、完整 pytest 日志和 Python/依赖版本，保留 14 天；依赖安装失败时尚无测试报告，应查看安装步骤日志。相同事件和分支上的新运行会取消旧运行。CI 只报告回归状态；若需要禁止失败 PR 合并，可将 `Pytest (Python 3.11)` 配置为 main 分支的必需检查。
 
 ## Paper 模拟交易
 

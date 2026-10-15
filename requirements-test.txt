@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Keep test tooling separate from the production SDK dependency pins.
+pytest==8.4.2
+pytest-socket==0.7.0
