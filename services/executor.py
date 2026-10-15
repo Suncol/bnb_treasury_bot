@@ -111,6 +111,9 @@ class Executor:
         previous_runtime = (
             self.repository.runtime() if kind == OperationKind.CANCEL else self._require_reconciled()
         )
+        if (kind == OperationKind.TRANSFER and payload.to_account == "SPOT"
+                and previous_runtime.funding_exhausted_at is not None):
+            raise ExecutionBlocked("Funding must wait for a later valid inventory cycle")
         runtime = previous_runtime
         if kind != OperationKind.CANCEL and account is None:
             account = self.exchange.fetch_account_snapshot()
@@ -162,7 +165,8 @@ class Executor:
                 ),
             )
         if kind == OperationKind.TRANSFER and payload.to_account == "SPOT":
-            runtime = replace(runtime, resume_replenishment=True)
+            runtime = replace(runtime, resume_replenishment=True,
+                              funding_client_id=op.client_id)
         elif (
             kind == OperationKind.CANCEL and payload.replenish_after_cancel
             or kind == OperationKind.TRANSFER and payload.asset == "BNB" and resume_replanning
@@ -170,7 +174,8 @@ class Executor:
             runtime = replace(runtime, resume_replanning=True)
         elif kind == OperationKind.ORDER:
             runtime = replace(
-                runtime, resume_replenishment=False, resume_replanning=False
+                runtime, resume_replenishment=False, resume_replanning=False,
+                funding_client_id=None,
             )
         self.repository.record_intent(op, runtime)
         if kind == OperationKind.CANCEL:
@@ -342,6 +347,8 @@ class Executor:
                 self.repository.runtime(),
                 resume_replenishment=previous_runtime.resume_replenishment,
                 resume_replanning=previous_runtime.resume_replanning,
+                funding_client_id=previous_runtime.funding_client_id,
+                funding_exhausted_at=previous_runtime.funding_exhausted_at,
             )
         if cooldown is not None:
             runtime = runtime or self.repository.runtime()
@@ -363,7 +370,7 @@ class Executor:
         if (op.status == OperationStatus.FAILED and not op.not_sent
                 and op.kind == OperationKind.TRANSFER):
             if op.payload.to_account == "SPOT":
-                runtime = replace(runtime, resume_replenishment=False)
+                runtime = replace(runtime, resume_replenishment=False, funding_client_id=None)
         if (
             op.status == OperationStatus.FAILED
             or (submission and op.status == OperationStatus.UNKNOWN)

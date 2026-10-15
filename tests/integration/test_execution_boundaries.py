@@ -551,6 +551,68 @@ def funded_setup(tmp_path):
     return exchange, repo, runner
 
 
+@pytest.mark.parametrize("result_commit_fails", [False, True])
+@pytest.mark.parametrize("outcome", ["rejected", "not_sent"])
+def test_funded_order_failure_restores_funding_identity_in_the_result_transaction(
+    tmp_path, outcome, result_commit_fails,
+):
+    from core.models import Fill
+    from services.exchange_adapter import RequestRejected
+    exchange, repo, runner = funded_setup(tmp_path)
+    funding = exchange.writes[0]
+    cfg = replace(runner.cfg, spot_activity_symbols=("BTCUSDT",))
+    runner = Runner(exchange, repo, cfg, clock=lambda: exchange.now)
+    submit = exchange.submit
+
+    def reject_order(op):
+        if op.kind == OperationKind.ORDER:
+            if outcome == "not_sent":
+                raise RequestNotSent("final local quota check", retry_after=60)
+            raise RequestRejected("definite rejection")
+        return submit(op)
+
+    exchange.submit = reject_order
+    if result_commit_fails:
+        repo.db.executescript("""
+            CREATE TRIGGER fail_funded_result BEFORE UPDATE ON kv
+            WHEN NEW.key='runtime' AND EXISTS (
+                SELECT 1 FROM operations WHERE kind='ORDER' AND status='FAILED'
+            ) BEGIN SELECT RAISE(ABORT, 'funded result failed'); END;
+        """)
+        with pytest.raises(sqlite3.IntegrityError, match="funded result failed"):
+            run(runner, exchange, inventory=False)
+    else:
+        run(runner, exchange, inventory=False)
+    order = next(o for o in repo.operations() if o.kind == OperationKind.ORDER)
+    assert repo.runtime().resume_replenishment == (not result_commit_fails)
+    assert repo.runtime().funding_client_id == (None if result_commit_fails else funding.client_id)
+    assert order.status == (OperationStatus.PENDING if result_commit_fails else OperationStatus.FAILED)
+    assert order.not_sent == (outcome == "not_sent" and not result_commit_fails)
+    repo.close()
+    repo = Repository(tmp_path / "test.sqlite3")
+    if result_commit_fails:
+        repo.db.execute("DROP TRIGGER fail_funded_result")
+        repo.db.commit()
+    runner = Runner(exchange, repo, cfg, clock=lambda: exchange.now)
+    exchange.submit = submit
+    exchange.now += timedelta(hours=25)
+    exchange.account = replace(exchange.account, spot_usd=D("0"))
+    exchange.fills.append(Fill(
+        "BTCUSDT", "outside-buy", "outside-order", exchange.now, D("0.1"),
+        quote_qty=funding.payload.amount, base_asset="BTC", quote_asset="USDT",
+    ))
+    run(runner, exchange, inventory=False)
+    if result_commit_fails:
+        assert repo.operation(order.client_id).unresolved
+        assert repo.runtime().funding_exhausted_at is None
+    else:
+        assert not repo.operations(unresolved_only=True)
+        assert not repo.runtime().resume_replenishment
+        assert repo.runtime().funding_exhausted_at == exchange.now
+    assert len(exchange.writes) == 1
+    repo.close()
+
+
 @pytest.mark.parametrize(
     "blocker", ["chase", "paused", "urgent_only", "slice", "market"]
 )
