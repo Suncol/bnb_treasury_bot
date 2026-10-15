@@ -196,6 +196,29 @@ class Reconciler:
         return result
 
     def refresh(self, now, *, force_income=False):
+        """At most one fresh observation after a completed slow batch audit."""
+        try:
+            for attempt in range(2):
+                result = self._refresh(now, force_income=force_income)
+                account, _, _, consistent = result
+                checked = self.clock() if self.clock else now
+                scan = self.executor.income_scan(checked)
+                if (
+                    attempt == 0 and force_income and scan is not None and consistent
+                    and account.ts is not None and utc(account.ts) <= utc(checked)
+                    and not valid_account_snapshot(account, checked, self.cfg)
+                ):
+                    now = checked
+                    continue
+                if (not valid_account_snapshot(account, checked, self.cfg)
+                        or not consistent or self.repository.load("futures_settlement_issue")):
+                    self.executor.invalidate_income_audit()
+                return result
+        except BaseException:
+            self.executor.invalidate_income_audit()
+            raise
+
+    def _refresh(self, now, *, force_income=False):
         self.income_refreshed = False
         repo, exchange, cfg = self.repository, self.exchange, self.cfg
         tracked = repo.tracked_orders(active_only=True)
@@ -555,7 +578,8 @@ class Reconciler:
             coverage, futures_issues, observation_valid
             and valid_account_snapshot(account, self.clock() if self.clock else now, cfg)
         )
-        if observation_valid and not futures_issues and self.income_refreshed:
+        if (observation_valid and not futures_issues and not pending.unresolved
+                and self.executor.income_scan(self.clock() if self.clock else now) is not None):
             self.executor._income_audited_at = account.ts
         runtime = repo.runtime()
         if runtime.guard.active:
@@ -609,20 +633,39 @@ class Reconciler:
                     windows.append((utc(issue["since"]), upper))
         if not windows:
             self.income_refreshed = True
+            if self.executor._income_batch:
+                self.executor._income_scan = {
+                    "since": None, "until": None, "checked_at": now,
+                    "completed_at": now, "source_account": account,
+                }
             return None
         since, until = min(w[0] for w in windows), max(w[1] for w in windows)
-        coverage = repo.load("futures_income_coverage")
+        scan = self.executor.income_scan(now)
+        same_scan = scan is not None and scan["since"] is not None and scan["since"] <= since
+        coverage = scan if same_scan else repo.load("futures_income_coverage")
         checked = coverage.get("checked_at") if coverage is not None else None
-        recheck = force or checked is None or not timedelta(0) <= now - utc(checked) < INCOME_RECHECK_INTERVAL
+        recheck = not same_scan and (
+            force or checked is None or not timedelta(0) <= now - utc(checked) < INCOME_RECHECK_INTERVAL
+        )
         if not recheck and coverage["since"] <= since <= until <= coverage["until"]:
-            return None
+            return ({key: coverage[key] for key in ("since", "until", "checked_at")}
+                    if same_scan else None)
         start = since
         if not recheck and coverage["since"] <= since <= coverage["until"] <= until:
             start = coverage["until"]  # Inclusive overlap preserves timestamp ties.
         if start <= until:
+            revision = self.executor._income_revision
             repo.save_futures_income(
                 self._read(self.exchange.fetch_futures_income, start, until)
             )
+            completed = self.clock() if self.clock else account.ts
+            if (self.executor._income_batch and revision == self.executor._income_revision
+                    and utc(completed) >= now):
+                self.executor._income_scan = {
+                    "since": since, "until": until,
+                    "checked_at": now if start == since else checked,
+                    "completed_at": completed, "source_account": account,
+                } if start == since or same_scan else None
         self.income_refreshed = start == since
         return {"since": since, "until": until,
                 "checked_at": now if self.income_refreshed else checked}

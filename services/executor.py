@@ -51,6 +51,9 @@ class Executor:
         self.clock = clock or getattr(exchange, "clock", None)
         self._income_batch = False
         self._income_audited_at = None
+        self._income_scan = None
+        self._income_revision = 0
+        self._income_checked_at = None
         self.reconciler = None
 
     def _reconciliation(self):
@@ -63,14 +66,32 @@ class Executor:
 
     @contextmanager
     def income_batch(self):
-        self._income_batch, self._income_audited_at = True, None
+        self.invalidate_income_audit()
+        self._income_batch = True
         try:
             yield
         finally:
-            self._income_batch, self._income_audited_at = False, None
+            self.invalidate_income_audit()
+            self._income_batch = False
+
+    def invalidate_income_audit(self):
+        self._income_audited_at = self._income_scan = self._income_checked_at = None
+        self._income_revision += 1
+
+    def income_scan(self, now):
+        if not self._income_batch:
+            return None
+        if self._income_checked_at is not None and utc(now) < utc(self._income_checked_at):
+            self.invalidate_income_audit()
+        self._income_checked_at = now
+        scan = self._income_scan
+        if scan is not None and not utc(scan["checked_at"]) <= utc(scan["completed_at"]) <= utc(now):
+            self.invalidate_income_audit()
+            return None
+        return scan
 
     def income_audited(self, now):
-        return self._income_batch and self._income_audited_at is not None and fresh(
+        return self.income_scan(now) is not None and self._income_audited_at is not None and fresh(
             self._income_audited_at, now, self.cfg.risk.max_account_age_seconds
         )
 
