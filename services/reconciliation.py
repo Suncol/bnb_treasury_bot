@@ -3,7 +3,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 from core.models import CancelPlan, OperationKind, OperationStatus, PendingState
-from core.time_utils import utc
+from core.time_utils import fresh, utc
 from core.validation import valid_account_snapshot
 
 from .exchange_adapter import ExchangeError, RequestDeferred, order_matches_operation
@@ -30,13 +30,25 @@ class Reconciler:
         self.income_refreshed = False
         self._funding_orders = None
 
-    def prepare_execution(self, now):
+    def prepare_execution(self, now, *, account=None):
         """Return a newly verified account and orders for the current write batch.
 
         Keep the shared executor's audit and priority read checkpoints. Callers
         must still check their candidate against the returned financial evidence.
         """
-        account, orders, pending, consistent = self.refresh(now, force_income=True)
+        if account is not None:
+            consistent = self.audit_income(account, now)
+            checked = self.clock() if self.clock else now
+            if (not consistent and self.executor.income_scan(checked) is not None
+                    and not fresh(account.ts, checked, self.cfg.risk.max_account_age_seconds)
+                    and utc(account.ts) <= utc(checked)):
+                account, orders, pending, consistent = self.refresh(
+                    checked, force_income=True, retry_slow=False,
+                )
+            else:
+                orders, pending = (), PendingState(ZERO, ZERO, ZERO, ZERO)
+        else:
+            account, orders, pending, consistent = self.refresh(now, force_income=True)
         checked_at = self.clock() if self.clock else now
         if not (
             consistent and not pending.unresolved
@@ -47,7 +59,9 @@ class Reconciler:
             and not self.repository.load("spot_settlement_issue")
             and not self.repository.load("futures_settlement_issue")
             and self.repository.load("spot_checkpoint") is not None
+            and self.executor.income_audited(checked_at, account=account)
         ):
+            self.executor.invalidate_income_audit()
             raise ExecutionBlocked("New operations require reconciled futures income and a valid account")
         return account, orders
 
@@ -196,7 +210,32 @@ class Reconciler:
             self.read_checkpoint()
         return result
 
-    def refresh(self, now, *, force_income=False):
+    def refresh(self, now, *, force_income=False, retry_slow=True):
+        """At most one fresh observation after a completed slow batch audit."""
+        try:
+            for attempt in range(2):
+                result = self._refresh(now, force_income=force_income)
+                account, _, _, consistent = result
+                checked = self.clock() if self.clock else now
+                scan = self.executor.income_scan(checked)
+                if (
+                    attempt == 0 and retry_slow and scan is not None and consistent
+                    and account.ts is not None and utc(account.ts) <= utc(checked)
+                    and not fresh(account.ts, checked, self.cfg.risk.max_account_age_seconds)
+                ):
+                    now = checked
+                    continue
+                if (not valid_account_snapshot(account, checked, self.cfg)
+                        or not consistent or result[2].unresolved
+                        or self.repository.load("futures_settlement_issue")
+                        or self.repository.load("spot_settlement_issue")):
+                    self.executor.invalidate_income_audit()
+                return result
+        except BaseException:
+            self.executor.invalidate_income_audit()
+            raise
+
+    def _refresh(self, now, *, force_income=False):
         self.income_refreshed = False
         self._funding_orders = None
         repo, exchange, cfg = self.repository, self.exchange, self.cfg
@@ -579,8 +618,9 @@ class Reconciler:
             coverage, futures_issues, observation_valid
             and valid_account_snapshot(account, self.clock() if self.clock else now, cfg)
         )
-        if observation_valid and not futures_issues and self.income_refreshed:
-            self.executor._income_audited_at = account.ts
+        if (observation_valid and not futures_issues and not pending.unresolved
+                and self.executor.income_scan(self.clock() if self.clock else now) is not None):
+            self.executor.qualify_income(account, self.clock() if self.clock else now)
         runtime = repo.runtime()
         if runtime.guard.active:
             repo.save(
@@ -635,20 +675,39 @@ class Reconciler:
                     windows.append((utc(issue["since"]), upper))
         if not windows:
             self.income_refreshed = True
+            if self.executor._income_batch:
+                self.executor._income_scan = {
+                    "since": None, "until": None, "checked_at": now,
+                    "completed_at": now, "source_account": account,
+                }
             return None
         since, until = min(w[0] for w in windows), max(w[1] for w in windows)
-        coverage = repo.load("futures_income_coverage")
+        scan = self.executor.income_scan(now)
+        same_scan = scan is not None and scan["since"] is not None and scan["since"] <= since
+        coverage = scan if same_scan else repo.load("futures_income_coverage")
         checked = coverage.get("checked_at") if coverage is not None else None
-        recheck = force or checked is None or not timedelta(0) <= now - utc(checked) < INCOME_RECHECK_INTERVAL
+        recheck = not same_scan and (
+            force or checked is None or not timedelta(0) <= now - utc(checked) < INCOME_RECHECK_INTERVAL
+        )
         if not recheck and coverage["since"] <= since <= until <= coverage["until"]:
-            return None
+            return ({key: coverage[key] for key in ("since", "until", "checked_at")}
+                    if same_scan else None)
         start = since
         if not recheck and coverage["since"] <= since <= coverage["until"] <= until:
             start = coverage["until"]  # Inclusive overlap preserves timestamp ties.
         if start <= until:
+            revision = self.executor._income_revision
             repo.save_futures_income(
                 self._read(self.exchange.fetch_futures_income, start, until)
             )
+            completed = self.clock() if self.clock else account.ts
+            if (self.executor._income_batch and revision == self.executor._income_revision
+                    and utc(completed) >= now):
+                self.executor._income_scan = {
+                    "since": since, "until": until,
+                    "checked_at": now if start == since else checked,
+                    "completed_at": completed, "source_account": account,
+                } if start == since or same_scan else None
         self.income_refreshed = start == since
         return {"since": since, "until": until,
                 "checked_at": now if self.income_refreshed else checked}
@@ -656,9 +715,10 @@ class Reconciler:
     def audit_income(self, account, now):
         """Refresh only income before a new batch; reuse the observed account."""
         repo, cfg = self.repository, self.cfg
-        self.executor._income_audited_at = None
+        self.executor._income_account = None
         if account.contract_total_margin_balance is None:
-            self.executor._income_audited_at = account.ts
+            self._refresh_income([], account, force=True)
+            self.executor.qualify_income(account, self.clock() if self.clock else now)
             return True
         samples = repo.snapshots_since(utc(now) - timedelta(hours=49))
         checkpoint = repo.load("spot_checkpoint")
@@ -692,7 +752,7 @@ class Reconciler:
         self._save_income_coverage(coverage, issues, valid)
         self.history = (ZERO, None) if issues else (rate, margin)
         if not issues:
-            self.executor._income_audited_at = account.ts
+            self.executor.qualify_income(account, self.clock() if self.clock else now)
         return not issues
 
     def _settle_spot(self, account, *, checkpoint=None):
