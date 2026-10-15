@@ -38,6 +38,13 @@ class RequestDeferred(ExchangeError):
     """Local throttle: no network request was sent."""
 
 
+class AccountObservationInconsistent(ExchangeError):
+    """Successful account reads describe different observations; read again.
+
+    This data state says nothing about the outcome of any earlier mutation.
+    """
+
+
 class RequestNotSent(RequestDeferred):
     """Final transport preflight proved this SDK mutation was never invoked.
 

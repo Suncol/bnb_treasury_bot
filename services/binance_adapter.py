@@ -25,6 +25,7 @@ from core.models import (
 from core.time_utils import utc
 
 from .exchange_adapter import (
+    AccountObservationInconsistent,
     ExchangeError,
     RequestRejected,
     order_matches_operation,
@@ -34,6 +35,29 @@ from .sdk_transport import BinanceAPIError, millis, timestamp, sdk_data as sdk_d
 from .spot_market import SpotMarketData
 
 D = Decimal
+
+# Matching-engine reasons for the plain BUY limit orders this adapter submits:
+# https://github.com/binance/binance-spot-api-docs/blob/master/errors.md#other-errors
+# Exact messages matter: duplicate IDs and other engine errors do not prove
+# that the journaled request has no live order.
+_PLAIN_LIMIT_REJECTIONS = frozenset({
+    "Account has insufficient balance for requested action.",
+    "Market is closed.",
+    "Price * QTY is zero or less.",
+    "This action is disabled on this account.",
+    "This account may not place or cancel orders.",
+    "Unsupported order combination",
+    "This symbol is not permitted for this account.",
+    "This symbol is restricted for this account.",
+    "Rest API trading is not enabled.",
+})
+_NEW_ORDER_REJECTIONS = {
+    ("LIMIT", "GTC"): _PLAIN_LIMIT_REJECTIONS,
+    ("LIMIT", "IOC"): _PLAIN_LIMIT_REJECTIONS,
+    ("LIMIT_MAKER", "GTC"): _PLAIN_LIMIT_REJECTIONS | {
+        "Order would immediately match and take.",
+    },
+}
 
 
 class BinanceAdapter(SpotMarketData):
@@ -114,12 +138,26 @@ class BinanceAdapter(SpotMarketData):
             raise ExchangeError("Quote asset does not expose futures maxWithdrawAmount")
         margin_assets = {a["asset"]: a for a in margin.get("assets", ())}
         margin_quote = margin_assets.get(self.cfg.quote_asset)
-        if (
-            margin_quote is None
-            or D(margin_quote["walletBalance"]) != D(quote["balance"])
-            or margin_quote.get("updateTime") != quote.get("updateTime")
+        if margin_quote is None:
+            raise ExchangeError("Futures margin observation is missing the quote asset")
+        if not all(D(value).is_finite() for value in (
+            margin_quote["walletBalance"], quote["balance"],
+        )):
+            raise ExchangeError("Futures quote wallet balance is nonfinite")
+        if "maxWithdrawAmount" not in margin_quote or not all(
+            D(value).is_finite() and D(value) >= 0
+            for value in (quote["maxWithdrawAmount"], margin_quote["maxWithdrawAmount"])
         ):
-            raise ExchangeError("Futures balance and margin observations disagree")
+            raise ExchangeError("Futures quote asset withdrawal limits are invalid")
+        if (
+            D(margin_quote["walletBalance"]) != D(quote["balance"])
+            or margin_quote.get("updateTime") != quote.get("updateTime")
+            or D(margin_quote["maxWithdrawAmount"]) != D(quote["maxWithdrawAmount"])
+        ):
+            raise AccountObservationInconsistent(
+                "Futures balance and margin observations disagree",
+                endpoint="futures_account_observation",
+            )
         mode = self._cached("futures_margin_mode", 300, lambda: self._call(
             self.futures.get_current_multi_assets_mode, recv_window=5000
         ))
@@ -440,14 +478,12 @@ class BinanceAdapter(SpotMarketData):
             }
             order_rejected = (
                 operation.kind == OperationKind.ORDER
+                and exc.endpoint == "new_order"
+                and exc.http_status == 400
                 and exc.code == -2010
-                and (
-                    exc.message
-                    == "Account has insufficient balance for requested action."
-                    or (
-                        p.order_type == "LIMIT_MAKER"
-                        and exc.message == "Order would immediately match and take."
-                    )
+                and p.side == "BUY"
+                and exc.message in _NEW_ORDER_REJECTIONS.get(
+                    (p.order_type, p.time_in_force), (),
                 )
             )
             transfer_rejected = (
@@ -456,7 +492,11 @@ class BinanceAdapter(SpotMarketData):
             if exc.definitive and (
                 exc.code in definite or order_rejected or transfer_rejected
             ):
-                raise RequestRejected(str(exc)) from None
+                raise RequestRejected(
+                    str(exc), endpoint=exc.endpoint, http_status=exc.http_status,
+                    code=exc.code, retry_after=exc.retry_after,
+                    request_weights=exc.request_weights,
+                ) from None
             raise
 
     def query_operation(self, operation):

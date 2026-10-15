@@ -24,8 +24,8 @@ from core.replenishment_engine import build_cycle_plan
 from core.time_utils import age_seconds, fresh, utc
 from core.validation import valid_account_snapshot
 
-from .exchange_adapter import ExchangeError, RequestDeferred
-from .executor import MAX_CANCEL_ATTEMPTS
+from .exchange_adapter import AccountObservationInconsistent, ExchangeError, RequestDeferred
+from .executor import ExecutionBlocked, MAX_CANCEL_ATTEMPTS
 from .market_data import MarketWindows
 from .reconciliation import Reconciler
 from .read_backoff import clear_read_backoff, record_read_failure, retry_deadline
@@ -236,7 +236,7 @@ class Runner:
             )
             raise exc
         record_read_failure(self.repository, exc, self.clock(), exchange=self.exchange)
-        if not isinstance(exc, RequestDeferred):
+        if not isinstance(exc, (RequestDeferred, AccountObservationInconsistent)):
             self.executor.note_failure(reason=type(exc).__name__)
         # Never reuse a partially reconciled view for trading or guard recovery.
         self.cached_inputs = None
@@ -269,8 +269,10 @@ class Runner:
         alerts = (
             Alert(
                 "WARNING",
-                "API_ERROR",
-                "Exchange reconciliation or data validation failed",
+                "ACCOUNT_INCONSISTENT" if isinstance(exc, AccountObservationInconsistent) else "API_ERROR",
+                "Account reads disagree; waiting for a consistent observation"
+                if isinstance(exc, AccountObservationInconsistent)
+                else "Exchange reconciliation or data validation failed",
             ),
             Alert(
                 "WARNING",
@@ -849,20 +851,40 @@ class Runner:
                 return plan
             if tag is not None:
                 used.add(tag)
-            op = self.executor.execute(
-                action,
-                self.clock(),
-                plan.state_decision.confirmed_state,
-                account=inputs.account,
-                starts_slice=hasattr(action, "qty")
-                and plan.slice_state.active
-                and submitted_qty == action.qty,
-                resume_replanning=tag == "bnb"
-                and inputs.allow_new_cycle
-                and submitted_qty == 0
-                and plan.state_decision.confirmed_state != ReplenishmentState.IDLE
-                and plan.state_decision.delta_bnb > 0,
-            )
+            try:
+                op = self.executor.execute(
+                    action,
+                    self.clock(),
+                    plan.state_decision.confirmed_state,
+                    account=inputs.account,
+                    inputs=inputs,
+                    starts_slice=hasattr(action, "qty")
+                    and plan.slice_state.active
+                    and submitted_qty == action.qty,
+                    resume_replanning=tag == "bnb"
+                    and inputs.allow_new_cycle
+                    and submitted_qty == 0
+                    and plan.state_decision.confirmed_state != ReplenishmentState.IDLE
+                    and plan.state_decision.delta_bnb > 0,
+                )
+            except ExecutionBlocked as exc:
+                # A final verified view invalidated this unsent candidate. End
+                # the batch; neither an API failure nor a smaller-amount retry.
+                self.cached_inputs = self.last_reconciled_at = None
+                self.repository.event(self.clock(), "EXECUTION_BLOCKED", str(exc))
+                alert = Alert("WARNING", "EXECUTION_BLOCKED", str(exc))
+                self._publish((alert,))
+                decision = exc.decision or plan.transfer_decision
+                status = decision.gate_status if not decision.allow else GateStatus.BLOCKED
+                return replace(
+                    plan,
+                    transfer_decision=replace(
+                        decision, allow=False, message=str(exc),
+                        gate_status=status,
+                    ),
+                    gates=replace(plan.gates, transfer_gate=status),
+                    alerts=plan.alerts + (alert,),
+                )
             if op.status in {OperationStatus.UNKNOWN, OperationStatus.FAILED}:
                 self._publish(
                     plan.alerts
