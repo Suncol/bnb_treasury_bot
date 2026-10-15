@@ -7,18 +7,25 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.models import FuturesIncome, OperationKind, OperationStatus, OrderPlan, ReplenishmentState, RunMode, SliceState
+from core.models import (
+    AssetTransferPlan, CrashGuardState, FuturesIncome, OperationKind, OperationStatus,
+    OrderPlan, ReplenishmentState, RunMode, SliceState, TransferRecord,
+)
 from services.binance_adapter import BinanceAdapter, millis
 from services.exchange_adapter import ExchangeError
-from tests.helpers import D, make_account, make_market, make_strategy_config
+from services.executor import ExecutionBlocked
+from tests.helpers import (
+    D, make_account, make_engine_inputs, make_market, make_strategy_config, order,
+)
 from tests.fake_exchange import FakeExchange
 from tests.execution_helpers import setup, seed_bid
 from tests.integration.test_margin_adjusted_target import margin_setup, partial_capital_setup
 
 
-def slow_income_setup(tmp_path, *, with_bid=False):
+def slow_income_setup(tmp_path, *, with_bid=False, contract_bnb="27", spot_bnb="0.5"):
     exchange = FakeExchange(make_account(
-        contract_bnb=D("27"), contract_max_withdraw_amount=D("97000"), spot_usd=D("10000"),
+        contract_bnb=D(contract_bnb), contract_max_withdraw_amount=D("97000"),
+        spot_bnb=D(spot_bnb), spot_usd=D("10000"),
     ))
     started = exchange.now
     exchange.now -= timedelta(hours=24)
@@ -213,6 +220,208 @@ def test_direct_order_finishes_slow_audit_against_new_account(tmp_path):
         assert len(queries) == 1 and len(pages) == 3 and len(exchange.writes) == 1
         assert repo.load("futures_income_coverage") is not None
         assert not runner.executor.income_audited(exchange.now)
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("filled", [False, True])
+def test_direct_order_discards_old_demand_when_slow_audit_observes_external_buy(tmp_path, filled):
+    exchange, repo, runner, queries, pages, accounts = slow_income_setup(tmp_path)
+    supplied = exchange.fetch_account_snapshot()
+
+    def external_buy(params, rows):
+        if len(pages) == 1:
+            exchange.orders["manual"] = order(
+                "manual", price="500", qty="5", strategy_id=None, created_at=exchange.now,
+            )
+            if filled:
+                exchange.fill("manual", D("5"))
+        return rows
+
+    exchange.income_page_hook = external_buy
+    try:
+        with pytest.raises(ExecutionBlocked, match="balances or orders changed"):
+            runner.executor.execute(
+                OrderPlan("BNBUSDT", "BUY", "LIMIT", D("5"), D("500"), "GTC", False),
+                exchange.now, repo.runtime().state, account=supplied,
+            )
+        assert accounts[-1].reserved_spot_usd == D("0" if filled else "2500")
+        assert accounts[-1].spot_bnb == D("5.5" if filled else "0.5")
+        assert len(queries) == 1 and len(pages) == 3
+        assert not repo.operations() and not exchange.writes
+        assert repo.runtime().api_errors == repo.runtime().transfer_failures == 0
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("source", ["market", "filters"])
+@pytest.mark.parametrize("age,allow", [(5, True), (5.000001, False)])
+def test_direct_audit_preserves_supplied_market_and_filter_lifetime(tmp_path, source, age, allow):
+    exchange, repo, runner = margin_setup(tmp_path, spot_usd="10000")
+    exchange.futures_change("USDT", D("-1"), "COMMISSION")
+    supplied = exchange.fetch_account_snapshot()
+    inputs = make_engine_inputs(account=supplied)
+    inputs = replace(
+        inputs, market=replace(inputs.market, ts=exchange.now),
+        filters=replace(inputs.filters, observed_at=(
+            exchange.now - timedelta(seconds=age - 1) if source == "filters" else None
+        )),
+    )
+    fetch = exchange.fetch_futures_income
+
+    def delayed_income(since, until):
+        rows = fetch(since, until)
+        exchange.now += timedelta(seconds=age if source == "market" else 1)
+        return rows
+
+    def unexpected_account_read():
+        pytest.fail("A still-fresh supplied account must not be queried again")
+
+    exchange.fetch_futures_income = delayed_income
+    exchange.fetch_account_snapshot = unexpected_account_read
+    candidate = OrderPlan("BNBUSDT", "BUY", "LIMIT", D("1"), D("500"), "GTC", False)
+    try:
+        if allow:
+            op = runner.executor.execute(candidate, exchange.now, repo.runtime().state,
+                                         account=supplied, inputs=inputs)
+            assert op.status == OperationStatus.CONFIRMED and len(exchange.writes) == 1
+        else:
+            with pytest.raises(ExecutionBlocked, match="expired"):
+                runner.executor.execute(candidate, exchange.now, repo.runtime().state,
+                                         account=supplied, inputs=inputs)
+            assert not repo.operations() and not exchange.writes
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("with_inputs", [False, True])
+def test_slow_audit_rejects_changed_order_exposure_even_when_balances_are_unchanged(tmp_path, with_inputs):
+    exchange, repo, runner, queries, pages, accounts = slow_income_setup(tmp_path)
+    original_order = order("manual", price="500", qty="1", strategy_id=None, created_at=exchange.now)
+    exchange.orders["manual"] = original_order
+    supplied = exchange.fetch_account_snapshot()
+    inputs = replace(make_engine_inputs(account=supplied), orders=(original_order,)) if with_inputs else None
+
+    def replace_external_buy(params, rows):
+        if len(pages) == 1:
+            exchange.orders["manual"] = replace(original_order, status="CANCELED")
+            exchange.orders["replacement"] = order(
+                "replacement", price="100", qty="5", strategy_id=None, created_at=exchange.now,
+            )
+        return rows
+
+    exchange.income_page_hook = replace_external_buy
+    try:
+        with pytest.raises(ExecutionBlocked, match="orders.*replan"):
+            runner.executor.execute(
+                OrderPlan("BNBUSDT", "BUY", "LIMIT", D("4"), D("500"), "GTC", False),
+                exchange.now, repo.runtime().state, account=supplied, inputs=inputs,
+            )
+        assert accounts[-1].reserved_spot_usd == supplied.reserved_spot_usd == D("500")
+        assert accounts[-1].spot_bnb == supplied.spot_bnb == D("0.5")
+        assert len(queries) == 1 and len(pages) == 3
+        assert not repo.operations() and not exchange.writes
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("kind", ["bnb", "sweep"])
+@pytest.mark.parametrize("changed", [False, True])
+def test_slow_audit_keeps_transfer_candidate_only_if_financial_demand_is_unchanged(tmp_path, kind, changed):
+    exchange, repo, runner, queries, pages, accounts = slow_income_setup(
+        tmp_path, spot_bnb="5.5" if kind == "bnb" else "0.5",
+        contract_bnb="27" if kind == "bnb" else "32",
+    )
+    if kind == "sweep":
+        repo.save("runtime", replace(repo.runtime(), state=ReplenishmentState.IDLE))
+    supplied = exchange.fetch_account_snapshot()
+    candidate = AssetTransferPlan(
+        "BNB" if kind == "bnb" else "USDT", D("5" if kind == "bnb" else "9500"),
+        "SPOT", "USDⓈ-M Futures", "replenish" if kind == "bnb" else "sweep idle funds",
+    )
+    # BNB returns do not need fresh market data; their static quantity filters
+    # and all balance/settlement constraints still apply.
+    inputs = make_engine_inputs(account=supplied) if kind == "bnb" else None
+
+    def external_activity(params, rows):
+        if changed and len(pages) == 1:
+            if kind == "bnb":
+                exchange.transfers["manual"] = TransferRecord(
+                    "manual", "BNB", D("4"), "SPOT", "USDⓈ-M Futures",
+                    exchange.now, OperationStatus.PENDING,
+                )
+                exchange.settle("manual")
+            else:
+                exchange.orders["manual"] = order(
+                    "manual", price="500", qty="5", strategy_id=None, created_at=exchange.now,
+                )
+        return rows
+
+    exchange.income_page_hook = external_activity
+    try:
+        if changed:
+            with pytest.raises(ExecutionBlocked, match="balances or orders changed"):
+                runner.executor.execute(candidate, exchange.now, repo.runtime().state,
+                                         account=supplied, inputs=inputs)
+            assert not repo.operations() and not exchange.writes
+        else:
+            operation = runner.executor.execute(candidate, exchange.now, repo.runtime().state,
+                                                account=supplied, inputs=inputs)
+            assert operation.status == OperationStatus.PENDING
+            assert operation.balance_before.ts > supplied.ts
+            assert len(exchange.writes) == 1 and exchange.writes[0].payload == candidate
+        assert not repo.load("spot_settlement_issue") and not repo.load("futures_settlement_issue")
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("kind", ["order", "bnb", "sweep"])
+def test_fresh_account_after_slow_audit_does_not_renew_other_candidate_inputs(tmp_path, kind):
+    exchange, repo, runner, queries, pages, accounts = slow_income_setup(
+        tmp_path, spot_bnb="5.5" if kind == "bnb" else "0.5",
+        contract_bnb="32" if kind == "sweep" else "27",
+    )
+    supplied = exchange.fetch_account_snapshot()
+    inputs = make_engine_inputs(account=supplied)
+    inputs = replace(inputs, filters=replace(inputs.filters, observed_at=exchange.now))
+    candidate = (OrderPlan("BNBUSDT", "BUY", "LIMIT", D("1"), D("500"), "GTC", False)
+                 if kind == "order" else AssetTransferPlan(
+                     "BNB" if kind == "bnb" else "USDT", D("5" if kind == "bnb" else "9500"),
+                     "SPOT", "USDⓈ-M Futures", "return available assets",
+                 ))
+    try:
+        with pytest.raises(ExecutionBlocked, match="expired"):
+            runner.executor.execute(candidate, exchange.now, repo.runtime().state,
+                                     account=supplied, inputs=inputs)
+        assert accounts[-1].ts > supplied.ts and accounts[-1].ts == exchange.now
+        assert len(queries) == 1 and len(pages) == 3
+        assert not repo.operations() and not exchange.writes
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("constraint", ["guard", "run_mode"])
+def test_slow_direct_audit_discards_candidate_when_execution_constraints_change(tmp_path, constraint):
+    exchange, repo, runner, queries, pages, accounts = slow_income_setup(tmp_path)
+    supplied = exchange.fetch_account_snapshot()
+
+    def change_constraint(params, rows):
+        if len(pages) == 1:
+            change = {"run_mode": RunMode.URGENT_ONLY} if constraint == "run_mode" else {
+                "guard": CrashGuardState(active=True, episode_id="new-protection", started_at=exchange.now),
+            }
+            repo.save("runtime", replace(repo.runtime(), **change))
+        return rows
+
+    exchange.income_page_hook = change_constraint
+    try:
+        with pytest.raises(ExecutionBlocked, match="Risk protection changed|run mode"):
+            runner.executor.execute(
+                OrderPlan("BNBUSDT", "BUY", "LIMIT", D("1"), D("500"), "GTC", False),
+                exchange.now, repo.runtime().state, account=supplied,
+            )
+        assert not repo.operations() and not exchange.writes
+        assert repo.runtime().api_errors == repo.runtime().transfer_failures == 0
     finally:
         repo.close()
 
