@@ -36,7 +36,12 @@ class Reconciler:
         Keep the shared executor's audit and priority read checkpoints. Callers
         must still check their candidate against the returned financial evidence.
         """
-        if account is not None:
+        checkpoint = self.repository.load("spot_checkpoint")
+        same_spot = account is not None and checkpoint is not None and all(
+            getattr(account, name) == getattr(checkpoint["account"], name)
+            for name in ("spot_bnb", "spot_usd", "reserved_spot_bnb", "reserved_spot_usd")
+        )
+        if account is not None and (self.repository.settlement_window_open() or same_spot):
             consistent = self.audit_income(account, now)
             checked = self.clock() if self.clock else now
             if (not consistent and self.executor.income_scan(checked) is not None
@@ -235,6 +240,7 @@ class Reconciler:
     def _refresh(self, now, *, force_income=False):
         self._funding_orders = None
         repo, exchange, cfg = self.repository, self.exchange, self.cfg
+        strict_at_start = repo.settlement_window_open()
         tracked = repo.tracked_orders(active_only=True)
         for op in repo.operations(unresolved_only=True):
             if op.status == OperationStatus.CONFIRMED and not (
@@ -408,6 +414,7 @@ class Reconciler:
             for fill in self._read(exchange.fetch_recent_fills, symbol, since, now):
                 fills.append(self._attribute_fill(fill))
         repo.save_fills(fills)
+        late_owned = self._restore_late_owned_fills(fills)
         runtime = repo.runtime()  # Priority reads may have opened a new episode.
         if runtime.guard.episode_id and not runtime.guard.active:
             episode = repo.load("episode:" + runtime.guard.episode_id, runtime.guard)
@@ -477,7 +484,8 @@ class Reconciler:
             return {(o.symbol, o.order_id): (o.client_id, o.side, o.price, o.qty,
                                             o.filled_qty, o.status, o.created_at)
                     for o in rows if o.is_open}
-        consistent = before_open == after_open and reservation_view(extra_before) == reservation_view(extra_after)
+        consistent = (not late_owned and before_open == after_open
+                      and reservation_view(extra_before) == reservation_view(extra_after))
         reservation_consistent = reservation_view(orders.values()) == reservation_view(after)
         # Cumulative order fills must be covered by the deduplicated trade ledger.
         if tracked:
@@ -485,7 +493,7 @@ class Reconciler:
                 cfg.symbol, (o.order_id for o in tracked.values())
             )
             if any(
-                totals.get(o.order_id, ZERO) < o.filled_qty for o in tracked.values()
+                totals.get(o.order_id, ZERO) != o.filled_qty for o in tracked.values()
             ):
                 consistent = False
         external_pending = any(
@@ -516,7 +524,17 @@ class Reconciler:
                         futures_issues["quote"] = policy
                     spot_before = {"account": anchor, "cursor": anchor.wallet_event_cursor}
             if quote_settled and policy is None and (checkpoint is not None or not external_pending):
-                spot_settled = self._settle_spot(account, checkpoint=spot_before)
+                allow_external = (not strict_at_start and not repo.settlement_window_open()
+                                  and not external_pending)
+                if allow_external:
+                    # Phase 03 only relaxes spot accounting; historical futures
+                    # authorization is still required before accepting a baseline.
+                    _, _, history_issue = historical_metrics(
+                        repo, account, checked_at, cfg.quote_asset, samples=samples)
+                    allow_external = history_issue is None
+                spot_settled = self._settle_spot(
+                    account, checkpoint=spot_before, allow_external=allow_external,
+                )
             if spot_settled:
                 repo.save("fills_since", utc(now) - timedelta(seconds=60))
             for op in repo.operations(active_only=True):
@@ -745,7 +763,7 @@ class Reconciler:
             self.executor.qualify_income(account, self.clock() if self.clock else now)
         return not issues
 
-    def _settle_spot(self, account, *, checkpoint=None):
+    def _settle_spot(self, account, *, checkpoint=None, allow_external=False):
         """Advance one durable balance/ledger checkpoint only on exact coverage.
 
         Both spot assets must include all known executions. Request timestamps,
@@ -759,10 +777,24 @@ class Reconciler:
                 {"reason": "No trusted spot baseline; stop external activity and run explicit baseline initialization"},
             )
             return False
+        boundary = repo.load("spot_acceptance")
+        if boundary is not None and (
+            checkpoint["cursor"] < boundary["cursor"]
+            or utc(checkpoint["account"].ts) < utc(boundary["account"].ts)
+        ):
+            # A futures replay anchor cannot rewind accepted spot inventory.
+            checkpoint = repo.load("spot_checkpoint")
         before = checkpoint["account"]
         through = account.wallet_event_cursor
         if through is None:
             through = repo.wallet_cursor()
+        ambiguous = repo.ambiguous_wallet_events(checkpoint["cursor"], through)
+        if ambiguous and not allow_external:
+            repo.save("spot_settlement_issue", {
+                "reason": "Receipt may already be included in accepted inventory",
+                "ambiguous_receipts": ambiguous,
+            })
+            return False
         expected = {"BNB": before.spot_bnb, cfg.quote_asset: before.spot_usd}
         missing = []
         for _, reference, deltas in repo.wallet_changes(checkpoint["cursor"], through=through):
@@ -779,6 +811,9 @@ class Reconciler:
             if actual[asset] != expected[asset]
         }
         if differences or missing:
+            if allow_external:
+                repo.accept_spot_observation(account)
+                return True
             repo.save(
                 "spot_settlement_issue",
                 {
@@ -807,6 +842,21 @@ class Reconciler:
         )
         repo.save("spot_settlement_issue", None)
         return True
+
+    def _restore_late_owned_fills(self, fills):
+        """A retired order's contradictory receipt stays our responsibility."""
+        repo = self.repository
+        changed = False
+        for order_id in {f.order_id for f in fills if f.strategy_id == self.cfg.strategy_id}:
+            op = repo.order_operation(order_id)
+            previous = repo.tracked_order(op.client_id) if op else None
+            if op is None or previous is None or previous.is_open:
+                continue
+            total = repo.fill_totals(self.cfg.symbol, (order_id,)).get(order_id, ZERO)
+            if total != previous.filled_qty:
+                repo.update_operation(replace(op, balance_pending=True))
+                changed = True
+        return changed
 
     def guard_with_fills(self, guard, now):
         stored = (

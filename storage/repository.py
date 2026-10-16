@@ -332,6 +332,55 @@ class Repository:
                 (client_id,),
             )
 
+    def settlement_window_open(self):
+        """Accepted open orders remain a responsibility even between fills."""
+        return bool(self.operations(active_only=True))
+
+    def settlement_epoch(self):
+        return (self.load("spot_acceptance") or {}).get("epoch", 0)
+
+    def accept_spot_observation(self, account):
+        """Accept external inventory only outside all journaled responsibility."""
+        with self.db:
+            if self.settlement_window_open() or self.load("spot_checkpoint") is None:
+                raise ValueError("External inventory acceptance requires an initialized idle journal")
+            cursor = account.wallet_event_cursor
+            if cursor != self.wallet_cursor():
+                raise ValueError("Wallet evidence changed during inventory acceptance")
+            acceptance = {"account": account, "cursor": cursor,
+                          "epoch": self.settlement_epoch() + 1}
+            for key, value in (("spot_acceptance", acceptance),
+                               ("spot_checkpoint", {"account": account, "cursor": cursor}),
+                               ("spot_settlement_issue", None)):
+                self.db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
+                                (key, dumps(value)))
+            self.db.execute("INSERT INTO events(ts,kind,data) VALUES (?,?,?)",
+                            (utc(account.ts).timestamp(), "EXTERNAL_INVENTORY_ACCEPTED", dumps(acceptance)))
+
+    def ambiguous_wallet_events(self, cursor, through):
+        boundary = self.load("spot_acceptance")
+        if boundary is None:
+            return ()
+        ambiguous = []
+        for reference, in self.db.execute(
+            "SELECT reference FROM wallet_events WHERE id>? AND id<=? AND ts<=? ORDER BY id",
+            (cursor, through, utc(boundary["account"].ts).timestamp()),
+        ):
+            parts = reference.split(":")
+            owner = None
+            if parts[0] == "trade":
+                row = self.db.execute("SELECT order_id FROM fills WHERE symbol=? AND trade_id=?",
+                                      (parts[1], parts[2])).fetchone()
+                if row:
+                    owner = self.order_operation(row[0])
+            elif parts[0] == "transfer":
+                row = self.db.execute("SELECT data FROM operations WHERE kind='TRANSFER' AND exchange_id=?",
+                                      (parts[1],)).fetchone()
+                owner = loads(row[0]) if row else None
+            if owner is None or owner.settlement_epoch != boundary["epoch"]:
+                ambiguous.append(reference)
+        return tuple(ambiguous)
+
     def operation(self, client_id):
         row = self.db.execute(
             "SELECT data FROM operations WHERE client_id=?", (client_id,)
@@ -407,6 +456,8 @@ class Repository:
         if operation.status != OperationStatus.PENDING:
             raise ValueError("New operation must be PENDING")
         with self.db:
+            if operation.settlement_epoch != self.settlement_epoch():
+                raise ValueError("Inventory boundary changed before intent")
             self.db.execute(
                 "INSERT INTO operations(client_id,scope,status,created,data,kind,exchange_id,unresolved,active) VALUES (?,?,?,?,?,?,?,?,?)",
                 (
@@ -550,6 +601,17 @@ class Repository:
                     ),
                 )
                 self._fill_event(fill)
+                # Imports and normal polling must preserve the same ownership
+                # responsibility, including receipts outside the next poll range.
+                owner = self.order_operation(fill.order_id) if fill.strategy_id else None
+                known = self.tracked_order(owner.client_id) if owner else None
+                if known is not None and not known.is_open and (
+                    self.fill_totals(fill.symbol, (fill.order_id,)).get(fill.order_id, Decimal("0"))
+                    != known.filled_qty
+                ):
+                    reopened = replace(owner, balance_pending=True)
+                    self.db.execute("UPDATE operations SET data=?,unresolved=1,active=1 WHERE client_id=?",
+                                    (dumps(reopened), owner.client_id))
                 # Guard episodes do not overlap. Only the interval containing
                 # this execution can change, including a late ownership binding.
                 difference = (

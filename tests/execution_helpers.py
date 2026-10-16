@@ -42,9 +42,16 @@ def seed_bid(exchange, repo, *, age_hours=0, qty="1"):
     Reconciler(exchange, repo, cfg).refresh(exchange.now)
     op = Executor(exchange, repo, cfg, clock=lambda: exchange.now).execute(
         OrderPlan(cfg.symbol, "BUY", "LIMIT_MAKER", D(qty), D("598"), "GTC", True),
-        exchange.now - timedelta(hours=age_hours),
+        exchange.now,
         ReplenishmentState.ACCUMULATE,
     )
+    # Model an existing aged order explicitly; preparation now refreshes idle
+    # account observations and correctly timestamps a real new intent at send.
+    op = replace(op, created_at=exchange.now - timedelta(hours=age_hours))
+    repo.update_operation(op)
+    with repo.db:
+        repo.db.execute("UPDATE operations SET created=? WHERE client_id=?",
+                        (op.created_at.timestamp(), op.client_id))
     exchange.orders[op.exchange_id] = replace(
         exchange.orders[op.exchange_id], created_at=op.created_at
     )

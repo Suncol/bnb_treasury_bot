@@ -517,6 +517,7 @@ class Operation:
     cancel_attempts: int = 0
     cancel_retry_at: datetime | None = None
     not_sent: bool = False
+    settlement_epoch: int = 0
 
     @property
     def unresolved(self) -> bool:

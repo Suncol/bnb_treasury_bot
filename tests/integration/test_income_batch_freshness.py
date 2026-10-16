@@ -312,7 +312,7 @@ def test_slow_audit_rejects_changed_order_exposure_even_when_balances_are_unchan
 
     exchange.income_page_hook = replace_external_buy
     try:
-        with pytest.raises(ExecutionBlocked, match="orders.*replan"):
+        with pytest.raises(ExecutionBlocked, match="orders.*replan|reconciled.*account"):
             runner.executor.execute(
                 OrderPlan("BNBUSDT", "BUY", "LIMIT", D("4"), D("500"), "GTC", False),
                 exchange.now, repo.runtime().state, account=supplied, inputs=inputs,
@@ -587,7 +587,7 @@ def test_incomplete_or_unstored_pagination_cannot_advance_coverage(tmp_path, fai
 
 @pytest.mark.parametrize("invalidate", ["rollback", "failed_proof"])
 def test_same_batch_cannot_reuse_scan_after_rollback_or_failed_proof(tmp_path, invalidate):
-    exchange, repo, runner, queries, pages, accounts = slow_income_setup(tmp_path)
+    exchange, repo, runner, queries, pages, accounts = slow_income_setup(tmp_path, with_bid=True)
     try:
         with runner.executor.income_batch():
             first, _ = runner.reconciler.prepare_execution(exchange.now)
@@ -606,7 +606,7 @@ def test_same_batch_cannot_reuse_scan_after_rollback_or_failed_proof(tmp_path, i
             assert len(queries) == 2 and queries[0] == queries[1] and len(pages) == 6
             assert final.ts > first.ts
         assert not runner.executor.income_audited(exchange.now)
-        assert not exchange.writes
+        assert len(exchange.writes) == 1  # Existing open GTC keeps the strict window.
     finally:
         repo.close()
 

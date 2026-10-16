@@ -231,6 +231,7 @@ class Executor:
             if kind != OperationKind.CANCEL
             else None,
             balance_pending=kind != OperationKind.CANCEL,
+            settlement_epoch=self.repository.settlement_epoch(),
         )
         if starts_slice:
             runtime = replace(

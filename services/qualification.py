@@ -11,6 +11,8 @@ from dataclasses import dataclass, asdict
 class ReconciliationStatus:
     initialized: bool
     own_operations: tuple
+    strict_window: bool
+    accepted_inventory: dict | None
     observation: dict | None
     spot_settlement: dict | None
     futures_settlement: dict
@@ -31,6 +33,8 @@ def reconciliation_status(repository):
     issues = dict(repository.load("futures_settlement_issue") or {})
     return ReconciliationStatus(
         initialized=repository.load("spot_checkpoint") is not None,
+        strict_window=repository.settlement_window_open(),
+        accepted_inventory=repository.load("spot_acceptance"),
         own_operations=tuple({"client_id": op.client_id, "kind": op.kind.value,
                               "status": op.status.value, "balance_pending": op.balance_pending}
                              for op in repository.operations(unresolved_only=True)),
