@@ -17,6 +17,8 @@ from core.risk_checks import evaluate_transfer_gate
 from core.time_utils import fresh, utc
 from core.validation import valid_account_snapshot
 
+from .qualification import reconciliation_status
+
 from .exchange_adapter import (
     ExchangeError, RequestNotSent, RequestRejected, order_matches_operation,
 )
@@ -121,6 +123,10 @@ class Executor:
                 and (account is None or account == self._income_account)
                 and valid_account_snapshot(self._income_account, now, self.cfg))
 
+    def execution_qualified(self, now, *, account=None):
+        """Current batch evidence; historical auditing is its initial policy."""
+        return self.income_audited(now, account=account)
+
     def cancel_due(self, payload, now):
         op = self.repository.cancel_operation(payload.symbol, payload.order_id)
         return op is None or (
@@ -131,14 +137,10 @@ class Executor:
 
     def _require_reconciled(self):
         runtime = self.repository.runtime()
-        if (
-            runtime.run_mode == RunMode.PAUSED
-            or self.repository.operations(unresolved_only=True)
-            or self.repository.load("spot_settlement_issue")
-            or self.repository.load("futures_settlement_issue")
-            or self.repository.load("spot_checkpoint") is None
-        ):
-            raise RuntimeError("New operations require an unpaused, reconciled runtime")
+        status = reconciliation_status(self.repository)
+        if runtime.run_mode == RunMode.PAUSED or status.blocked:
+            raise RuntimeError("New operations require an unpaused, reconciled runtime: "
+                               + str(status.describe()))
         return runtime
 
     def execute(self, payload, now, state, *, starts_slice=False, account=None,
@@ -200,7 +202,7 @@ class Executor:
             account, now = self._prepare_funding(payload, account, runtime, now, inputs)
             previous_runtime = runtime = self.repository.runtime()
         elif kind != OperationKind.CANCEL:
-            if not self.income_audited(self.clock() if self.clock else now, account=account):
+            if not self.execution_qualified(self.clock() if self.clock else now, account=account):
                 # Fast direct calls retain their supplied account. A slow audit
                 # must verify both the refreshed account and the old candidate.
                 original = account

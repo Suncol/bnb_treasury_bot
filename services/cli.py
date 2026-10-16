@@ -20,6 +20,7 @@ from .alert_service import AlertService, LogSink, WebhookSink
 from .binance_adapter import BinanceAdapter
 from .exchange_adapter import AccountObservationInconsistent, ExchangeError, RequestDeferred
 from .executor import Executor
+from .qualification import reconciliation_status
 from .market_stream import MarketStream
 from .paper_exchange import PaperExchange
 from .read_backoff import clear_read_backoff, record_read_failure, retry_deadline
@@ -112,6 +113,7 @@ def main():
             status = {
                 "runtime": repository.runtime(),
                 "unresolved": repository.operations(unresolved_only=True),
+                "reconciliation": reconciliation_status(repository).describe(),
                 "spot_settlement_issue": repository.load("spot_settlement_issue"),
                 "account_identity": repository.load("account_identity"),
                 "transport_backoff": repository.load("transport_backoff"),

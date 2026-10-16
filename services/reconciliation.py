@@ -8,6 +8,7 @@ from core.validation import valid_account_snapshot
 
 from .exchange_adapter import ExchangeError, RequestDeferred, order_matches_operation
 from .executor import ExecutionBlocked, Executor
+from .qualification import reconciliation_status
 from .history import (
     futures_settlement_evidence,
     historical_metrics,
@@ -54,11 +55,8 @@ class Reconciler:
             and valid_account_snapshot(account, checked_at, self.cfg)
             and (account.contract_total_margin_balance is None
                  or account.contract_margin_asset == self.cfg.quote_asset)
-            and not self.repository.operations(unresolved_only=True)
-            and not self.repository.load("spot_settlement_issue")
-            and not self.repository.load("futures_settlement_issue")
-            and self.repository.load("spot_checkpoint") is not None
-            and self.executor.income_audited(checked_at, account=account)
+            and not reconciliation_status(self.repository).blocked
+            and self.executor.execution_qualified(checked_at, account=account)
         ):
             self.executor.invalidate_income_audit()
             raise ExecutionBlocked("New operations require reconciled futures income and a valid account")

@@ -28,6 +28,7 @@ from .exchange_adapter import AccountObservationInconsistent, ExchangeError, Req
 from .executor import ExecutionBlocked, MAX_CANCEL_ATTEMPTS
 from .market_data import MarketWindows
 from .reconciliation import Reconciler
+from .qualification import reconciliation_status
 from .read_backoff import clear_read_backoff, record_read_failure, retry_deadline
 from .price_refresh import PriceRefreshPending
 
@@ -331,6 +332,7 @@ class Runner:
             "filters_age_seconds": age(inputs.filters.observed_at),
             "snapshot_consistent": inputs.snapshot_consistent,
             "pending_unresolved": inputs.pending.unresolved,
+            "reconciliation": reconciliation_status(self.repository).describe(),
         }
         logging.getLogger("bnb_treasury").log(
             logging.WARNING if reasons and reasons != ("WINDOWS_WARMING",) else logging.INFO,
@@ -493,7 +495,7 @@ class Runner:
 
     def _persist_plan(self, plan, *, inventory, now, update_slice=True):
         runtime = self.repository.runtime()
-        verified = plan.inventory_valid and self.executor.income_audited(self.clock())
+        verified = plan.inventory_valid and self.executor.execution_qualified(self.clock())
         advance_candidate = verified and (
             inventory or plan.state_decision.transitioned
         )
@@ -704,7 +706,7 @@ class Runner:
             )
             candidate = queue[0] if queue else None
             plan = build_cycle_plan(inputs, self.cfg, queued_order=candidate)
-            if not self.executor.income_audited(self.clock()) and (
+            if not self.executor.execution_qualified(self.clock()) and (
                 advance_inventory or self._inventory_change(plan) or self.execute_enabled and (
                     plan.buy_plan.orders or plan.transfer_decision.allow
                     or plan.bnb_transfer_plan or plan.spot_usd_sweep_plan
@@ -732,7 +734,7 @@ class Runner:
                     plan,
                     slice_state=replace(plan.slice_state, next_at=saved_slice.next_at),
                 )
-            if advance_inventory and plan.inventory_valid and self.executor.income_audited(self.clock()):
+            if advance_inventory and plan.inventory_valid and self.executor.execution_qualified(self.clock()):
                 self.repository.save_snapshot(inputs.account)
             self._persist_plan(plan, inventory=advance_inventory, now=inputs.now)
             if plan.inventory_valid:
