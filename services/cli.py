@@ -104,11 +104,10 @@ def main():
     stop = Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    repository = Repository(args.db, readonly=args.paper and args.status)
+    repository = Repository(args.db, readonly=args.status)
     if args.status:
         try:
-            if args.paper:
-                repository.db.execute("BEGIN")  # One consistent WAL snapshot while the controller writes.
+            repository.db.execute("BEGIN")  # One consistent read-only WAL snapshot.
             check_environment(repository, paper=args.paper)
             status = {
                 "runtime": repository.runtime(),
