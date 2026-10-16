@@ -261,7 +261,7 @@ class StateInputs:
     pending_usd_to_spot: Decimal
     open_buy_remaining_qty: Decimal
     filled_untransferred_bnb: Decimal
-    consumption_rate: Decimal
+    consumption_rate: Decimal | None
     previous_state: ReplenishmentState
     previous_candidate_state: ReplenishmentState | None
     candidate_streak: int
@@ -351,7 +351,7 @@ class EngineInputs:
     market: MarketSnapshot
     filters: SymbolFilters
     run_mode: RunMode
-    consumption_rate: Decimal
+    consumption_rate: Decimal | None
     previous_state: ReplenishmentState
     previous_candidate_state: ReplenishmentState | None
     candidate_streak: int

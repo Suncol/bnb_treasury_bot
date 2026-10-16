@@ -124,30 +124,17 @@ assert qty >= min_qty and notional >= min_notional
 | `IDLE` | 本轮已完成，或原本处于 IDLE 且 `contract_bnb >= B_alert` | 保持休息，取消已不需要的买单 |
 | `WATCH` | 存量持久化状态，尚未完成普通补仓状态的连续确认 | 继续按原状态执行，确认后进入 ACCUMULATE |
 | `ACCUMULATE` | 已启动、尚未完成且未触发紧急需求的普通补仓 | 使用现有折扣及重定价周期持续本轮补仓 |
-| `URGENT` | `contract_bnb <= B_low`，或需要补仓且 `T_depletion <= 6h` | 立即补仓，允许吃单或市价 |
+| `URGENT` | `contract_bnb <= B_low`（已有 URGENT 保留退出缓冲） | 立即补仓，允许吃单或市价 |
 
-现有业务状态同时表示补仓轮次，不增加独立的轮次开关：IDLE 库存低于 `B_alert` 后启动补仓，WATCH/ACCUMULATE/URGENT 均表示本轮尚未结束。普通本轮持续使用 ACCUMULATE，库存恢复至 28–32 BNB 时不再降回 WATCH；URGENT 缓解后也按普通补仓规则确认进入 ACCUMULATE。存量 WATCH 按同一规则迁入 ACCUMULATE，复用原有连续确认及 previous_state，不增加迁移标志。已经处于 IDLE 且库存仍不低于 28 时，消耗时间不会单独启动另一轮。
+现有业务状态同时表示补仓轮次，不增加独立的轮次开关：IDLE 库存低于 `B_alert` 后启动补仓，WATCH/ACCUMULATE/URGENT 均表示本轮尚未结束。普通本轮持续使用 ACCUMULATE，库存恢复至 28–32 BNB 时不再降回 WATCH；URGENT 缓解后也按普通补仓规则确认进入 ACCUMULATE。存量 WATCH 按同一规则迁入 ACCUMULATE，复用原有连续确认及 previous_state，不增加迁移标志。已经处于 IDLE 且库存仍不低于 28 时，不启动另一轮。
 
 收尾只看已核对的合约 BNB，不能用现货余额、挂单或在途量提前完成本轮。合约库存达到 `B_target`，或距目标严格小于现有最小 BNB 回划量时结束；若回划量配置低于数量步长，以步长作为最小可执行单位。默认收尾区间为 `(31.9, 32]` BNB，不新增策略参数。`contract_bnb >= B_high` 始终停止新增买入。
 
-### 5.1 消耗速率与耗尽时间
+### 5.1 固定库存阈值
 
-```python
-r = max(0, (bnb_at_t_minus_dt + confirmed_bnb_in - confirmed_bnb_out - bnb_now) / dt_hours)
+库存状态只依赖当前有效库存、补仓轮次和既有连续确认。历史消耗率、预计耗尽时间不参与状态、买单或划转决策；缺失、零值或很高的历史消耗率得到相同计划。新决策不再产生 `DEPLETION_*` 原因，兼容输出 `t_depletion` 为 `None`，不是零消耗或无限库存的证明。旧字段和枚举继续兼容读取；旧 URGENT 依据新阈值及原退出缓冲、连续确认收敛，不重置运行态。
 
-if r == 0:
-    T_depletion = inf
-else:
-    T_depletion = max(0, (contract_bnb - B_low) / r)
-```
-
-分别计算最近 6h 与 24h 的整窗平均消耗率，再取双窗口中位数，降低偶发波动影响：
-
-```python
-r_use = median(r_6h, r_24h)
-```
-
-每个窗口选取边界时刻或此前最近的余额快照，以该快照至当前账户快照的实际小时数为分母；只调整此期间已确认的 BNB 划入与划出，起点不含、终点包含。不能对相邻快照的消耗率先取中位数，否则间歇性集中扣费会被多数零消耗区间抹掉。不足一个完整窗口时不使用该窗口；两个窗口均不足时，只使用余额阈值判定，不依赖 `T_depletion`。
+取消预测升级意味着库存尚高于下限但预计即将耗尽时，不再提前进入 URGENT。阈值默认保持 25/28/32/40 BNB，急跌保护独立生效。本步骤保留原有结算与收入证明门禁，不能用固定阈值绕过无效库存。
 
 ### 5.2 状态抖动控制
 

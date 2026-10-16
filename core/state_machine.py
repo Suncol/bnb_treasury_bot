@@ -54,8 +54,6 @@ def classify_candidate_state(
         return ReplenishmentState.IDLE
     if previous_state == ReplenishmentState.IDLE and contract_bnb >= thresholds.b_alert:
         return ReplenishmentState.IDLE
-    if t_depletion is not None and t_depletion <= Decimal("6"):
-        return ReplenishmentState.URGENT
     return ReplenishmentState.ACCUMULATE
 
 
@@ -67,14 +65,8 @@ def _classify_reason(
         return TransitionReason.HIGH_BALANCE
     if contract_bnb <= thresholds.b_low:
         return TransitionReason.LOW_BALANCE
-    if t_depletion is not None and t_depletion <= Decimal("6"):
-        return TransitionReason.DEPLETION_6H
     if contract_bnb < thresholds.b_alert:
         return TransitionReason.LOW_BALANCE
-    if t_depletion is not None and t_depletion <= Decimal("24"):
-        return TransitionReason.DEPLETION_24H
-    if t_depletion is not None and t_depletion <= Decimal("72"):
-        return TransitionReason.DEPLETION_72H
     return TransitionReason.REPLENISHMENT_ACTIVE
 
 
@@ -116,9 +108,9 @@ def apply_hysteresis(
 
 def evaluate_state(inputs: StateInputs, cfg: StrategyConfig, *,
                    target_tolerance: Decimal = Decimal("0")) -> StateDecision:
-    t_depletion = compute_t_depletion(
-        inputs.contract_bnb, cfg.thresholds.b_low, inputs.consumption_rate
-    )
+    # Retain the legacy output field for persisted callers; forecasting no
+    # longer participates in state selection or pretends to be a live metric.
+    t_depletion = None
     effective_supply = compute_effective_supply(inputs, cfg.thresholds.b_spot_reserve)
     delta_bnb = compute_delta_bnb(effective_supply, cfg.thresholds.b_target)
 

@@ -42,7 +42,7 @@ def test_compute_t_depletion_returns_none_for_non_positive_rate(rate) -> None:
         (D("28"), None, ReplenishmentState.ACCUMULATE),
         (D("27.99"), D("100"), ReplenishmentState.ACCUMULATE),
         (D("25.01"), D("100"), ReplenishmentState.ACCUMULATE),
-        (D("25.01"), D("6"), ReplenishmentState.URGENT),
+        (D("25.01"), D("6"), ReplenishmentState.ACCUMULATE),
     ],
 )
 def test_classify_candidate_state_threshold_boundaries(
@@ -61,7 +61,7 @@ def test_classify_candidate_state_threshold_boundaries(
     [
         (D("30.04"), D("0.07"), ReplenishmentState.ACCUMULATE),
         (D("29.8"), D("0.2"), ReplenishmentState.ACCUMULATE),
-        (D("25.6"), D("0.1"), ReplenishmentState.URGENT),
+        (D("25.6"), D("0.1"), ReplenishmentState.ACCUMULATE),
     ],
 )
 def test_t_depletion_exact_time_boundaries(contract_bnb, rate, expected_state) -> None:

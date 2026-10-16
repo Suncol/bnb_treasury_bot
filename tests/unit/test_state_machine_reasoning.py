@@ -21,15 +21,15 @@ from tests.helpers import D, make_state_inputs, make_strategy_config
             D("25.6"),
             D("0.1"),
             ReplenishmentState.WATCH,
-            ReplenishmentState.URGENT,
-            TransitionReason.DEPLETION_6H,
+            ReplenishmentState.ACCUMULATE,
+            TransitionReason.LOW_BALANCE,
         ),
         (
             D("29.8"),
             D("0.2"),
             ReplenishmentState.WATCH,
             ReplenishmentState.ACCUMULATE,
-            TransitionReason.DEPLETION_24H,
+            TransitionReason.REPLENISHMENT_ACTIVE,
         ),
         (
             D("32.2"),
@@ -43,7 +43,7 @@ from tests.helpers import D, make_state_inputs, make_strategy_config
             D("0.07"),
             ReplenishmentState.WATCH,
             ReplenishmentState.ACCUMULATE,
-            TransitionReason.DEPLETION_72H,
+            TransitionReason.REPLENISHMENT_ACTIVE,
         ),
         (
             D("30"),
