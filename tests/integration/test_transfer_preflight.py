@@ -142,10 +142,12 @@ def test_exact_remaining_budget_sends_once_using_final_observation_and_no_double
 @pytest.mark.parametrize("evidence", ["past", "future", "nonfinite", "missing_income", "empty_new_version", "capital", "spot", "orders"])
 def test_final_observation_must_have_valid_time_and_complete_financial_evidence(treasury, evidence):
     account = replace(
-        make_account(contract_bnb=D("24"), contract_max_withdraw_amount=D("60000")),
+        make_account(contract_bnb=D("24"), spot_usd=D("5000"), contract_max_withdraw_amount=D("60000")),
         contract_total_margin_balance=D("60000"), contract_margin_asset="USDT",
     )
     exchange, repo, runner = treasury(FakeExchange(account))
+    from tests.execution_helpers import legacy_open_bid
+    legacy_open_bid(exchange, repo)
     original = exchange.fetch_account_snapshot()
     fetch = exchange.fetch_account_snapshot
     if evidence in {"past", "future", "nonfinite"}:
@@ -171,7 +173,7 @@ def test_final_observation_must_have_valid_time_and_complete_financial_evidence(
         exchange.fetch_open_orders = changing_orders
     with pytest.raises(ExecutionBlocked, match="reconciled"):
         runner.executor.execute(funding("500"), exchange.now, repo.runtime().state, account=original)
-    assert not repo.operations() and not exchange.writes
+    assert [op.client_id for op in repo.operations()] == ["legacy-open"] and not exchange.writes
     assert repo.runtime().api_errors == repo.runtime().transfer_failures == 0
 
 

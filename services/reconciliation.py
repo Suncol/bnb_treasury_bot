@@ -11,9 +11,7 @@ from .executor import ExecutionBlocked, Executor
 from .qualification import reconciliation_status
 from .history import (
     futures_settlement_evidence,
-    historical_metrics,
     INCOME_RECHECK_INTERVAL,
-    margin_baseline,
     settlement_policy_issue,
 )
 
@@ -27,7 +25,7 @@ class Reconciler:
         self.read_checkpoint = None
         self.executor = executor or Executor(exchange, repository, cfg, clock=self.clock)
         self.executor.reconciler = self
-        self.history = (ZERO, None)
+        self.history = (None, None)
         self._funding_orders = None
 
     def prepare_execution(self, now, *, account=None):
@@ -36,24 +34,9 @@ class Reconciler:
         Keep the shared executor's audit and priority read checkpoints. Callers
         must still check their candidate against the returned financial evidence.
         """
-        checkpoint = self.repository.load("spot_checkpoint")
-        same_spot = account is not None and checkpoint is not None and all(
-            getattr(account, name) == getattr(checkpoint["account"], name)
-            for name in ("spot_bnb", "spot_usd", "reserved_spot_bnb", "reserved_spot_usd")
-        )
-        if account is not None and (self.repository.settlement_window_open() or same_spot):
-            consistent = self.audit_income(account, now)
-            checked = self.clock() if self.clock else now
-            if (not consistent and self.executor.income_scan(checked) is not None
-                    and not fresh(account.ts, checked, self.cfg.risk.max_account_age_seconds)
-                    and utc(account.ts) <= utc(checked)):
-                account, orders, pending, consistent = self.refresh(
-                    checked, force_income=True, retry_slow=False,
-                )
-            else:
-                orders, pending = (), PendingState(ZERO, ZERO, ZERO, ZERO)
-        else:
-            account, orders, pending, consistent = self.refresh(now, force_income=True)
+        # Always verify the account together with orders and the budget. A
+        # caller-supplied balance is not a substitute for this observation.
+        account, orders, pending, consistent = self.refresh(now, force_income=True)
         checked_at = self.clock() if self.clock else now
         if not (
             consistent and not pending.unresolved
@@ -64,7 +47,7 @@ class Reconciler:
             and self.executor.execution_qualified(checked_at, account=account)
         ):
             self.executor.invalidate_income_audit()
-            raise ExecutionBlocked("New operations require reconciled futures income and a valid account")
+            raise ExecutionBlocked("New operations require reconciled orders, settlement and a valid account")
         return account, orders
 
     def protective_cancellations(self, *, guard=None, now=None, retries_only=False):
@@ -240,6 +223,7 @@ class Reconciler:
     def _refresh(self, now, *, force_income=False):
         self._funding_orders = None
         repo, exchange, cfg = self.repository, self.exchange, self.cfg
+        preparation = self.executor.begin_preparation(now)
         strict_at_start = repo.settlement_window_open()
         tracked = repo.tracked_orders(active_only=True)
         for op in repo.operations(unresolved_only=True):
@@ -448,18 +432,26 @@ class Reconciler:
         )
         checked_at = self.clock() if self.clock else now
         samples = repo.snapshots_since(utc(checked_at) - timedelta(hours=49))
-        baseline = margin_baseline(samples, checked_at, warmup=True)
         quote_before = (
             replace(checkpoint["account"], wallet_event_cursor=checkpoint["cursor"])
             if checkpoint is not None else None
         )
+        strict = strict_at_start or repo.settlement_window_open()
+        window_before = quote_before
+        if strict:
+            anchors = [op.balance_before for op in repo.operations(active_only=True)
+                       if op.balance_before is not None]
+            if quote_before is not None:
+                anchors.append(quote_before)
+            if anchors:
+                window_before = min(anchors, key=lambda a: utc(a.ts))
         observations = [
             (op.balance_before, op.payload.asset) for op in pending_transfers
             if op.status == OperationStatus.CONFIRMED and op.balance_before is not None
         ]
-        if account.contract_total_margin_balance is not None:
+        if strict and account.contract_total_margin_balance is not None:
             observations.extend(
-                (before, cfg.quote_asset) for before in (baseline, quote_before)
+                (before, cfg.quote_asset) for before in (quote_before, window_before)
                 if before is not None and account.contract_margin_asset == cfg.quote_asset
             )
         coverage = (
@@ -467,7 +459,7 @@ class Reconciler:
                 observations, account,
                 force=force_income and not self.executor.income_audited(checked_at),
             )
-            if valid_account_snapshot(account, checked_at, cfg) else None
+            if strict and valid_account_snapshot(account, checked_at, cfg) else None
         )
         after = self._read(exchange.fetch_open_orders, cfg.symbol)
         extra_after = tuple(
@@ -504,7 +496,8 @@ class Reconciler:
         spot_settled = False
         observation_valid = consistent and valid_account_snapshot(
             account, self.clock() if self.clock else now, cfg
-        )
+        ) and (account.contract_total_margin_balance is None
+               or account.contract_margin_asset == cfg.quote_asset)
         futures_issues = {} if observation_valid else dict(
             repo.load("futures_settlement_issue") or {}
         )
@@ -512,7 +505,7 @@ class Reconciler:
             quote_settled = True
             spot_before = checkpoint
             policy = None
-            if quote_before is not None and account.contract_total_margin_balance is not None:
+            if strict and quote_before is not None and account.contract_total_margin_balance is not None:
                 quote_settled, anchor, evidence = futures_settlement_evidence(
                     repo, quote_before, account, cfg.quote_asset, samples=samples
                 )
@@ -523,18 +516,20 @@ class Reconciler:
                     if policy is not None:
                         futures_issues["quote"] = policy
                     spot_before = {"account": anchor, "cursor": anchor.wallet_event_cursor}
+                if quote_settled and policy is None and window_before is not quote_before:
+                    window_valid, _, window_evidence = futures_settlement_evidence(
+                        repo, window_before, account, cfg.quote_asset, samples=samples)
+                    window_policy = settlement_policy_issue(window_evidence)
+                    if not window_valid or window_policy is not None:
+                        futures_issues["window"] = window_evidence if not window_valid else window_policy
+                        quote_settled = False
             if quote_settled and policy is None and (checkpoint is not None or not external_pending):
-                allow_external = (not strict_at_start and not repo.settlement_window_open()
-                                  and not external_pending)
-                if allow_external:
-                    # Phase 03 only relaxes spot accounting; historical futures
-                    # authorization is still required before accepting a baseline.
-                    _, _, history_issue = historical_metrics(
-                        repo, account, checked_at, cfg.quote_asset, samples=samples)
-                    allow_external = history_issue is None
-                spot_settled = self._settle_spot(
-                    account, checkpoint=spot_before, allow_external=allow_external,
-                )
+                allow_external = not strict and not external_pending
+                if allow_external and checkpoint is not None:
+                    repo.accept_inventory_observation(account)
+                    spot_settled = True
+                else:
+                    spot_settled = self._settle_spot(account, checkpoint=spot_before)
             if spot_settled:
                 repo.save("fills_since", utc(now) - timedelta(seconds=60))
             for op in repo.operations(active_only=True):
@@ -617,24 +612,16 @@ class Reconciler:
         # Account-wide pending transfers also block bootstrap and strategy writes.
         if external_pending:
             pending = replace(pending, has_unknown_transfers=True)
-        self.history = (ZERO, None)
-        if observation_valid and not any("since" in i for i in futures_issues.values()):
-            rate, margin, issue = historical_metrics(
-                repo, account, checked_at, cfg.quote_asset, samples=samples
-            )
-            if issue is not None:
-                futures_issues["margin"] = issue
-                consistent = False
-            elif not pending.unresolved:
-                self.history = rate, margin
+        # No historical prediction/diagnostic is required by fixed thresholds.
+        self.history = (None, None)
         repo.save("futures_settlement_issue", futures_issues or None)
         self._save_income_coverage(
             coverage, futures_issues, observation_valid
             and valid_account_snapshot(account, self.clock() if self.clock else now, cfg)
         )
         if (observation_valid and not futures_issues and not pending.unresolved
-                and self.executor.income_scan(self.clock() if self.clock else now) is not None):
-            self.executor.qualify_income(account, self.clock() if self.clock else now)
+                and (not strict or self.executor.income_scan(self.clock() if self.clock else now) is not None)):
+            self.executor.qualify_execution(preparation, account, self.clock() if self.clock else now)
         runtime = repo.runtime()
         if runtime.guard.active:
             repo.save(
@@ -681,8 +668,8 @@ class Reconciler:
                 and lower < upper <= utc(account.ts) + timedelta(seconds=1)
             ):
                 windows.append((utc(before.ts) - timedelta(seconds=1), upper))
-        for issue in (repo.load("futures_settlement_issue") or {}).values():
-            if "since" in issue:
+        for key, issue in (repo.load("futures_settlement_issue") or {}).items():
+            if key != "margin" and "since" in issue:
                 version = "contract_bnb_updated_at" if issue.get("asset") == "BNB" else "contract_quote_updated_at"
                 upper = utc(getattr(account, version) or account.ts)
                 if utc(issue["since"]) <= upper <= utc(account.ts) + timedelta(seconds=1):
@@ -719,49 +706,6 @@ class Reconciler:
                 self.clock() if self.clock else account.ts,
             )
         return coverage
-
-    def audit_income(self, account, now):
-        """Refresh only income before a new batch; reuse the observed account."""
-        repo, cfg = self.repository, self.cfg
-        self.executor.invalidate_income_qualification()
-        if account.contract_total_margin_balance is None:
-            self._refresh_income([], account, force=True)
-            self.executor.qualify_income(account, self.clock() if self.clock else now)
-            return True
-        samples = repo.snapshots_since(utc(now) - timedelta(hours=49))
-        checkpoint = repo.load("spot_checkpoint")
-        before = (replace(checkpoint["account"], wallet_event_cursor=checkpoint["cursor"])
-                  if checkpoint is not None else None)
-        baseline = margin_baseline(samples, now, warmup=True)
-        observations = [(s, cfg.quote_asset) for s in (baseline, before) if s is not None]
-        for snapshot, asset in tuple(observations):
-            _, anchor, _ = futures_settlement_evidence(repo, snapshot, account, asset, samples=samples)
-            if anchor is not snapshot:
-                observations.append((anchor, asset))
-        coverage = self._refresh_income(observations, account, force=True)
-        issues = {}
-        if before is not None:
-            valid, _, evidence = futures_settlement_evidence(
-                repo, before, account, cfg.quote_asset, samples=samples
-            )
-            policy = settlement_policy_issue(evidence)
-            if not valid or policy is not None:
-                issues["quote"] = evidence if not valid else policy
-        rate, margin, issue = historical_metrics(repo, account, now, cfg.quote_asset, samples=samples)
-        if issue is not None:
-            issues["margin"] = issue
-        valid = (
-            valid_account_snapshot(account, self.clock() if self.clock else now, cfg)
-            and not repo.operations(unresolved_only=True)
-        )
-        if not valid:
-            issues["observation"] = {"reason": "Account or runtime changed during income audit"}
-        repo.save("futures_settlement_issue", issues or None)
-        self._save_income_coverage(coverage, issues, valid)
-        self.history = (ZERO, None) if issues else (rate, margin)
-        if not issues:
-            self.executor.qualify_income(account, self.clock() if self.clock else now)
-        return not issues
 
     def _settle_spot(self, account, *, checkpoint=None, allow_external=False):
         """Advance one durable balance/ledger checkpoint only on exact coverage.
@@ -812,7 +756,7 @@ class Reconciler:
         }
         if differences or missing:
             if allow_external:
-                repo.accept_spot_observation(account)
+                repo.accept_inventory_observation(account)
                 return True
             repo.save(
                 "spot_settlement_issue",
@@ -913,11 +857,12 @@ class Reconciler:
             f"trade:{f.symbol}:{f.trade_id}": f for f in repo.fills_after(funding.balance_fill_cursor)
             if f.strategy_id != cfg.strategy_id and utc(f.ts) >= utc(funding.created_at)
         }
+        same_boundary = funding.settlement_epoch == repo.settlement_epoch()
         changes = [
             (reference, deltas[cfg.quote_asset])
             for _, reference, deltas in repo.wallet_changes(
                 funding.balance_before.wallet_event_cursor, through=account.wallet_event_cursor)
-            if reference in external and deltas.get(cfg.quote_asset) is not None
+            if same_boundary and reference in external and deltas.get(cfg.quote_asset) is not None
         ]
         spent = max(-sum((amount for _, amount in changes), ZERO), ZERO)
         frozen = ZERO
@@ -1033,6 +978,9 @@ class Reconciler:
 
     def _futures_transfer_settled(self, op, account, issues, *, samples=()):
         before, p, repo = op.balance_before, op.payload, self.repository
+        if op.settlement_epoch != repo.settlement_epoch():
+            issues[op.client_id] = {"reason": "Operation precedes accepted inventory boundary"}
+            return False
         if before is None or before.ts is None:
             issues[op.client_id] = {"reason": "Missing pre-transfer futures baseline"}
             return False

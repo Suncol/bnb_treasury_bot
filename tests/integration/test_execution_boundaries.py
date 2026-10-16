@@ -607,8 +607,10 @@ def test_funded_order_failure_restores_funding_identity_in_the_result_transactio
         assert repo.runtime().funding_exhausted_at is None
     else:
         assert not repo.operations(unresolved_only=True)
-        assert not repo.runtime().resume_replenishment
-        assert repo.runtime().funding_exhausted_at == exchange.now
+        # The external balance was accepted outside the completed window;
+        # late receipts/cursors cannot prove occupation of the old funding.
+        assert repo.runtime().resume_replenishment
+        assert repo.runtime().funding_exhausted_at is None
     assert len(exchange.writes) == 1
     repo.close()
 

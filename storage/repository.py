@@ -339,23 +339,49 @@ class Repository:
     def settlement_epoch(self):
         return (self.load("spot_acceptance") or {}).get("epoch", 0)
 
-    def accept_spot_observation(self, account):
-        """Accept external inventory only outside all journaled responsibility."""
+    def accept_inventory_observation(self, account):
+        """Atomically accept both accounts outside all journaled responsibility.
+
+        Repeated observations with identical financial content do not create
+        another generation. The timestamp/cursors record a replay boundary,
+        never exchange-side proof of coverage for an individual operation.
+        """
         with self.db:
             if self.settlement_window_open() or self.load("spot_checkpoint") is None:
                 raise ValueError("External inventory acceptance requires an initialized idle journal")
             cursor = account.wallet_event_cursor
             if cursor != self.wallet_cursor():
                 raise ValueError("Wallet evidence changed during inventory acceptance")
-            acceptance = {"account": account, "cursor": cursor,
-                          "epoch": self.settlement_epoch() + 1}
-            for key, value in (("spot_acceptance", acceptance),
-                               ("spot_checkpoint", {"account": account, "cursor": cursor}),
+            previous = self.load("spot_acceptance")
+            changed = previous is None or (
+                replace(self.load("spot_checkpoint")["account"], ts=account.ts) != account
+            )
+            if changed:
+                acceptance = {"account": account, "cursor": cursor,
+                              "income_cursor": self.db.execute("SELECT COALESCE(MAX(rowid),0) FROM futures_income").fetchone()[0],
+                              "epoch": self.settlement_epoch() + 1}
+                self.db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
+                                ("spot_acceptance", dumps(acceptance)))
+                self.db.execute("INSERT INTO events(ts,kind,data) VALUES (?,?,?)",
+                                (utc(account.ts).timestamp(), "EXTERNAL_INVENTORY_ACCEPTED", dumps(acceptance)))
+            for key, value in (("spot_checkpoint", {"account": account, "cursor": cursor}),
                                ("spot_settlement_issue", None)):
                 self.db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
                                 (key, dumps(value)))
-            self.db.execute("INSERT INTO events(ts,kind,data) VALUES (?,?,?)",
-                            (utc(account.ts).timestamp(), "EXTERNAL_INVENTORY_ACCEPTED", dumps(acceptance)))
+
+    def ambiguous_income(self, records):
+        boundary = self.load("spot_acceptance")
+        if boundary is None:
+            return ()
+        ambiguous = []
+        for record in records:
+            if utc(record.ts) > utc(boundary["account"].ts):
+                continue
+            row = self.db.execute("SELECT rowid FROM futures_income WHERE income_type=? AND transaction_id=?",
+                                  (record.income_type, record.transaction_id)).fetchone()
+            if row is not None and row[0] > boundary.get("income_cursor", 0):
+                ambiguous.append((record.income_type, record.transaction_id))
+        return tuple(ambiguous)
 
     def ambiguous_wallet_events(self, cursor, through):
         boundary = self.load("spot_acceptance")

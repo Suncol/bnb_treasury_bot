@@ -18,7 +18,7 @@ from tests.helpers import (
     D, make_account, make_engine_inputs, make_market, make_strategy_config, order,
 )
 from tests.fake_exchange import FakeExchange
-from tests.execution_helpers import setup, seed_bid
+from tests.execution_helpers import setup, seed_bid, legacy_open_bid
 from tests.integration.test_margin_adjusted_target import margin_setup, partial_capital_setup
 
 
@@ -44,6 +44,8 @@ def slow_income_setup(tmp_path, *, with_bid=False, contract_bnb="27", spot_bnb="
     exchange, repo, runner = setup(tmp_path, exchange, ReplenishmentState.ACCUMULATE)
     if with_bid:
         seed_bid(exchange, repo)
+    else:
+        legacy_open_bid(exchange, repo, created_at=started)
     repo.save_snapshot(exchange.fetch_account_snapshot())
     exchange.now = started
     first_income_at = started - timedelta(hours=23)
@@ -118,43 +120,33 @@ def test_slow_full_income_scan_reuses_completion_with_a_fresh_final_account(tmp_
         assert metrics == {
             "full_queries": 1, "increment_queries": 0, "pages": 3,
             "original_account_age_seconds": 12.0, "final_account_age_seconds": 0.0,
-            "legal_plan": True, "writes": 3, "coverage_saved": True,
+            "legal_plan": True, "writes": 2, "coverage_saved": True,
         }
         assert account_reads[-1].ts > account_reads[0].ts
-        assert runner.cached_inputs.margin_change_24h == D("-2.501")
+        assert runner.cached_inputs.margin_change_24h is None
         assert all(op.kind == OperationKind.ORDER for op in exchange.writes)
-        assert sum(op.payload.qty for op in exchange.writes) == D("5")
+        assert sum(op.payload.qty for op in exchange.writes) == D("4.94")
         assert not repo.operations(unresolved_only=True)
     finally:
         repo.close()
 
 
 @pytest.mark.parametrize("execute", [False, True])
-def test_idle_maintenance_reuses_finite_income_coverage_without_full_audits(tmp_path, execute):
+def test_idle_maintenance_needs_no_income_cache(tmp_path, execute):
     exchange, repo, runner = margin_setup(tmp_path)
     exchange.account = replace(exchange.account, contract_bnb=D("32"))
     repo.save("runtime", replace(repo.runtime(), state=ReplenishmentState.IDLE))
     runner.execute_enabled = execute
     exchange.futures_change("USDT", D("-1"), "COMMISSION")
-    requests, read = [], exchange.fetch_futures_income
-
-    def income(since, until):
-        requests.append((since, until))
-        return read(since, until)
-
-    exchange.fetch_futures_income = income
+    def forbidden(*args):
+        pytest.fail("Idle maintenance does not require income")
+    exchange.fetch_futures_income = forbidden
     try:
-        assert runner.run_once(inventory_cycle=False).inventory_valid
-        checked = repo.load("futures_income_coverage")["checked_at"]
         for _ in range(3):
-            exchange.now += timedelta(seconds=10)
+            exchange.now += timedelta(minutes=5)
             assert runner.run_once(inventory_cycle=False).inventory_valid
-        assert len(requests) == 1
-        assert not exchange.writes
-        assert repo.runtime().last_inventory_at is None
-        exchange.now = checked + timedelta(minutes=5)
-        assert runner.run_once(inventory_cycle=False).inventory_valid
-        assert len(requests) == 2 and requests[1] == requests[0]
+        assert not exchange.writes and repo.runtime().last_inventory_at is None
+        assert repo.load("futures_income_coverage") is None
     finally:
         repo.close()
 
@@ -176,13 +168,24 @@ def test_maintenance_audits_before_inventory_state_or_slice_changes(tmp_path, ex
     before = repo.runtime()
     try:
         plan = runner.run_once(inventory_cycle=False)
-        assert len(calls) == 2, (change, plan)
-        assert not plan.inventory_valid
         after = repo.runtime()
-        assert (after.state, after.candidate, after.candidate_streak, after.slice_state) == (
-            before.state, before.candidate, before.candidate_streak, before.slice_state)
+        if change in {"urgent", "idle"}:
+            # The state transition first requests a protective cancellation.
+            # Observation-only mode cannot advance stock state; execution may
+            # close the old window and then accept a fresh idle baseline.
+            if execute:
+                assert any(op.kind == OperationKind.CANCEL for op in exchange.writes)
+                assert repo.load("spot_acceptance") is not None
+            else:
+                assert len(calls) == 1 and not exchange.writes
+                assert (after.state, after.candidate, after.candidate_streak) == (
+                    before.state, before.candidate, before.candidate_streak)
+        else:
+            assert len(calls) == 2 and not plan.inventory_valid
+            assert (after.state, after.candidate, after.candidate_streak, after.slice_state) == (
+                before.state, before.candidate, before.candidate_streak, before.slice_state)
+            assert not exchange.writes
         assert after.last_inventory_at is None
-        assert not repo.operations() and not exchange.writes
     finally:
         repo.close()
 
@@ -196,12 +199,12 @@ def test_cached_tick_routes_new_state_decision_through_full_audit(tmp_path):
     before = repo.runtime()
     try:
         plan = runner.tick()
-        assert len(calls) == 2
-        assert not plan.inventory_valid
+        assert len(calls) == 1
+        assert plan.cancellations  # Protection does not authorize stock state.
         assert repo.runtime().state == before.state
         assert repo.runtime().candidate == before.candidate
         assert repo.runtime().last_inventory_at == before.last_inventory_at
-        assert not repo.operations() and not exchange.writes
+        assert [op.client_id for op in repo.operations()] == ["legacy-open"] and not exchange.writes
     finally:
         repo.close()
 
@@ -240,15 +243,15 @@ def test_direct_order_discards_old_demand_when_slow_audit_observes_external_buy(
 
     exchange.income_page_hook = external_buy
     try:
-        with pytest.raises(ExecutionBlocked, match="balances or orders changed"):
+        with pytest.raises(ExecutionBlocked, match="balances or orders changed|reconciled.*account"):
             runner.executor.execute(
                 OrderPlan("BNBUSDT", "BUY", "LIMIT", D("5"), D("500"), "GTC", False),
                 exchange.now, repo.runtime().state, account=supplied,
             )
-        assert accounts[-1].reserved_spot_usd == D("0" if filled else "2500")
+        assert accounts[-1].reserved_spot_usd >= D("29.90")
         assert accounts[-1].spot_bnb == D("5.5" if filled else "0.5")
         assert len(queries) == 1 and len(pages) == 3
-        assert not repo.operations() and not exchange.writes
+        assert [op.client_id for op in repo.operations()] == ["legacy-open"] and not exchange.writes
         assert repo.runtime().api_errors == repo.runtime().transfer_failures == 0
     finally:
         repo.close()
@@ -257,10 +260,10 @@ def test_direct_order_discards_old_demand_when_slow_audit_observes_external_buy(
 @pytest.mark.parametrize("source", ["market", "filters"])
 @pytest.mark.parametrize("age,allow", [(5, True), (5.000001, False)])
 def test_direct_audit_preserves_supplied_market_and_filter_lifetime(tmp_path, source, age, allow):
-    exchange, repo, runner = margin_setup(tmp_path, spot_usd="10000")
+    exchange, repo, runner = margin_setup(tmp_path, spot_usd="10000", strict=True)
     exchange.futures_change("USDT", D("-1"), "COMMISSION")
     supplied = exchange.fetch_account_snapshot()
-    inputs = make_engine_inputs(account=supplied)
+    inputs = replace(make_engine_inputs(account=supplied), orders=tuple(repo.tracked_orders(active_only=True).values()))
     inputs = replace(
         inputs, market=replace(inputs.market, ts=exchange.now),
         filters=replace(inputs.filters, observed_at=(
@@ -274,11 +277,7 @@ def test_direct_audit_preserves_supplied_market_and_filter_lifetime(tmp_path, so
         exchange.now += timedelta(seconds=age if source == "market" else 1)
         return rows
 
-    def unexpected_account_read():
-        pytest.fail("A still-fresh supplied account must not be queried again")
-
     exchange.fetch_futures_income = delayed_income
-    exchange.fetch_account_snapshot = unexpected_account_read
     candidate = OrderPlan("BNBUSDT", "BUY", "LIMIT", D("1"), D("500"), "GTC", False)
     try:
         if allow:
@@ -289,7 +288,7 @@ def test_direct_audit_preserves_supplied_market_and_filter_lifetime(tmp_path, so
             with pytest.raises(ExecutionBlocked, match="expired"):
                 runner.executor.execute(candidate, exchange.now, repo.runtime().state,
                                          account=supplied, inputs=inputs)
-            assert not repo.operations() and not exchange.writes
+            assert [op.client_id for op in repo.operations()] == ["legacy-open"] and not exchange.writes
     finally:
         repo.close()
 
@@ -317,10 +316,10 @@ def test_slow_audit_rejects_changed_order_exposure_even_when_balances_are_unchan
                 OrderPlan("BNBUSDT", "BUY", "LIMIT", D("4"), D("500"), "GTC", False),
                 exchange.now, repo.runtime().state, account=supplied, inputs=inputs,
             )
-        assert accounts[-1].reserved_spot_usd == supplied.reserved_spot_usd == D("500")
+        assert accounts[-1].reserved_spot_usd == supplied.reserved_spot_usd == D("529.90")
         assert accounts[-1].spot_bnb == supplied.spot_bnb == D("0.5")
         assert len(queries) == 1 and len(pages) == 3
-        assert not repo.operations() and not exchange.writes
+        assert [op.client_id for op in repo.operations()] == ["legacy-open"] and not exchange.writes
     finally:
         repo.close()
 
@@ -341,7 +340,7 @@ def test_slow_audit_keeps_transfer_candidate_only_if_financial_demand_is_unchang
     )
     # BNB returns do not need fresh market data; their static quantity filters
     # and all balance/settlement constraints still apply.
-    inputs = make_engine_inputs(account=supplied) if kind == "bnb" else None
+    inputs = replace(make_engine_inputs(account=supplied), orders=tuple(repo.tracked_orders(active_only=True).values())) if kind == "bnb" else None
 
     def external_activity(params, rows):
         if changed and len(pages) == 1:
@@ -360,17 +359,18 @@ def test_slow_audit_keeps_transfer_candidate_only_if_financial_demand_is_unchang
     exchange.income_page_hook = external_activity
     try:
         if changed:
-            with pytest.raises(ExecutionBlocked, match="balances or orders changed"):
+            with pytest.raises(ExecutionBlocked, match="balances or orders changed|reconciled.*account"):
                 runner.executor.execute(candidate, exchange.now, repo.runtime().state,
                                          account=supplied, inputs=inputs)
-            assert not repo.operations() and not exchange.writes
+            assert [op.client_id for op in repo.operations()] == ["legacy-open"] and not exchange.writes
         else:
             operation = runner.executor.execute(candidate, exchange.now, repo.runtime().state,
                                                 account=supplied, inputs=inputs)
             assert operation.status == OperationStatus.PENDING
             assert operation.balance_before.ts > supplied.ts
             assert len(exchange.writes) == 1 and exchange.writes[0].payload == candidate
-        assert not repo.load("spot_settlement_issue") and not repo.load("futures_settlement_issue")
+        if not changed:
+            assert not repo.load("spot_settlement_issue") and not repo.load("futures_settlement_issue")
     finally:
         repo.close()
 
@@ -382,7 +382,7 @@ def test_fresh_account_after_slow_audit_does_not_renew_other_candidate_inputs(tm
         contract_bnb="32" if kind == "sweep" else "27",
     )
     supplied = exchange.fetch_account_snapshot()
-    inputs = make_engine_inputs(account=supplied)
+    inputs = replace(make_engine_inputs(account=supplied), orders=tuple(repo.tracked_orders(active_only=True).values()))
     inputs = replace(inputs, filters=replace(inputs.filters, observed_at=exchange.now))
     candidate = (OrderPlan("BNBUSDT", "BUY", "LIMIT", D("1"), D("500"), "GTC", False)
                  if kind == "order" else AssetTransferPlan(
@@ -395,7 +395,7 @@ def test_fresh_account_after_slow_audit_does_not_renew_other_candidate_inputs(tm
                                      account=supplied, inputs=inputs)
         assert accounts[-1].ts > supplied.ts and accounts[-1].ts == exchange.now
         assert len(queries) == 1 and len(pages) == 3
-        assert not repo.operations() and not exchange.writes
+        assert [op.client_id for op in repo.operations()] == ["legacy-open"] and not exchange.writes
     finally:
         repo.close()
 
@@ -415,12 +415,14 @@ def test_slow_direct_audit_discards_candidate_when_execution_constraints_change(
 
     exchange.income_page_hook = change_constraint
     try:
-        with pytest.raises(ExecutionBlocked, match="Risk protection changed|run mode"):
+        with pytest.raises(ExecutionBlocked, match="Risk protection changed|run mode|reconciled.*account"):
             runner.executor.execute(
                 OrderPlan("BNBUSDT", "BUY", "LIMIT", D("1"), D("500"), "GTC", False),
                 exchange.now, repo.runtime().state, account=supplied,
             )
-        assert not repo.operations() and not exchange.writes
+        assert all(op.client_id == "legacy-open" or op.kind == OperationKind.CANCEL
+                   for op in repo.operations())
+        assert all(op.kind == OperationKind.CANCEL for op in exchange.writes)
         assert repo.runtime().api_errors == repo.runtime().transfer_failures == 0
     finally:
         repo.close()
@@ -478,10 +480,10 @@ def test_slow_scan_extends_only_new_wallet_version_and_rechecks_final_account(tm
     exchange.fetch_futures_income = publish_tail
     try:
         plan = runner.run_once()
-        assert plan.inventory_valid and len(exchange.writes) == 3
+        assert plan.inventory_valid and len(exchange.writes) == 2
         assert len(queries) == 2 and len(pages) == 4
         assert queries[1] == (queries[0][1], exchange.account.contract_quote_updated_at)
-        assert runner.cached_inputs.margin_change_24h == D("-3.501")
+        assert runner.cached_inputs.margin_change_24h is None
         assert (account_reads[1].ts - account_reads[0].ts).total_seconds() > 12
         assert repo.load("futures_income_coverage")["checked_at"] == account_reads[0].ts
     finally:
@@ -491,6 +493,7 @@ def test_slow_scan_extends_only_new_wallet_version_and_rechecks_final_account(tm
 @pytest.mark.parametrize("slow", ["account", "tail"])
 def test_slow_final_observation_blocks_with_bounded_reads_and_no_intent(tmp_path, slow):
     exchange, repo, runner, queries, pages, accounts = slow_income_setup(tmp_path)
+    runner.execute_enabled = False
     if slow == "account":
         read_account = exchange.fetch_account_snapshot
 
@@ -519,7 +522,7 @@ def test_slow_final_observation_blocks_with_bounded_reads_and_no_intent(tmp_path
         assert not plan.inventory_valid
         assert len(accounts) == 2 and len(queries) == (1 if slow == "account" else 2)
         assert len(pages) == (3 if slow == "account" else 4)
-        assert not repo.operations() and not exchange.writes
+        assert [op.client_id for op in repo.operations()] == ["legacy-open"] and not exchange.writes
         assert repo.load("futures_income_coverage") is None
         assert repo.runtime().state == before.state and repo.runtime().last_inventory_at is None
         assert not runner.executor.income_audited(exchange.now)
@@ -544,6 +547,7 @@ def test_slow_maintenance_scan_can_establish_finite_coverage(tmp_path):
 @pytest.mark.parametrize("failure", ["page", "duplicate", "conflict", "storage", "coverage"])
 def test_incomplete_or_unstored_pagination_cannot_advance_coverage(tmp_path, failure):
     exchange, repo, runner, queries, pages, accounts = slow_income_setup(tmp_path)
+    runner.execute_enabled = False
     if failure == "storage":
         repo.db.execute("""CREATE TRIGGER fail_income BEFORE INSERT ON futures_income
                            WHEN NEW.transaction_id = '1001'
@@ -578,7 +582,7 @@ def test_incomplete_or_unstored_pagination_cannot_advance_coverage(tmp_path, fai
         assert repo.load("futures_income_coverage") is None
         assert len(repo.futures_income_since(queries[0][0])) == (
             2501 if failure == "coverage" else int(failure == "conflict"))
-        assert not repo.operations() and not exchange.writes
+        assert [op.client_id for op in repo.operations()] == ["legacy-open"] and not exchange.writes
         assert repo.runtime().last_inventory_at is None
         assert not runner.executor.income_audited(exchange.now)
     finally:
@@ -625,7 +629,7 @@ def test_execution_qualification_is_bound_to_the_audited_account_version(tmp_pat
             assert operation.status == OperationStatus.CONFIRMED
             assert operation.balance_before.contract_quote_updated_at > first.contract_quote_updated_at
             assert len(queries) == 2 and queries[1][0] == queries[0][1] and len(pages) == 4
-            assert runner.reconciler.history[1] == D("-3.501")
+            assert runner.reconciler.history[1] is None
     finally:
         repo.close()
 

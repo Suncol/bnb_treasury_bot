@@ -10,10 +10,10 @@ from services.runner import Runner
 from storage.repository import Repository
 from tests.fake_exchange import FakeExchange
 from tests.helpers import D, make_account, make_strategy_config
-from tests.execution_helpers import setup
+from tests.execution_helpers import setup, legacy_open_bid
 
 
-def margin_setup(tmp_path, *, spot_usd="0", baseline_hours=24):
+def margin_setup(tmp_path, *, spot_usd="0", baseline_hours=24, strict=False):
     exchange = FakeExchange(make_account(
         contract_bnb=D("27"), contract_max_withdraw_amount=D("97000"),
         spot_usd=D(spot_usd),
@@ -31,6 +31,8 @@ def margin_setup(tmp_path, *, spot_usd="0", baseline_hours=24):
     exchange.fetch_account_snapshot = snapshot
     exchange, repo, runner = setup(tmp_path, exchange, ReplenishmentState.ACCUMULATE)
     repo.save_snapshot(replace(snapshot(), ts=baseline_at))
+    if strict:
+        legacy_open_bid(exchange, repo)
     return exchange, repo, runner
 
 
@@ -40,7 +42,7 @@ def test_reconciled_loss_keeps_full_spot_funded_replenishment(tmp_path, loss):
     exchange.futures_change("USDT", D(loss), "REALIZED_PNL")
     plan = runner.run_once()
     assert plan.inventory_valid and plan.active_buy_target == D("32")
-    assert runner.cached_inputs.margin_change_24h == D(loss)
+    assert runner.cached_inputs.margin_change_24h is None
     assert len(exchange.writes) == 3
     assert all(op.kind == OperationKind.ORDER for op in exchange.writes)
     assert sum((op.payload.qty for op in exchange.writes), D("0")) == D("5")
@@ -62,14 +64,14 @@ def test_normal_funding_keeps_target_32_and_real_money_limits(tmp_path, warm_cac
     if warm_cache:
         exchange.futures_change("USDT", D("-1"), "COMMISSION")
         runner.execute_enabled = False
-        assert runner.run_once(inventory_cycle=False).inventory_valid and len(calls) == 1
+        assert runner.run_once(inventory_cycle=False).inventory_valid and not calls
         exchange.now += timedelta(seconds=1)
         runner.execute_enabled = True
     batch_started = exchange.now
     plan = runner.run_once()
     assert plan is not None and plan.inventory_valid
     assert plan.active_buy_target == D("32")
-    assert runner.cached_inputs.margin_change_24h == (-D("1") if warm_cache else D("0"))
+    assert runner.cached_inputs.margin_change_24h is None
     assert runner.cached_inputs.account.contract_max_withdraw_amount == D("94000")
     assert repo.budget_used(exchange.now, "USDT") == D("3000")
     funding = [op for op in exchange.writes if op.kind == OperationKind.TRANSFER]
@@ -78,11 +80,8 @@ def test_normal_funding_keeps_target_32_and_real_money_limits(tmp_path, warm_cac
     assert orders and sum((o.qty * o.price for o in orders), D("0")) <= D("3000")
     assert sum((o.qty for o in orders), D("0")) <= D("5")
     assert not repo.operations(unresolved_only=True)
-    assert len(calls) == (3 if warm_cache else 1)
-    if warm_cache:
-        assert calls[1] == calls[0]  # One full read for the new batch.
-        assert calls[2][0] == calls[1][1] < calls[2][1]  # Funding only adds an increment.
-        assert repo.load("futures_income_coverage")["checked_at"] == batch_started
+    assert len(calls) == 1  # Only the new funding settlement needs income.
+    assert repo.load("futures_income_coverage")["checked_at"] >= batch_started
     repo.close()
 
 
@@ -114,10 +113,10 @@ def test_manual_settled_transfers_do_not_change_loss_signal_across_restart(
     for _ in range(2):
         plan = runner.run_once(inventory_cycle=False)
         assert plan is not None and plan.inventory_valid
-        assert runner.cached_inputs.margin_change_24h == D(expected)
+        assert runner.cached_inputs.margin_change_24h is None
         assert plan.active_buy_target == D("32")
     assert not exchange.writes
-    assert len(repo.futures_income_since(exchange.now - timedelta(hours=24))) == (2 if D(loss) else 1)
+    assert len(repo.futures_income_since(exchange.now - timedelta(hours=24))) == 0  # Idle external history is not queried.
     repo.close()
 
 
@@ -138,7 +137,7 @@ def external_transfer(exchange, amount, loss="0"):
 
 @pytest.mark.parametrize("amount,loss", [("-3000", "0"), ("3000", "-1000")])
 def test_split_margin_and_quote_observations_block_then_recover(tmp_path, amount, loss):
-    exchange, repo, runner = margin_setup(tmp_path, spot_usd="5000")
+    exchange, repo, runner = margin_setup(tmp_path, strict=True, spot_usd="5000")
     before = exchange.fetch_account_snapshot()
     external_transfer(exchange, amount, loss)
     read = exchange.fetch_account_snapshot
@@ -155,7 +154,7 @@ def test_split_margin_and_quote_observations_block_then_recover(tmp_path, amount
     exchange.fetch_account_snapshot = read
     recovered = runner.run_once()
     assert recovered.inventory_valid
-    assert runner.cached_inputs.margin_change_24h == D(loss)
+    assert runner.cached_inputs.margin_change_24h is None
     assert recovered.active_buy_target == D("32")
     assert not exchange.writes
     repo.close()
@@ -163,7 +162,7 @@ def test_split_margin_and_quote_observations_block_then_recover(tmp_path, amount
 
 @pytest.mark.parametrize("loss,missing", [("-1000", "loss"), ("-3000", "all")])
 def test_missing_income_freezes_checkpoint_and_retries_after_restart(tmp_path, loss, missing):
-    exchange, repo, runner = margin_setup(tmp_path, spot_usd="5000")
+    exchange, repo, runner = margin_setup(tmp_path, strict=True, spot_usd="5000")
     checkpoint = repo.load("spot_checkpoint")
     external_transfer(exchange, "3000", loss)
     receipts = exchange.income[:]
@@ -188,7 +187,7 @@ def test_missing_income_freezes_checkpoint_and_retries_after_restart(tmp_path, l
             )
     exchange.income = receipts
     plan = runner.run_once()
-    assert plan.inventory_valid and runner.cached_inputs.margin_change_24h == D(loss)
+    assert plan.inventory_valid and runner.cached_inputs.margin_change_24h is None
     assert plan.active_buy_target == D("32")
     assert repo.wallet_cursor() == 1
     assert len(repo.futures_income_since(checkpoint["account"].ts)) == 2
@@ -197,7 +196,7 @@ def test_missing_income_freezes_checkpoint_and_retries_after_restart(tmp_path, l
 
 
 def test_verified_income_window_is_reused_and_extended_across_restart(tmp_path):
-    exchange, repo, runner = margin_setup(tmp_path, spot_usd="5000")
+    exchange, repo, runner = margin_setup(tmp_path, strict=True, spot_usd="5000")
     external_transfer(exchange, "3000", "-1000")
     calls, read = [], exchange.fetch_futures_income
 
@@ -222,12 +221,12 @@ def test_verified_income_window_is_reused_and_extended_across_restart(tmp_path):
     assert runner.run_once(inventory_cycle=False).inventory_valid
     assert len(calls) == 2 and calls[1][0] == first[1]
     assert calls[1][1] - calls[1][0] < timedelta(seconds=3)
-    assert runner.cached_inputs.margin_change_24h == D("-1001")
+    assert runner.cached_inputs.margin_change_24h is None
     repo.close()
 
 
 def test_income_read_failure_does_not_advance_verified_coverage(tmp_path):
-    exchange, repo, runner = margin_setup(tmp_path, spot_usd="5000")
+    exchange, repo, runner = margin_setup(tmp_path, strict=True, spot_usd="5000")
     external_transfer(exchange, "3000", "-1000")
     runner.execute_enabled = False
     assert runner.run_once(inventory_cycle=False).inventory_valid
@@ -244,7 +243,7 @@ def test_income_read_failure_does_not_advance_verified_coverage(tmp_path):
     assert repo.load("futures_income_coverage") == coverage
     exchange.fetch_futures_income = read
     assert runner.reconciler.refresh(exchange.now)[3]
-    assert runner.reconciler.history[1] == D("-1001")
+    assert runner.reconciler.history[1] is None
     repo.close()
 
 
@@ -274,7 +273,7 @@ def test_verified_futures_income_is_reused_while_spot_balance_lags(tmp_path):
 
 
 def test_missing_tail_receipt_preserves_verified_prefix_and_repairs_only_tail(tmp_path):
-    exchange, repo, runner = margin_setup(tmp_path, spot_usd="5000")
+    exchange, repo, runner = margin_setup(tmp_path, strict=True, spot_usd="5000")
     external_transfer(exchange, "3000", "-1000")
     calls, read = [], exchange.fetch_futures_income
 
@@ -295,7 +294,7 @@ def test_missing_tail_receipt_preserves_verified_prefix_and_repairs_only_tail(tm
         assert coverage["until"] - prefix["until"] <= timedelta(seconds=1)
     exchange.income.append(missing)
     assert runner.run_once(inventory_cycle=False).inventory_valid
-    assert runner.cached_inputs.margin_change_24h == D("-1001")
+    assert runner.cached_inputs.margin_change_24h is None
     assert all(until - since < timedelta(seconds=2) for since, until in calls[1:])
     repo.close()
 
@@ -310,7 +309,7 @@ def test_unsupported_multi_asset_margin_cannot_hide_loss_or_fund_new_buys(tmp_pa
     runner.execute_enabled = False
     plan = runner.run_once()
     assert not plan.inventory_valid and not plan.transfer_decision.allow
-    assert not plan.buy_plan.orders and repo.load("futures_settlement_issue")["margin"]
+    assert not plan.buy_plan.orders and repo.load("futures_settlement_issue")["observation"]
     assert not exchange.writes
     repo.close()
 
@@ -343,7 +342,7 @@ def test_unknown_funding_remains_unknown_with_income_coverage_after_restart(tmp_
 
 @pytest.mark.parametrize("invalid", ["stale", "nonfinite", "orders"])
 def test_invalid_observation_preserves_futures_gate_and_blocks_direct_writes(tmp_path, invalid):
-    exchange, repo, runner = margin_setup(tmp_path, spot_usd="5000")
+    exchange, repo, runner = margin_setup(tmp_path, strict=True, spot_usd="5000")
     external_transfer(exchange, "3000", "-1000")
     receipts = exchange.income[:]
     exchange.income = [r for r in receipts if r.income_type != "REALIZED_PNL"]
@@ -383,7 +382,7 @@ def test_invalid_observation_preserves_futures_gate_and_blocks_direct_writes(tmp
         with pytest.raises(RuntimeError, match="reconciled"):
             runner.executor.execute(payload, exchange.now, repo.runtime().state, account=read_account())
     plan = runner.run_once(inventory_cycle=False)
-    assert plan.inventory_valid and runner.cached_inputs.margin_change_24h == D("-1000")
+    assert plan.inventory_valid and runner.cached_inputs.margin_change_24h is None
     assert not repo.load("futures_settlement_issue") and not exchange.writes
     repo.close()
 
@@ -414,7 +413,7 @@ def test_direct_execution_validates_its_account_without_an_extra_read(tmp_path, 
 ])
 @pytest.mark.parametrize("baseline_hours", [0, 24])
 def test_other_capital_income_blocks_buys_and_reuses_coverage_after_restart(tmp_path, kind, baseline_hours):
-    exchange, repo, runner = margin_setup(tmp_path, spot_usd="5000", baseline_hours=baseline_hours)
+    exchange, repo, runner = margin_setup(tmp_path, strict=True, spot_usd="5000", baseline_hours=baseline_hours)
     checkpoint = repo.load("spot_checkpoint")
     exchange.futures_change("USDT", D("3000"), kind)
     exchange.futures_change("USDT", D("-1000"), "REALIZED_PNL")
@@ -450,7 +449,7 @@ def test_other_capital_income_blocks_buys_and_reuses_coverage_after_restart(tmp_
 @pytest.mark.parametrize("baseline_hours", [0, 24])
 @pytest.mark.parametrize("missing", ["both", "income", "transfers"])
 def test_late_round_trip_receipts_replay_earlier_checkpoint_after_restart(tmp_path, baseline_hours, missing):
-    exchange, repo, runner = margin_setup(tmp_path, spot_usd="5000", baseline_hours=baseline_hours)
+    exchange, repo, runner = margin_setup(tmp_path, strict=True, spot_usd="5000", baseline_hours=baseline_hours)
     initial = exchange.fetch_account_snapshot()
     external_transfer(exchange, "3000")
     external_transfer(exchange, "-3000")
@@ -487,7 +486,7 @@ def test_late_round_trip_receipts_replay_earlier_checkpoint_after_restart(tmp_pa
         plan = runner.run_once(inventory_cycle=False)
     assert plan.inventory_valid
     expected = D("-1") if missing == "both" else D("0")
-    assert runner.cached_inputs.margin_change_24h == (expected if baseline_hours == 24 else None)
+    assert runner.cached_inputs.margin_change_24h is None
     assert not repo.load("futures_settlement_issue") and repo.wallet_cursor() == 2
     assert repo.load("spot_checkpoint")["cursor"] == 2
     assert len(repo.futures_income_since(calls[0][0])) == len(receipts)
@@ -501,7 +500,7 @@ def test_late_round_trip_receipts_replay_earlier_checkpoint_after_restart(tmp_pa
 
 
 def test_foreign_currency_policy_keeps_verified_income_coverage_across_restart(tmp_path):
-    exchange, repo, runner = margin_setup(tmp_path, spot_usd="5000")
+    exchange, repo, runner = margin_setup(tmp_path, strict=True, spot_usd="5000")
     exchange.futures_change("USDT", D("-1000"), "REALIZED_PNL")
     exchange.transfers["usdc"] = TransferRecord(
         "usdc", "USDC", D("3000"), "SPOT", "USDⓈ-M Futures", exchange.now, OperationStatus.CONFIRMED,
@@ -534,7 +533,7 @@ def test_foreign_currency_policy_keeps_verified_income_coverage_across_restart(t
 
 
 def test_late_old_foreign_round_trip_recovers_without_current_conversion_gate(tmp_path):
-    exchange, repo, runner = margin_setup(tmp_path, spot_usd="5000")
+    exchange, repo, runner = margin_setup(tmp_path, strict=True, spot_usd="5000")
     original = exchange.fetch_account_snapshot()
     repo.save_snapshot(replace(original, ts=exchange.now - timedelta(hours=48),
                                contract_quote_updated_at=exchange.now - timedelta(hours=48)))
@@ -564,7 +563,7 @@ def test_late_old_foreign_round_trip_recovers_without_current_conversion_gate(tm
     runner = Runner(exchange, repo, make_strategy_config(), clock=lambda: exchange.now, execute=False)
     for _ in range(3):
         plan = runner.run_once(inventory_cycle=False)
-        assert plan.inventory_valid and runner.cached_inputs.margin_change_24h == D("-1")
+        assert plan.inventory_valid and runner.cached_inputs.margin_change_24h is None
         assert not repo.load("futures_settlement_issue")
     assert repo.load("spot_checkpoint")["cursor"] == repo.wallet_cursor() == 2
     assert len(calls) == 2 and calls[1][0] < credit.ts
@@ -573,7 +572,7 @@ def test_late_old_foreign_round_trip_recovers_without_current_conversion_gate(tm
 
 
 def partial_capital_setup(tmp_path, *, baseline_hours=24):
-    exchange, repo, runner = margin_setup(tmp_path, spot_usd="5000", baseline_hours=baseline_hours)
+    exchange, repo, runner = margin_setup(tmp_path, strict=True, spot_usd="5000", baseline_hours=baseline_hours)
     exchange.futures_change("USDT", D("3000"), "INTERNAL_TRANSFER")
     exchange.futures_change("USDT", D("-3000"), "REALIZED_PNL")
     exchange.futures_change("USDT", D("-1"), "COMMISSION")
@@ -615,7 +614,7 @@ def test_partial_income_is_rechecked_on_persisted_deadline_after_restart(tmp_pat
     assert not plan.inventory_valid and not plan.buy_plan.orders and not plan.transfer_decision.allow
     assert len(calls) == 3 and calls[2][0] == calls[0][0]
     assert len(repo.futures_income_since(calls[0][0])) == 4
-    assert repo.load("futures_settlement_issue")["margin"]["income_types"] == ("INTERNAL_TRANSFER",)
+    assert repo.load("futures_settlement_issue")["window"]["income_types"] == ("INTERNAL_TRANSFER",)
     for _ in range(3):
         assert not runner.run_once(inventory_cycle=False).inventory_valid
     assert len(calls) == 3 and not exchange.writes
@@ -647,7 +646,7 @@ def test_new_inventory_batch_rechecks_partial_income_before_advancing_state(
     assert all(s in retained for s in snapshots)
     assert all(s.ts < exchange.now for s in retained)
     assert repo.runtime().last_inventory_at is None
-    assert repo.load("futures_settlement_issue") and not repo.operations() and not exchange.writes
+    assert repo.load("futures_settlement_issue") and [op.client_id for op in repo.operations()] == ["legacy-open"] and not exchange.writes
     repo.close()
 
 
@@ -668,11 +667,11 @@ def test_direct_execution_rechecks_partial_income_and_funding_account(tmp_path, 
         return accounts[-1]
 
     exchange.fetch_account_snapshot = final_account
-    with pytest.raises(RuntimeError, match="reconciled futures income"):
+    with pytest.raises(RuntimeError, match="reconciled.*account"):
         runner.executor.execute(payload, exchange.now, repo.runtime().state, account=account)
     assert len(calls) == 2 and repo.load("futures_settlement_issue")
-    assert len(accounts) == int(isinstance(payload, AssetTransferPlan))
-    assert not repo.operations() and not exchange.writes
+    assert len(accounts) == 1
+    assert [op.client_id for op in repo.operations()] == ["legacy-open"] and not exchange.writes
     repo.close()
 
 
@@ -694,7 +693,7 @@ def test_failed_income_recheck_cannot_extend_lease_or_create_an_intent(tmp_path)
             AssetTransferPlan("USDT", D("500"), "USDⓈ-M Futures", "SPOT", "test"),
             exchange.now, repo.runtime().state,
         )
-    assert repo.load("futures_income_coverage") == coverage and not repo.operations()
+    assert repo.load("futures_income_coverage") == coverage and [op.client_id for op in repo.operations()] == ["legacy-open"]
     exchange.fetch_futures_income = read
     exchange.income = receipts
     assert not runner.run_once(inventory_cycle=False).inventory_valid
@@ -724,7 +723,7 @@ def test_new_execution_batch_audits_cached_income_once_for_all_orders(
     tmp_path, new_wallet_version, inventory_cycle
 ):
     # Fund the full target from spot even after the manual transfer to futures.
-    exchange, repo, runner = margin_setup(tmp_path, spot_usd="10000")
+    exchange, repo, runner = margin_setup(tmp_path, strict=True, spot_usd="10000")
     external_transfer(exchange, "3000", "-1000")
     calls, read = [], exchange.fetch_futures_income
 
@@ -742,14 +741,14 @@ def test_new_execution_batch_audits_cached_income_once_for_all_orders(
     runner.execute_enabled = True
     plan = runner.run_once(inventory_cycle=inventory_cycle)
     assert plan.inventory_valid and plan.active_buy_target == D("32")
-    assert len(exchange.writes) == 3 and all(op.kind == OperationKind.ORDER for op in exchange.writes)
+    assert len(exchange.writes) == 2 and all(op.kind == OperationKind.ORDER for op in exchange.writes)
     assert len(calls) == 2 and calls[1] == (calls[0][0], exchange.account.contract_quote_updated_at)
     assert not repo.operations(unresolved_only=True)
     repo.close()
 
 
 def test_new_wallet_version_without_income_cannot_verify_a_hidden_capital_offset(tmp_path):
-    exchange, repo, runner = margin_setup(tmp_path, spot_usd="5000")
+    exchange, repo, runner = margin_setup(tmp_path, strict=True, spot_usd="5000")
     checkpoint = repo.load("spot_checkpoint")
     exchange.futures_change("USDT", D("3000"), "INTERNAL_TRANSFER")
     exchange.futures_change("USDT", D("-3000"), "REALIZED_PNL")

@@ -333,6 +333,8 @@ def test_late_declared_trades_rewind_to_frozen_checkpoint(tmp_path, delay):
     ex, path = funded(), tmp_path / "late.db"
     repo = Repository(path)
     initialize(repo, ex)
+    from tests.execution_helpers import legacy_open_bid
+    legacy_open_bid(ex, repo)
     refresh(repo, ex, cfg)
     ex.now += timedelta(seconds=1)
     ex.fills.append(Fill("ETHUSDT", "late", "external", ex.now, D("1"), base_asset="ETH",

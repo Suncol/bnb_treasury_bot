@@ -60,6 +60,21 @@ def sdk(monkeypatch):
     return adapter, calls, responses
 
 
+def sdk_executor(adapter, repo, cfg, **kwargs):
+    executor = Executor(adapter, repo, cfg, **kwargs)
+    checkpoint = repo.load("spot_checkpoint")
+    if checkpoint is not None and checkpoint["account"].contract_total_margin_balance is None:
+        # Mutation protocol tests supply a virtual account. Exercise the new
+        # full preparation against that same virtual exchange, while writes,
+        # transport quotas and unknown-result queries still use the real SDK.
+        observed = FakeExchange(checkpoint["account"])
+        observed.fetch_open_orders = lambda symbol: tuple(
+            order for order in repo.tracked_orders(active_only=True).values()
+            if order.symbol == symbol and order.is_open)
+        Reconciler(observed, repo, cfg, clock=adapter.clock, executor=executor)
+    return executor
+
+
 def operation(kind, payload):
     return Operation("bt-01234567890123456789012345678901", kind, "scope", payload, NOW)
 
@@ -408,7 +423,7 @@ def test_sdk_definite_order_rejection_does_not_block_next_order(
     repo = Repository(tmp_path / "sdk.sqlite3")
     repo.initialize_spot_checkpoint(FakeExchange().fetch_account_snapshot(), {"operator": "test", "reason": "quiescent fixture"})
     repo.save("runtime", replace(repo.runtime(), resume_replenishment=True, resume_replanning=True))
-    executor = Executor(adapter, repo, make_strategy_config())
+    executor = sdk_executor(adapter, repo, make_strategy_config())
     rejected = executor.execute(
         payload,
         NOW,
@@ -469,7 +484,7 @@ def test_ambiguous_sdk_rejections_and_absence_keep_journal_unresolved(
     payload = OrderPlan("BNBUSDT", "BUY", "LIMIT_MAKER", D("1"), D("600"), "GTC", True)
     repo = Repository(tmp_path / "sdk.sqlite3")
     repo.initialize_spot_checkpoint(FakeExchange().fetch_account_snapshot(), {"operator": "test", "reason": "quiescent fixture"})
-    executor = Executor(adapter, repo, make_strategy_config())
+    executor = sdk_executor(adapter, repo, make_strategy_config())
     unresolved = executor.execute(
         payload,
         NOW,
@@ -495,7 +510,7 @@ def test_matching_engine_reason_in_server_error_never_proves_rejection(sdk, tmp_
     repo = Repository(tmp_path / "server-error.db")
     account = FakeExchange().fetch_account_snapshot()
     repo.initialize_spot_checkpoint(account, {"operator": "test", "reason": "quiescent fixture"})
-    result = Executor(adapter, repo, make_strategy_config()).execute(
+    result = sdk_executor(adapter, repo, make_strategy_config()).execute(
         OrderPlan("BNBUSDT", "BUY", "LIMIT_MAKER", D("1"), D("600"), "GTC", True),
         NOW, ReplenishmentState.ACCUMULATE, account=account,
     )
@@ -539,7 +554,7 @@ def test_order_rejection_allowlist_requires_complete_protocol_match(sdk, tmp_pat
     repo = Repository(tmp_path / "protocol-scope.db")
     account = funding_account_responses(sdk) if case == "transfer" else FakeExchange().fetch_account_snapshot()
     repo.initialize_spot_checkpoint(account, {"operator": "test", "reason": "quiescent fixture"})
-    result = Executor(adapter, repo, make_strategy_config()).execute(
+    result = sdk_executor(adapter, repo, make_strategy_config()).execute(
         payload, NOW, ReplenishmentState.ACCUMULATE, account=account,
     )
     assert result.status == OperationStatus.UNKNOWN and not result.not_sent
@@ -556,7 +571,7 @@ def test_persistent_account_permission_rejections_pause_once_per_intent(sdk, tmp
     repo = Repository(tmp_path / "permission.db")
     account = FakeExchange().fetch_account_snapshot()
     repo.initialize_spot_checkpoint(account, {"operator": "test", "reason": "quiescent fixture"})
-    executor = Executor(adapter, repo, make_strategy_config())
+    executor = sdk_executor(adapter, repo, make_strategy_config())
     payload = OrderPlan("BNBUSDT", "BUY", "LIMIT_MAKER", D("1"), D("600"), "GTC", True)
     for expected in (1, 2, 3):
         result = executor.execute(payload, NOW, ReplenishmentState.ACCUMULATE, account=account)
@@ -582,7 +597,7 @@ def test_definite_transfer_limit_rejection_can_reconcile_and_counts_failures(
     repo = Repository(tmp_path / "sdk.sqlite3")
     account = funding_account_responses(sdk)
     repo.initialize_spot_checkpoint(account, {"operator": "test", "reason": "quiescent fixture"})
-    executor = Executor(adapter, repo, make_strategy_config())
+    executor = sdk_executor(adapter, repo, make_strategy_config())
     payload = AssetTransferPlan("USDT", D("500"), "USDⓈ-M Futures", "SPOT", "fund")
     for attempt in range(2):
         op = executor.execute(
@@ -610,7 +625,7 @@ def test_uncertain_transfer_responses_keep_the_gate_closed(sdk, tmp_path, status
     repo = Repository(tmp_path / "sdk.sqlite3")
     account = funding_account_responses(sdk)
     repo.initialize_spot_checkpoint(account, {"operator": "test", "reason": "quiescent fixture"})
-    executor = Executor(adapter, repo, make_strategy_config())
+    executor = sdk_executor(adapter, repo, make_strategy_config())
     payload = AssetTransferPlan("USDT", D("500"), "USDⓈ-M Futures", "SPOT", "fund")
     op = executor.execute(
         payload,
@@ -970,7 +985,7 @@ def test_request_weight_reserves_capacity_for_cancel_without_creating_unsent_int
     )
     adapter._call(adapter.spot.exchange_info, symbol="BNBUSDT")
     repo = Repository(tmp_path / "budget.db")
-    executor = Executor(adapter, repo, make_strategy_config())
+    executor = sdk_executor(adapter, repo, make_strategy_config())
     with pytest.raises(RequestDeferred):
         executor.execute(
             OrderPlan("BNBUSDT", "BUY", "LIMIT", D("1"), D("600"), "IOC", False),
@@ -1000,7 +1015,7 @@ def test_write_rate_limit_persists_cooldown_with_unknown_intent(sdk, tmp_path):
     path = tmp_path / "limited.db"
     repo = Repository(path)
     repo.initialize_spot_checkpoint(FakeExchange().fetch_account_snapshot(), {"operator": "test", "reason": "quiescent fixture"})
-    result = Executor(adapter, repo, make_strategy_config(), clock=lambda: NOW).execute(
+    result = sdk_executor(adapter, repo, make_strategy_config(), clock=lambda: NOW).execute(
         OrderPlan("BNBUSDT", "BUY", "LIMIT", D("1"), D("600"), "IOC", False),
         NOW,
         ReplenishmentState.URGENT,
@@ -1052,7 +1067,7 @@ def test_quota_exhausted_after_intent_is_audited_as_not_sent(sdk, tmp_path, acti
         return submit(op)
 
     adapter.submit = concurrent_public_response
-    result = Executor(adapter, repo, make_strategy_config(), clock=lambda: NOW).execute(
+    result = sdk_executor(adapter, repo, make_strategy_config(), clock=lambda: NOW).execute(
         payload, NOW, ReplenishmentState.URGENT, account=account,
         starts_slice=action == "buy", resume_replanning=action == "bnb",
     )
@@ -1096,7 +1111,7 @@ def test_unsent_cancel_recovery_preserves_identity_and_real_attempts(sdk, tmp_pa
     repo = Repository(path)
     account = FakeExchange().fetch_account_snapshot()
     repo.initialize_spot_checkpoint(account, {"operator": "test", "reason": "quiescent fixture"})
-    executor = Executor(adapter, repo, make_strategy_config())
+    executor = sdk_executor(adapter, repo, make_strategy_config())
     responses["POST", "/api/v3/order"] = (200, {"orderId": 123, "status": "NEW"})
     buy = executor.execute(
         OrderPlan("BNBUSDT", "BUY", "LIMIT_MAKER", D("1"), D("590"), "GTC", True),
@@ -1140,7 +1155,7 @@ def test_unsent_cancel_recovery_preserves_identity_and_real_attempts(sdk, tmp_pa
         assert result.cancel_retry_at == now[0] + timedelta(seconds=90)
         repo.close()
         repo = Repository(path)
-        executor = Executor(adapter, repo, make_strategy_config())
+        executor = sdk_executor(adapter, repo, make_strategy_config())
         assert repo.cancel_operation("BNBUSDT", "123") == result
     assert sum(call["method"] == "DELETE" for call in calls) == 1
     adapter.submit = submit
@@ -1172,7 +1187,7 @@ def test_only_transport_preflight_proves_unsent_order(sdk, tmp_path, failure):
     account = FakeExchange().fetch_account_snapshot()
     repo.initialize_spot_checkpoint(account, {"operator": "test", "reason": "quiescent fixture"})
     repo.save("runtime", replace(repo.runtime(), resume_replenishment=True))
-    result = Executor(adapter, repo, make_strategy_config()).execute(
+    result = sdk_executor(adapter, repo, make_strategy_config()).execute(
         OrderPlan("BNBUSDT", "BUY", "LIMIT", D("1"), D("600"), "IOC", False),
         NOW, ReplenishmentState.URGENT, account=account,
     )
@@ -1183,7 +1198,7 @@ def test_only_transport_preflight_proves_unsent_order(sdk, tmp_path, failure):
     repo = Repository(path)
     assert repo.operations(unresolved_only=True) == (result,)
     with pytest.raises((RuntimeError, RequestDeferred)):
-        Executor(adapter, repo, make_strategy_config()).execute(
+        sdk_executor(adapter, repo, make_strategy_config()).execute(
             result.payload, NOW, ReplenishmentState.URGENT, account=account,
         )
     assert len(calls) == 1

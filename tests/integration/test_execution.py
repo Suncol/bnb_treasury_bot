@@ -308,6 +308,7 @@ def test_failed_unknown_query_does_not_skip_known_protective_cancels(tmp_path):
             "transfer:fund",
             AssetTransferPlan("USDT", D("500"), "USDⓈ-M Futures", "SPOT", "test"),
             exchange.now,
+            settlement_epoch=repo.settlement_epoch(),
         )
     )
     query = exchange.query_operation

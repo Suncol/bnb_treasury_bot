@@ -10,7 +10,7 @@ from tests.helpers import D, make_account
 from tests.fake_exchange import FakeExchange
 
 
-@pytest.mark.parametrize("cause", ["spot", "history", "observation"])
+@pytest.mark.parametrize("cause", ["spot", "observation"])
 def test_distinct_durable_blockers_protect_runner_and_direct_execution(tmp_path, monkeypatch, cause):
     exchange, repo, runner = setup(tmp_path, FakeExchange(make_account(
         contract_bnb=D("27"), spot_usd=D("5000"))), ReplenishmentState.ACCUMULATE)
@@ -18,9 +18,6 @@ def test_distinct_durable_blockers_protect_runner_and_direct_execution(tmp_path,
         seed_bid(exchange, repo)
         runner.reconciler.refresh(exchange.now)
         exchange.account = replace(exchange.account, spot_usd=D("5100"))
-    elif cause == "history":
-        monkeypatch.setattr("services.reconciliation.historical_metrics",
-                            lambda *args, **kwargs: (D("0"), None, {"reason": "missing historical evidence"}))
     else:
         read = exchange.fetch_account_snapshot
         exchange.fetch_account_snapshot = lambda: replace(read(), ts=exchange.now - timedelta(seconds=20))
@@ -48,4 +45,15 @@ def test_open_accepted_order_is_not_an_unknown_submission(tmp_path):
     assert not reconciliation_status(repo).blocked
     assert repo.operation(op.client_id).kind == OperationKind.ORDER
     assert repo.operations(active_only=True)
+    repo.close()
+
+
+def test_historical_diagnostics_do_not_reintroduce_inventory_gate(tmp_path):
+    exchange, repo, runner = setup(tmp_path)
+    repo.save("futures_settlement_issue", {"margin": {"reason": "unavailable historical metric"}})
+    assert reconciliation_status(repo).historical_diagnostics
+    assert not reconciliation_status(repo).blocked
+    runner.execute_enabled = False
+    assert runner.run_once().inventory_valid
+    assert repo.runtime().last_inventory_at is not None
     repo.close()

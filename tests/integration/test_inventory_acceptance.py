@@ -49,7 +49,7 @@ def test_open_gtc_rejects_balance_first_and_delayed_order_views_after_restart(tm
             repo = Repository(tmp_path / "test.sqlite3")
             runner = Runner(exchange, repo, make_strategy_config(), clock=lambda: exchange.now)
         assert runner.reconciler.refresh(exchange.now)[2].unresolved
-        assert repo.settlement_epoch() == 0
+        assert repo.settlement_epoch() == op.settlement_epoch
         assert reconciliation_status(repo).strict_window
     exchange.fetch_open_orders = read
     exchange.hide_fills = False
@@ -69,7 +69,7 @@ def test_retired_order_contradictory_fill_cannot_be_external_inventory(tmp_path)
     exchange.account = replace(exchange.account, spot_bnb=exchange.account.spot_bnb+D("1"))
     assert not runner.reconciler.refresh(exchange.now)[3]
     assert repo.operation(op.client_id).balance_pending
-    assert repo.settlement_epoch() == 0
+    assert repo.settlement_epoch() == op.settlement_epoch
     repo.close()
 
 
@@ -120,5 +120,5 @@ def test_imported_retired_owned_fill_reopens_responsibility_before_polling(tmp_p
     assert repo.operation(op.client_id).balance_pending
     exchange.account = replace(exchange.account, spot_bnb=exchange.account.spot_bnb+D("1"))
     assert not runner.reconciler.refresh(exchange.now)[3]
-    assert repo.settlement_epoch() == 0
+    assert repo.settlement_epoch() == op.settlement_epoch
     repo.close()

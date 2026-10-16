@@ -70,6 +70,12 @@ def settlement_baselines(repository, samples, before, account, asset):
     """Try the nearest retained checkpoint only after the original proof fails."""
     version = "contract_bnb_updated_at" if asset == "BNB" else "contract_quote_updated_at"
     lower = utc(getattr(before, version) or before.ts)
+    boundary = repository.load("spot_acceptance")
+    if boundary is not None:
+        samples = tuple(s for s in samples
+                        if utc(s.ts) >= utc(boundary["account"].ts)
+                        and s.wallet_event_cursor is not None
+                        and s.wallet_event_cursor >= boundary["cursor"])
     if before.wallet_event_cursor is not None and any(
         (t.asset == asset or asset != "BNB" and t.asset != "BNB")
         and utc(t.ts) <= lower
@@ -170,8 +176,9 @@ def _settlement_evidence(repository, before, account, asset, anchor):
         before.wallet_event_cursor is None
         or 0 <= before.wallet_event_cursor <= through <= repository.wallet_cursor()
     )
+    ambiguous = repository.ambiguous_income(covered_income)
     valid = (
-        previous is not None and actual is not None
+        not ambiguous and previous is not None and actual is not None
         and previous.is_finite() and actual.is_finite()
         and lower <= utc(before.ts) + timedelta(seconds=1)
         and lower <= upper <= utc(account.ts) + timedelta(seconds=1)
@@ -187,6 +194,7 @@ def _settlement_evidence(repository, before, account, asset, anchor):
         and expected == actual and wallet_flows == income_flows
     )
     return valid, anchor, {
+        "ambiguous_receipts": ambiguous,
         "asset": asset, "before": previous, "expected": expected, "actual": actual,
         "from": lower, "through": upper,
         "since": since,

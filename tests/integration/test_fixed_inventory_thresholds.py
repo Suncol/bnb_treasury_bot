@@ -28,7 +28,7 @@ def test_legacy_urgent_exits_with_valid_cycles_after_restart(tmp_path, monkeypat
     exchange, repo, runner = setup(tmp_path, FakeExchange(make_account(
         contract_bnb=D("27"), spot_usd=D("0"))), ReplenishmentState.URGENT)
     runner.execute_enabled = False
-    monkeypatch.setattr("services.reconciliation.historical_metrics",
+    monkeypatch.setattr("services.history.historical_metrics",
                         lambda *a, **kw: (D("100000"), None, None))
     runner.run_once()
     assert repo.runtime().state == ReplenishmentState.URGENT

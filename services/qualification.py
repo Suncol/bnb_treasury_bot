@@ -20,10 +20,8 @@ class ReconciliationStatus:
 
     @property
     def blocked(self):
-        # Compatibility policy: all former blockers still apply in phase 01.
         return bool(not self.initialized or self.own_operations or self.observation
-                    or self.spot_settlement or self.futures_settlement
-                    or self.historical_diagnostics)
+                    or self.spot_settlement or self.futures_settlement)
 
     def describe(self):
         return asdict(self)

@@ -178,7 +178,7 @@ def test_consumption_estimate_removes_transfer_inflows(tmp_path):
     list(range(360, -1, -30)),
     [360, 359, 300, 120, 119, 1, 0],
 ])
-def test_bursty_consumption_uses_window_average_and_accelerates_active_replenishment(
+def test_bursty_consumption_remains_diagnostic_under_fixed_inventory_thresholds(
     tmp_path, minutes
 ):
     repo = Repository(tmp_path / "journal.db")
@@ -195,8 +195,8 @@ def test_bursty_consumption_uses_window_average_and_accelerates_active_replenish
         make_engine_inputs(account=account, consumption_rate=rate,
                            previous_state=ReplenishmentState.WATCH), make_strategy_config()
     )
-    assert plan.state_decision.confirmed_state == ReplenishmentState.URGENT
-    assert plan.state_decision.t_depletion == D("3.4") / D("0.6")
+    assert plan.state_decision.confirmed_state == ReplenishmentState.WATCH
+    assert plan.state_decision.t_depletion is None
 
 
 def test_consumption_combines_full_window_rates_and_preserves_margin_change(tmp_path):

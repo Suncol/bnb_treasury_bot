@@ -123,9 +123,22 @@ class Executor:
                 and (account is None or account == self._income_account)
                 and valid_account_snapshot(self._income_account, now, self.cfg))
 
+    def begin_preparation(self, now):
+        self.income_scan(now)  # Also detects clock rollback within the batch.
+        return (self._income_revision, now) if self._income_batch else None
+
+    def qualify_execution(self, token, account, now):
+        if (token is not None and self._income_batch
+                and token[0] == self._income_revision and utc(token[1]) <= utc(now)
+                and valid_account_snapshot(account, now, self.cfg)):
+            self._income_account = account
+
     def execution_qualified(self, now, *, account=None):
-        """Current batch evidence; historical auditing is its initial policy."""
-        return self.income_audited(now, account=account)
+        """Fresh verified observation, with strict-window evidence when needed."""
+        self.income_scan(now)
+        return (self._income_batch and self._income_account is not None
+                and (account is None or account == self._income_account)
+                and valid_account_snapshot(self._income_account, now, self.cfg))
 
     def cancel_due(self, payload, now):
         op = self.repository.cancel_operation(payload.symbol, payload.order_id)
@@ -135,10 +148,15 @@ class Executor:
             and utc(now) >= utc(op.cancel_retry_at or op.created_at + timedelta(seconds=2))
         )
 
-    def _require_reconciled(self):
+    def _require_reconciled(self, *, preparing=False):
         runtime = self.repository.runtime()
         status = reconciliation_status(self.repository)
-        if runtime.run_mode == RunMode.PAUSED or status.blocked:
+        blocked = status.blocked
+        if preparing and not status.strict_window:
+            # Stale source-audit errors can be replaced only by a complete idle
+            # preparation. Initialization and own responsibility remain mandatory.
+            blocked = not status.initialized or bool(status.own_operations) or bool(status.observation)
+        if runtime.run_mode == RunMode.PAUSED or blocked:
             raise RuntimeError("New operations require an unpaused, reconciled runtime: "
                                + str(status.describe()))
         return runtime
@@ -177,7 +195,7 @@ class Executor:
                 protective=kind == OperationKind.CANCEL
             )  # No unsent UNKNOWN intent.
         previous_runtime = (
-            self.repository.runtime() if kind == OperationKind.CANCEL else self._require_reconciled()
+            self.repository.runtime() if kind == OperationKind.CANCEL else self._require_reconciled(preparing=True)
         )
         if (kind == OperationKind.TRANSFER and payload.to_account == "SPOT"
                 and previous_runtime.funding_exhausted_at is not None):
@@ -203,16 +221,16 @@ class Executor:
             previous_runtime = runtime = self.repository.runtime()
         elif kind != OperationKind.CANCEL:
             if not self.execution_qualified(self.clock() if self.clock else now, account=account):
-                # Fast direct calls retain their supplied account. A slow audit
-                # must verify both the refreshed account and the old candidate.
+                # Verify both the refreshed observation and the original candidate.
                 original = account
+                known_orders = tuple(self.repository.tracked_orders(active_only=True).values())
                 account, orders = self._reconciliation().prepare_execution(
                     self.clock() if self.clock else now, account=account,
                 )
                 if account is not original:
                     now = self.clock() if self.clock else now
                     self._require_unchanged_demand(original, account, orders, inputs)
-                    if inputs is None and orders:
+                    if inputs is None and set(orders) != set(known_orders):
                         raise ExecutionBlocked("Refreshed orders lack candidate context; replan the candidate")
             self._require_current_constraints(
                 runtime, account, self.clock() if self.clock else now, inputs,
