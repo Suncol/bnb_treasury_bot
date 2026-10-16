@@ -85,7 +85,9 @@ def _max_affordable_qty(
 
 
 def _layered_orders(
-    total_qty: Decimal,
+    delta_bnb: Decimal,
+    ref_price: Decimal,
+    quote_budget: Decimal | None,
     symbol: str,
     filters: SymbolFilters,
     layers: tuple[tuple[Decimal, Decimal], ...],
@@ -100,6 +102,7 @@ def _layered_orders(
     weight_sum = sum((weight for weight, _ in available), Decimal("0"))
     if not available or weight_sum <= 0:
         return ()
+    total_qty = _max_affordable_qty(delta_bnb, ref_price, quote_budget, filters)
     plans: list[OrderPlan] = []
     carry_qty = Decimal("0")
 
@@ -133,7 +136,25 @@ def _layered_orders(
             qty = floor_to_multiple(carry_qty, filters.qty_step)
             plans[-1] = replace(plans[-1], qty=plans[-1].qty + qty)
 
-    return tuple(order for order in plans if order_passes_filters(order, filters))
+    orders = tuple(order for order in plans if order_passes_filters(order, filters))
+    if orders:
+        return orders
+
+    # Reference-price sizing can round below one lot even when a discounted
+    # layer is affordable. Try a minimum legal bid at each available price;
+    # quote_budget already excludes the engine's fee reserve.
+    for _, price in available:
+        if price <= 0:
+            continue
+        qty = ceil_to_multiple(
+            max(filters.min_qty, filters.qty_step, filters.min_notional / price),
+            filters.qty_step,
+        )
+        order = OrderPlan(symbol, "BUY", order_type, qty, price, time_in_force, post_only)
+        if (qty <= delta_bnb and order_passes_filters(order, filters)
+                and (quote_budget is None or qty * price <= quote_budget)):
+            return (order,)
+    return ()
 
 
 def plan_watch_orders(
@@ -145,15 +166,12 @@ def plan_watch_orders(
     quote_budget: Decimal | None,
     existing_orders: tuple[OrderView, ...] = (),
 ) -> BuyPlan:
-    total_qty = _max_affordable_qty(delta_bnb, ref_price, quote_budget, filters)
-    if total_qty == Decimal("0"):
-        return BuyPlan(
-            state=ReplenishmentState.WATCH, reason="Insufficient quote budget for WATCH"
-        )
     return BuyPlan(
         state=ReplenishmentState.WATCH,
         orders=_layered_orders(
-            total_qty=total_qty,
+            delta_bnb=delta_bnb,
+            ref_price=ref_price,
+            quote_budget=quote_budget,
             symbol=symbol,
             filters=filters,
             layers=ordinary_layers(ReplenishmentState.WATCH, ref_price, filters, cfg),
@@ -175,16 +193,12 @@ def plan_accumulate_orders(
     quote_budget: Decimal | None,
     existing_orders: tuple[OrderView, ...] = (),
 ) -> BuyPlan:
-    total_qty = _max_affordable_qty(delta_bnb, ref_price, quote_budget, filters)
-    if total_qty == Decimal("0"):
-        return BuyPlan(
-            state=ReplenishmentState.ACCUMULATE,
-            reason="Insufficient quote budget for ACCUMULATE",
-        )
     return BuyPlan(
         state=ReplenishmentState.ACCUMULATE,
         orders=_layered_orders(
-            total_qty=total_qty,
+            delta_bnb=delta_bnb,
+            ref_price=ref_price,
+            quote_budget=quote_budget,
             symbol=symbol,
             filters=filters,
             layers=ordinary_layers(ReplenishmentState.ACCUMULATE, ref_price, filters, cfg),
