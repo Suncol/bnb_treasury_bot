@@ -326,9 +326,11 @@ class Reconciler:
         for client_id, op in buys.items():
             previous = tracked.get(client_id) or repo.tracked_order(client_id)
             if op.status == OperationStatus.FAILED or (
-                previous is not None and not previous.is_open
+                previous is not None and not previous.is_open and not op.balance_pending
             ):
                 continue
+            # Reopened terminal orders need their final cumulative quantity
+            # verified by the same exchange identity before settling late fills.
             present = (
                 op.exchange_id in orders
                 if op.exchange_id is not None
