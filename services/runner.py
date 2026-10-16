@@ -667,7 +667,7 @@ class Runner:
         return inputs
 
     def _cycle(self, market, inventory):
-        with self.executor.income_batch():
+        with self.executor.execution_batch():
             return self._run_cycle(market, inventory)
 
     def _run_cycle(self, market, inventory):
@@ -712,8 +712,8 @@ class Runner:
                     or plan.bnb_transfer_plan or plan.spot_usd_sweep_plan
                 )
             ) and plan.inventory_valid and not inputs.pending.unresolved and not plan.cancellations:
-                # A maintenance observation can reveal a new decision. Promote
-                # it to a full audit and rebuild from its final fresh account.
+                # A maintenance observation can reveal a new decision. Obtain
+                # phase-appropriate qualification and rebuild from its final account.
                 audited = self._inputs(inputs.market, advance_inventory,
                                        continuing=inputs.allow_new_cycle, force_income=True)
                 inputs = replace(audited, allow_usd_funding=inputs.allow_usd_funding,

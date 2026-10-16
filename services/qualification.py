@@ -18,6 +18,7 @@ class ReconciliationStatus:
     spot_settlement: dict | None
     futures_settlement: dict
     historical_diagnostics: dict | None
+    funding_diagnostics: dict | None
 
     @property
     def blocked(self):
@@ -45,7 +46,7 @@ def reconciliation_status(repository):
             "missing_recovery_evidence": tuple(reason for condition, reason in (
                 (op.kind.value == "TRANSFER" and op.exchange_id is None,
                  "transfer_identity"),
-                (op.kind.value == "TRANSFER" and op.balance_before is None,
+                (op.kind.value == "TRANSFER" and (op.balance_before is None or op.balance_before.ts is None),
                  "pre_transfer_baseline"),
             ) if condition),
         } for op in repository.operations(active_only=True)),
@@ -56,5 +57,6 @@ def reconciliation_status(repository):
         observation=issues.pop("observation", None),
         spot_settlement=repository.load("spot_settlement_issue"),
         historical_diagnostics=issues.pop("margin", None),
+        funding_diagnostics=repository.load("funding_evidence_issue"),
         futures_settlement=issues,
     )

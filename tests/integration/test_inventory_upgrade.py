@@ -151,10 +151,12 @@ def test_legacy_missing_transfer_identity_requires_explicit_verified_binding(tmp
     repo.close()
 
 
-def test_legacy_missing_transfer_baseline_remains_blocked_and_diagnosed(tmp_path):
+@pytest.mark.parametrize("missing", ["snapshot", "timestamp"])
+def test_legacy_missing_transfer_baseline_remains_blocked_and_diagnosed(tmp_path, missing):
     ex, repo, reconciler = restore(tmp_path, 'bnb')
     op = repo.operations()[0]
-    repo.update_operation(replace(op, balance_before=None))
+    repo.update_operation(replace(op, balance_before=None if missing == "snapshot"
+                                  else replace(op.balance_before, ts=None)))
     repo, reconciler = reopen(repo, ex)
     assert reconciler.refresh(ex.now)[2].unresolved
     status = reconciliation_status(repo)

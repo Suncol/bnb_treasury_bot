@@ -580,6 +580,20 @@ class Repository:
             for row in self.db.execute(query + " ORDER BY created,client_id")
         )
 
+    def has_order_journal(self):
+        return self.db.execute("SELECT 1 FROM operations WHERE kind='ORDER' LIMIT 1").fetchone() is not None
+
+    def pending_transfer_records(self):
+        return tuple(loads(row[0]) for row in self.db.execute(
+            "SELECT data FROM transfers WHERE json_extract(data,'$.fields.status.value') IN ('PENDING','UNKNOWN') ORDER BY ts"
+        ))
+
+    def settlement_snapshots(self):
+        boundary = self.load("spot_acceptance")
+        if boundary is not None:
+            return self.snapshots_since(boundary["account"].ts)
+        return tuple(loads(row[0]) for row in self.db.execute("SELECT data FROM snapshots ORDER BY ts"))
+
     def save_fills(self, fills, *, evidence=None):
         with self.db:
             if evidence is not None:
@@ -865,10 +879,11 @@ class Repository:
                 "INSERT OR REPLACE INTO snapshots VALUES (?,?)",
                 (utc(account.ts).timestamp(), dumps(account)),
             )
-            self.db.execute(
-                "DELETE FROM snapshots WHERE ts < ?",
-                ((utc(account.ts) - timedelta(hours=49)).timestamp(),),
-            )
+            if not self.settlement_window_open():
+                self.db.execute(
+                    "DELETE FROM snapshots WHERE ts < ?",
+                    ((utc(account.ts) - timedelta(hours=49)).timestamp(),),
+                )
 
     def snapshots_since(self, since):
         return tuple(

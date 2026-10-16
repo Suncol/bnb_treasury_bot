@@ -552,6 +552,8 @@ def test_late_old_foreign_round_trip_recovers_without_current_conversion_gate(tm
     debit = replace(credit, transfer_id="late-usdc-out", from_account="USDⓈ-M Futures",
                     to_account="SPOT", ts=original.ts - timedelta(hours=26))
     exchange.transfers.update({credit.transfer_id: credit, debit.transfer_id: debit})
+    # Outside the current budget/window query, discovered via authenticated import.
+    repo.save_transfers((credit, debit))
     exchange.income.extend((
         FuturesIncome("TRANSFER", credit.transfer_id, "USDC", credit.amount, credit.ts),
         FuturesIncome("TRANSFER", debit.transfer_id, "USDC", -debit.amount, debit.ts),

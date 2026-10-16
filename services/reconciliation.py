@@ -8,6 +8,7 @@ from core.validation import valid_account_snapshot
 
 from .exchange_adapter import ExchangeError, RequestDeferred, order_matches_operation
 from .executor import ExecutionBlocked, Executor
+from .evidence_queries import evidence_queries
 from .qualification import reconciliation_status
 from .history import (
     futures_settlement_evidence,
@@ -198,24 +199,25 @@ class Reconciler:
     def refresh(self, now, *, force_income=False, retry_slow=True):
         """At most one fresh observation after a completed slow batch audit."""
         try:
-            for attempt in range(2):
-                result = self._refresh(now, force_income=force_income)
-                account, _, _, consistent = result
-                checked = self.clock() if self.clock else now
-                scan = self.executor.income_scan(checked)
-                if (
-                    attempt == 0 and retry_slow and scan is not None and consistent
-                    and account.ts is not None and utc(account.ts) <= utc(checked)
-                    and not fresh(account.ts, checked, self.cfg.risk.max_account_age_seconds)
-                ):
-                    now = checked
-                    continue
-                if (not valid_account_snapshot(account, checked, self.cfg)
-                        or not consistent or result[2].unresolved
-                        or self.repository.load("futures_settlement_issue")
-                        or self.repository.load("spot_settlement_issue")):
-                    self.executor.invalidate_income_audit()
-                return result
+            with self.repository.exclusive():
+                for attempt in range(2):
+                    result = self._refresh(now, force_income=force_income)
+                    account, _, _, consistent = result
+                    checked = self.clock() if self.clock else now
+                    scan = self.executor.income_scan(checked)
+                    if (
+                        attempt == 0 and retry_slow and scan is not None and consistent
+                        and account.ts is not None and utc(account.ts) <= utc(checked)
+                        and not fresh(account.ts, checked, self.cfg.risk.max_account_age_seconds)
+                    ):
+                        now = checked
+                        continue
+                    if (not valid_account_snapshot(account, checked, self.cfg)
+                            or not consistent or result[2].unresolved
+                            or self.repository.load("futures_settlement_issue")
+                            or self.repository.load("spot_settlement_issue")):
+                        self.executor.invalidate_income_audit()
+                    return result
         except BaseException:
             self.executor.invalidate_income_audit()
             raise
@@ -374,12 +376,9 @@ class Reconciler:
                 tracked[op.client_id] = order
         repo.save_tracked_orders(tracked)
         runtime = repo.runtime()
-        since = repo.load("fills_since", utc(now) - timedelta(hours=24))
+        queries = evidence_queries(repo, cfg, now, strict_at_start=strict_at_start)
+        since = queries.fills_since
         checkpoint = repo.load("spot_checkpoint")
-        if checkpoint is not None:
-            since = min(
-                utc(since), utc(checkpoint["account"].ts) - timedelta(seconds=1)
-            )
         if tracked:
             totals = repo.fill_totals(
                 cfg.symbol, (o.order_id for o in tracked.values())
@@ -394,7 +393,7 @@ class Reconciler:
         # Indexed journal lookup preserves ownership for late fills of retired
         # orders without loading every historical operation into the hot path.
         fills = []
-        for symbol in dict.fromkeys((cfg.symbol, *cfg.spot_activity_symbols)):
+        for symbol in queries.fill_symbols:
             for fill in self._read(exchange.fetch_recent_fills, symbol, since, now):
                 fills.append(self._attribute_fill(fill))
         repo.save_fills(fills)
@@ -406,11 +405,7 @@ class Reconciler:
                 runtime, guard=replace(runtime.guard, filled_bnb=episode.filled_bnb)
             )
             repo.save("runtime", runtime)
-        recovery_since = utc(now) - timedelta(hours=49)
-        if checkpoint is not None:
-            recovery_since = min(
-                recovery_since, utc(checkpoint["account"].ts) - timedelta(seconds=1)
-            )
+        recovery_since = queries.transfers_since
         pending_transfers = tuple(
             op for op in repo.operations(unresolved_only=True)
             if op.kind == OperationKind.TRANSFER
@@ -431,7 +426,7 @@ class Reconciler:
             wallet_event_cursor=repo.wallet_cursor(),
         )
         checked_at = self.clock() if self.clock else now
-        samples = repo.snapshots_since(utc(checked_at) - timedelta(hours=49))
+        samples = repo.settlement_snapshots() if queries.strict else ()
         quote_before = (
             replace(checkpoint["account"], wallet_event_cursor=checkpoint["cursor"])
             if checkpoint is not None else None
@@ -440,7 +435,7 @@ class Reconciler:
         window_before = quote_before
         if strict:
             anchors = [op.balance_before for op in repo.operations(active_only=True)
-                       if op.balance_before is not None]
+                       if op.balance_before is not None and op.balance_before.ts is not None]
             if quote_before is not None:
                 anchors.append(quote_before)
             if anchors:
@@ -448,6 +443,7 @@ class Reconciler:
         observations = [
             (op.balance_before, op.payload.asset) for op in pending_transfers
             if op.status == OperationStatus.CONFIRMED and op.balance_before is not None
+            and op.balance_before.ts is not None
         ]
         if strict and account.contract_total_margin_balance is not None:
             observations.extend(
@@ -491,7 +487,7 @@ class Reconciler:
         external_pending = any(
             t.status in {OperationStatus.PENDING, OperationStatus.UNKNOWN}
             and t.asset in {"BNB", cfg.quote_asset}
-            for t in transfers
+            for t in repo.pending_transfer_records()
         )
         spot_settled = False
         observation_valid = consistent and valid_account_snapshot(
@@ -707,7 +703,7 @@ class Reconciler:
             )
         return coverage
 
-    def _settle_spot(self, account, *, checkpoint=None, allow_external=False):
+    def _settle_spot(self, account, *, checkpoint=None):
         """Advance one durable balance/ledger checkpoint only on exact coverage.
 
         Both spot assets must include all known executions. Request timestamps,
@@ -733,7 +729,7 @@ class Reconciler:
         if through is None:
             through = repo.wallet_cursor()
         ambiguous = repo.ambiguous_wallet_events(checkpoint["cursor"], through)
-        if ambiguous and not allow_external:
+        if ambiguous:
             repo.save("spot_settlement_issue", {
                 "reason": "Receipt may already be included in accepted inventory",
                 "ambiguous_receipts": ambiguous,
@@ -755,9 +751,6 @@ class Reconciler:
             if actual[asset] != expected[asset]
         }
         if differences or missing:
-            if allow_external:
-                repo.accept_inventory_observation(account)
-                return True
             repo.save(
                 "spot_settlement_issue",
                 {
@@ -858,6 +851,11 @@ class Reconciler:
             if f.strategy_id != cfg.strategy_id and utc(f.ts) >= utc(funding.created_at)
         }
         same_boundary = funding.settlement_epoch == repo.settlement_epoch()
+        repo.save("funding_evidence_issue", None if same_boundary else {
+            "reason": "Old funding spend lacks coverage across accepted inventory boundary",
+            "funding_client_id": funding.client_id,
+            "funding_epoch": funding.settlement_epoch, "current_epoch": repo.settlement_epoch(),
+        })
         changes = [
             (reference, deltas[cfg.quote_asset])
             for _, reference, deltas in repo.wallet_changes(

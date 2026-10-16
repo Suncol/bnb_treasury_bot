@@ -51,8 +51,8 @@ class Executor:
     def __init__(self, exchange, repository, cfg, *, clock=None):
         self.exchange, self.repository, self.cfg = exchange, repository, cfg
         self.clock = clock or getattr(exchange, "clock", None)
-        self._income_batch = False
-        self._income_account = None
+        self._execution_batch_active = False
+        self._qualified_account = None
         self._income_scan = None
         self._income_revision = 0
         self._income_checked_at = None
@@ -67,14 +67,16 @@ class Executor:
         return self.reconciler
 
     @contextmanager
-    def income_batch(self):
+    def execution_batch(self):
         self.invalidate_income_audit()
-        self._income_batch = True
+        self._execution_batch_active = True
         try:
             yield
         finally:
             self.invalidate_income_audit()
-            self._income_batch = False
+            self._execution_batch_active = False
+
+    income_batch = execution_batch  # Compatibility for existing direct callers.
 
     def invalidate_income_audit(self):
         self._income_scan = self._income_checked_at = None
@@ -82,17 +84,17 @@ class Executor:
         self._income_revision += 1
 
     def invalidate_income_qualification(self):
-        self._income_account = None
+        self._qualified_account = None
 
     def begin_income_scan(self, now):
         """Capture a batch token so invalidation during reads defeats completion."""
         self.income_scan(now)
         self.invalidate_income_qualification()
-        return (self._income_revision, now) if self._income_batch else None
+        return (self._income_revision, now) if self._execution_batch_active else None
 
     def complete_income_scan(self, token, coverage, account, now):
         """Publish committed receipts only within the batch that requested them."""
-        if token is None or not self._income_batch:
+        if token is None or not self._execution_batch_active:
             return
         revision, started_at = token
         if revision != self._income_revision:
@@ -104,7 +106,7 @@ class Executor:
                              if coverage is not None else None)
 
     def income_scan(self, now):
-        if not self._income_batch:
+        if not self._execution_batch_active:
             return None
         if self._income_checked_at is not None and utc(now) < utc(self._income_checked_at):
             self.invalidate_income_audit()
@@ -115,30 +117,27 @@ class Executor:
             return None
         return scan
 
-    def qualify_income(self, account, now):
-        self._income_account = account if self.income_scan(now) is not None else None
-
     def income_audited(self, now, *, account=None):
-        return (self.income_scan(now) is not None and self._income_account is not None
-                and (account is None or account == self._income_account)
-                and valid_account_snapshot(self._income_account, now, self.cfg))
+        return (self.income_scan(now) is not None and self._qualified_account is not None
+                and (account is None or account == self._qualified_account)
+                and valid_account_snapshot(self._qualified_account, now, self.cfg))
 
     def begin_preparation(self, now):
         self.income_scan(now)  # Also detects clock rollback within the batch.
-        return (self._income_revision, now) if self._income_batch else None
+        return (self._income_revision, now) if self._execution_batch_active else None
 
     def qualify_execution(self, token, account, now):
-        if (token is not None and self._income_batch
+        if (token is not None and self._execution_batch_active
                 and token[0] == self._income_revision and utc(token[1]) <= utc(now)
                 and valid_account_snapshot(account, now, self.cfg)):
-            self._income_account = account
+            self._qualified_account = account
 
     def execution_qualified(self, now, *, account=None):
         """Fresh verified observation, with strict-window evidence when needed."""
         self.income_scan(now)
-        return (self._income_batch and self._income_account is not None
-                and (account is None or account == self._income_account)
-                and valid_account_snapshot(self._income_account, now, self.cfg))
+        return (self._execution_batch_active and self._qualified_account is not None
+                and (account is None or account == self._qualified_account)
+                and valid_account_snapshot(self._qualified_account, now, self.cfg))
 
     def cancel_due(self, payload, now):
         op = self.repository.cancel_operation(payload.symbol, payload.order_id)
@@ -164,18 +163,19 @@ class Executor:
     def execute(self, payload, now, state, *, starts_slice=False, account=None,
                 resume_replanning=False, inputs=None):
         try:
-            if isinstance(payload, CancelPlan):
-                # A cancellation can change the orders/balances observed by an
-                # in-progress scan. Protection never waits for income evidence.
-                self.invalidate_income_audit()
-            elif not self._income_batch:
-                with self.income_batch():
-                    return self._execute(payload, now, state, starts_slice=starts_slice,
-                                         account=account, resume_replanning=resume_replanning,
-                                         inputs=inputs)
-            return self._execute(payload, now, state, starts_slice=starts_slice,
-                                 account=account, resume_replanning=resume_replanning,
-                                 inputs=inputs)
+            with self.repository.exclusive():
+                if isinstance(payload, CancelPlan):
+                    # A cancellation can change the orders/balances observed by an
+                    # in-progress scan. Protection never waits for income evidence.
+                    self.invalidate_income_audit()
+                elif not self._execution_batch_active:
+                    with self.execution_batch():
+                        return self._execute(payload, now, state, starts_slice=starts_slice,
+                                             account=account, resume_replanning=resume_replanning,
+                                             inputs=inputs)
+                return self._execute(payload, now, state, starts_slice=starts_slice,
+                                     account=account, resume_replanning=resume_replanning,
+                                     inputs=inputs)
         except BaseException:
             self.invalidate_income_audit()
             raise
