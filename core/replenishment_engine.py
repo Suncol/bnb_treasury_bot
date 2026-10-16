@@ -325,6 +325,7 @@ def build_cycle_plan(
         False, GateStatus.OPEN, "NO_ACTION", ZERO, "No USD transfer planned"
     )
     buy = BuyPlan(state, reason="No funded incremental demand")
+    funding_shortfall = False
     bnb_transfer = sweep = None
     slice_state = inputs.slice_state
     if inventory_valid and (
@@ -431,6 +432,10 @@ def build_cycle_plan(
             )
         if slots is not None:
             buy = replace(buy, orders=buy.orders[: max(0, slots)])
+        # All non-cash gates and the exact order filters were applied above.
+        # The unbudgeted demand can trade, but current free cash cannot fund
+        # even a smaller legal order. This diagnoses no source of the shortfall.
+        funding_shortfall = bool(demand.orders and not buy.orders and not transfer.allow)
     if ready and data_gate == GateStatus.OPEN and not transfer.allow and not buy.orders:
         gross = (
             decision.delta_bnb
@@ -453,4 +458,5 @@ def build_cycle_plan(
         slice_state,
         target,
         inventory_valid,
+        funding_shortfall,
     )

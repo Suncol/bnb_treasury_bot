@@ -384,6 +384,7 @@ class CyclePlan:
     slice_state: SliceState = field(default_factory=lambda: SliceState())
     active_buy_target: Decimal = Decimal("0")
     inventory_valid: bool = True
+    buy_funding_shortfall: bool = False
 
 
 class OperationStatus(str, Enum):

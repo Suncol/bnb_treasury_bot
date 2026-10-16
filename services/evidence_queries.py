@@ -1,4 +1,4 @@
-"""Historical reads follow current responsibility, funding proof, and budget."""
+"""Historical reads follow current responsibility and the account budget."""
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -28,19 +28,11 @@ def evidence_queries(repository, cfg, now, *, strict_at_start=False):
     since = min(anchors) - timedelta(seconds=1) if anchors else None
     # A persisted unrelated 24h metric never widens these requirements.
     symbols = tuple(dict.fromkeys((cfg.symbol, *cfg.spot_activity_symbols))) if strict else ()
-    if not strict:
-        funding = repository.current_funding(cfg.quote_asset, cfg.symbol)
-        if (repository.runtime().resume_replenishment and funding is not None
-                and not funding.unresolved and funding.balance_before is not None
-                and funding.balance_before.ts is not None
-                and funding.settlement_epoch == repository.settlement_epoch()):
-            since = utc(funding.balance_before.ts) - timedelta(seconds=1)
-            symbols = tuple(dict.fromkeys((cfg.symbol, *cfg.spot_activity_symbols)))
-        elif repository.has_order_journal():
-            # Watch recent receipts for retired owned-order contradictions. This
-            # bounded overlap is not an audit of external account provenance.
-            since = utc(now) - timedelta(seconds=60)
-            symbols = (cfg.symbol,)
+    if not strict and repository.has_order_journal():
+        # Watch recent receipts for retired owned-order contradictions. This
+        # bounded overlap is not an audit of external account provenance.
+        since = utc(now) - timedelta(seconds=60)
+        symbols = (cfg.symbol,)
     transfer_since = utc(now) - timedelta(hours=24)
     if strict and since is not None:
         transfer_since = min(transfer_since, since)

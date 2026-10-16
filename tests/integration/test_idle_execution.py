@@ -94,7 +94,7 @@ def test_budget_read_failure_cannot_authorize_idle_funding(tmp_path):
     repo.close()
 
 
-def test_late_external_trade_after_acceptance_cannot_exhaust_old_funding(tmp_path):
+def test_late_trade_import_does_not_change_current_shortfall_exit_reason(tmp_path):
     from core.models import Fill
     from tests.integration.test_replenishment_continuation import funded_setup, external_spend
     ex, repo, runner, funding = funded_setup(tmp_path)
@@ -109,13 +109,18 @@ def test_late_external_trade_after_acceptance_cannot_exhaust_old_funding(tmp_pat
     repo.save_fills((Fill('BTCUSDT', 'late-import', 'external', spent_at, D('0.1'),
                          quote_qty=funding.payload.amount, base_asset='BTC', quote_asset='USDT'),))
     runner.run_once(inventory_cycle=False)
-    assert repo.runtime().resume_replenishment
-    assert repo.runtime().funding_exhausted_at is None
+    assert not repo.runtime().resume_replenishment
+    assert repo.runtime().funding_exhausted_at is not None
+    from storage.codec import loads
+    event, = [loads(row[0]) for row in repo.db.execute(
+        "SELECT data FROM events WHERE kind='FUNDING_INSUFFICIENT_FUNDS'")]
+    assert event['reason'] == 'INSUFFICIENT_AVAILABLE_FUNDS'
+    assert 'trade_references' not in event
     assert len(ex.writes) == 1
     repo.close()
 
 
-def test_current_external_freeze_remains_verifiable_after_acceptance(tmp_path):
+def test_current_free_balance_after_external_freeze_can_end_settled_continuation(tmp_path):
     from tests.integration.test_replenishment_continuation import funded_setup, external_freeze
     ex, repo, runner, funding = funded_setup(tmp_path)
     runner.reconciler.refresh(ex.now)

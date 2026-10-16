@@ -710,6 +710,7 @@ class Runner:
                 advance_inventory or self._inventory_change(plan) or self.execute_enabled and (
                     plan.buy_plan.orders or plan.transfer_decision.allow
                     or plan.bnb_transfer_plan or plan.spot_usd_sweep_plan
+                    or runtime.resume_replenishment and plan.buy_funding_shortfall
                 )
             ) and plan.inventory_valid and not inputs.pending.unresolved and not plan.cancellations:
                 # A maintenance observation can reveal a new decision. Obtain
@@ -857,20 +858,22 @@ class Runner:
                             and not plan.crash_guard.active
                         )
                     )
-                    if (runtime.resume_replenishment and continuing
-                            and plan.gates.run_mode_gate == GateStatus.OPEN
-                            and not plan.buy_plan.orders and not plan.cancellations):
-                        evidence = self.reconciler.funding_occupation(inputs.account)
-                        if evidence is not None:
-                            restored = build_cycle_plan(replace(
-                                inputs, account=replace(inputs.account,
-                                    spot_usd=inputs.account.spot_usd + evidence["amount"]),
-                                allow_usd_funding=False,
-                            ), self.cfg)
-                            if restored.buy_plan.orders and self.repository.end_funded_continuation(
-                                evidence["funding_client_id"], inputs.now, evidence,
-                            ):
-                                return plan
+                    if (runtime.resume_replenishment and continuing and plan.buy_funding_shortfall
+                            and self.executor.execution_qualified(self.clock(), account=inputs.account)
+                            and fresh(inputs.market.ts, self.clock(), self.cfg.crash_guard.max_market_age_seconds)
+                            and (inputs.filters.observed_at is None or fresh(
+                                inputs.filters.observed_at, self.clock(), self.cfg.crash_guard.max_market_age_seconds))):
+                        funding = self.repository.current_funding(self.cfg.quote_asset, self.cfg.symbol)
+                        if funding is not None and self.repository.end_funded_continuation(
+                            funding.client_id, self.clock(), {
+                                "reason": "INSUFFICIENT_AVAILABLE_FUNDS",
+                                "funding_client_id": funding.client_id,
+                                "available_quote": inputs.account.spot_usd - inputs.account.reserved_spot_usd,
+                                "quote_asset": self.cfg.quote_asset, "symbol": self.cfg.symbol,
+                                "account_at": inputs.account.ts,
+                            },
+                        ):
+                            return plan
                     self.repository.save(
                         "runtime",
                         replace(

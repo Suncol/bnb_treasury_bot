@@ -448,12 +448,18 @@ class Repository:
             return None
         return funding
 
-    def end_funded_continuation(self, funding_id, now, evidence):
+    def end_funded_continuation(self, funding_id, now, observation):
         """Retire the funded permission and journal the next-cycle barrier together."""
         with self.db:
             runtime = self.runtime()
-            funding = self.current_funding(evidence["quote_asset"], evidence["symbol"])
-            if funding is None or funding.client_id != funding_id:
+            funding = self.current_funding(observation["quote_asset"], observation["symbol"])
+            if (funding is None or funding.client_id != funding_id
+                    or funding.kind != OperationKind.TRANSFER
+                    or funding.status != OperationStatus.CONFIRMED or funding.unresolved
+                    or funding.exchange_id is None
+                    or (funding.payload.asset, funding.payload.from_account, funding.payload.to_account)
+                    != (observation["quote_asset"], "USDⓈ-M Futures", "SPOT")
+                    or self.operations(unresolved_only=True)):
                 return False
             runtime = replace(
                 runtime, resume_replenishment=False, resume_replanning=False,
@@ -464,7 +470,7 @@ class Repository:
                 (dumps(runtime),),
             )
             self.db.execute("INSERT INTO events(ts,kind,data) VALUES (?,?,?)",
-                            (utc(now).timestamp(), "FUNDING_EXTERNAL_USAGE", dumps(evidence)))
+                            (utc(now).timestamp(), "FUNDING_INSUFFICIENT_FUNDS", dumps(observation)))
         return True
 
     def order_operation(self, exchange_id):

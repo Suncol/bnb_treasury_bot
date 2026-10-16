@@ -340,7 +340,7 @@ def test_legacy_funded_boolean_uses_its_latest_settled_funding_journal(tmp_path)
         repo.close()
 
 
-def test_replaced_external_spend_cannot_blame_later_price_jump_for_exhaustion(tmp_path):
+def test_current_purchase_power_shortfall_does_not_claim_external_spending(tmp_path):
     from core.models import TransferRecord
     ex, repo, runner, funding = funded_setup(tmp_path)
     try:
@@ -357,8 +357,8 @@ def test_replaced_external_spend_cannot_blame_later_price_jump_for_exhaustion(tm
         )
         plan = run(runner, ex, inventory=False)
         assert plan.inventory_valid and not plan.buy_plan.orders
-        assert repo.runtime().resume_replenishment
-        assert repo.runtime().funding_exhausted_at is None
+        assert not repo.runtime().resume_replenishment
+        assert repo.runtime().funding_exhausted_at is not None
         assert len(ex.writes) == 1
     finally:
         repo.close()
@@ -442,14 +442,14 @@ def test_external_spend_with_remaining_cash_places_a_smaller_compliant_group(tmp
 
 
 @pytest.mark.parametrize("created_offset", [0, -1])
-def test_ambiguous_or_older_external_lock_cannot_prove_this_funding_was_taken(tmp_path, created_offset):
+def test_current_cash_shortfall_does_not_depend_on_external_lock_creation_time(tmp_path, created_offset):
     ex, repo, runner, funding = funded_setup(tmp_path)
     try:
         external_freeze(ex, funding.payload.amount,
                         created_at=funding.created_at + timedelta(seconds=created_offset))
         run(runner, ex, inventory=False)
-        assert repo.runtime().resume_replenishment
-        assert repo.runtime().funding_exhausted_at is None
+        assert not repo.runtime().resume_replenishment
+        assert repo.runtime().funding_exhausted_at is not None
         assert len(ex.writes) == 1
     finally:
         repo.close()
@@ -497,7 +497,7 @@ def test_next_inventory_after_external_usage_rechecks_transfer_limits(tmp_path, 
         repo.close()
 
 
-def test_external_usage_exit_and_next_cycle_barrier_roll_back_together(tmp_path):
+def test_cash_shortfall_exit_and_next_cycle_barrier_roll_back_together(tmp_path):
     import sqlite3
     ex, repo, runner, funding = funded_setup(tmp_path, urgent=True)
     try:
@@ -505,7 +505,7 @@ def test_external_usage_exit_and_next_cycle_barrier_roll_back_together(tmp_path)
         ex.now += timedelta(hours=25)
         repo.db.executescript("""
             CREATE TRIGGER fail_funding_exit BEFORE INSERT ON events
-            WHEN NEW.kind='FUNDING_EXTERNAL_USAGE'
+            WHEN NEW.kind='FUNDING_INSUFFICIENT_FUNDS'
             BEGIN SELECT RAISE(ABORT, 'exit transaction failed'); END;
         """)
         with pytest.raises(sqlite3.IntegrityError, match="exit transaction failed"):
@@ -605,7 +605,7 @@ def test_executor_cannot_bypass_the_persisted_next_inventory_barrier(tmp_path):
 
 
 @pytest.mark.parametrize("evidence_gap", ["changing_order", "unexplained_reservation", "unknown_order"])
-def test_external_freeze_requires_stable_orders_covering_the_account_reservation(tmp_path, evidence_gap):
+def test_unrelated_reservation_source_does_not_gate_current_cash_shortfall(tmp_path, evidence_gap):
     from core.models import OrderView
     ex, repo, runner, funding = funded_setup(tmp_path)
     try:
@@ -631,16 +631,16 @@ def test_external_freeze_requires_stable_orders_covering_the_account_reservation
 
             ex.fetch_open_orders = changing_orders
         plan = run(runner, ex, inventory=False)
-        assert plan.inventory_valid == (evidence_gap != "changing_order")
-        assert repo.runtime().resume_replenishment
-        assert repo.runtime().funding_exhausted_at is None
+        assert plan.inventory_valid
+        assert not repo.runtime().resume_replenishment
+        assert repo.runtime().funding_exhausted_at is not None
         assert len(ex.writes) == 1
     finally:
         repo.close()
 
 
 @pytest.mark.parametrize("legacy", [False, True])
-def test_previous_funding_trade_receipts_cannot_end_a_later_funded_continuation(tmp_path, legacy):
+def test_new_funding_cash_shortfall_does_not_require_reusing_old_spend(tmp_path, legacy):
     from core.models import TransferRecord
     ex, repo, runner, funding = funded_setup(tmp_path)
     try:
@@ -662,8 +662,8 @@ def test_previous_funding_trade_receipts_cannot_end_a_later_funded_continuation(
             repo.save("runtime", replace(repo.runtime(), funding_client_id=None))
         run(runner, ex, inventory=False)
         assert not repo.operations(unresolved_only=True)
-        assert repo.runtime().resume_replenishment
-        assert repo.runtime().funding_exhausted_at is None
+        assert not repo.runtime().resume_replenishment
+        assert repo.runtime().funding_exhausted_at is not None
         assert len(ex.writes) == 2
     finally:
         repo.close()

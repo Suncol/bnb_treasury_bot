@@ -18,7 +18,6 @@ class ReconciliationStatus:
     spot_settlement: dict | None
     futures_settlement: dict
     historical_diagnostics: dict | None
-    funding_diagnostics: dict | None
 
     @property
     def blocked(self):
@@ -57,6 +56,5 @@ def reconciliation_status(repository):
         observation=issues.pop("observation", None),
         spot_settlement=repository.load("spot_settlement_issue"),
         historical_diagnostics=issues.pop("margin", None),
-        funding_diagnostics=repository.load("funding_evidence_issue"),
         futures_settlement=issues,
     )
