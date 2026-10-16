@@ -129,6 +129,16 @@ def test_invalid_small_layers_are_dropped_or_merged() -> None:
     ('ACCUMULATE', '5.92', '1', {}, ('590.90',), None),
     ('ACCUMULATE', '6', '1', {}, ('598.09', '595.70', '590.90'), None),
     ('ACCUMULATE', '5', '1', {'price_tick': '100'}, (), ('.01', '500')),
+    ('WATCH', '5.849', '1', {}, ('598',), ('.01', '584.90')),
+    ('ACCUMULATE', '5.92', '1', {}, ('598',), ('.01', '590.90')),
+    ('ACCUMULATE', '5.92', '1', {}, ('598', '597'), ('.01', '590.90')),
+    ('ACCUMULATE', '5.92', '1', {}, ('598', '597', '596'), None),
+    ('ACCUMULATE', '5.92', '1', {}, ('598', '590.90'), None),
+    ('ACCUMULATE', '5.92', '.009', {}, ('598',), None),
+    ('ACCUMULATE', '11.818', '1', {'min_notional': '6', 'max_qty': '.01'}, ('598',), None),
+    ('ACCUMULATE', '5.92', '1', {'min_price': '595'}, ('598',), None),
+    ('ACCUMULATE', '5.92', '1', {'max_notional': '5.9'}, ('598',), None),
+    ('ACCUMULATE', '5', '1', {'price_tick': '100'}, ('600',), None),
 ])
 def test_minimum_bid_respects_actual_available_prices_and_order_filters(
     state, budget, delta, filter_changes, occupied, expected,
@@ -144,3 +154,27 @@ def test_minimum_bid_respects_actual_available_prices_and_order_filters(
     assert [(order.qty, order.price) for order in plan.orders] == (
         [] if expected is None else [(D(expected[0]), D(expected[1]))]
     )
+
+
+@pytest.mark.parametrize('state,prices', [
+    ('WATCH', ('596.90', '592.70')),
+    ('ACCUMULATE', ('598.09', '595.70')),
+])
+@pytest.mark.parametrize('occupied,quantities', [
+    (('598',), ('.42', '.57')),
+    (('598', '597'), ('1',)),
+    (('598', '597', '596'), ()),
+])
+def test_normal_layer_allocation_preserves_slots_with_old_grid_orders(state, prices, occupied, quantities):
+    cfg, market = make_strategy_config(), make_market()
+    state = ReplenishmentState(state)
+    orders = tuple(OrderView(cfg.symbol, str(i), 'owned-' + str(i), cfg.strategy_id,
+                             D(price), D('.01'), D('0'), market.ts, state=state)
+                   for i, price in enumerate(occupied))
+
+    plan = plan_buy_orders(make_state_decision(state, '1'), market, make_filters(), cfg,
+                           D('10000'), existing_orders=orders)
+
+    assert [(order.qty, order.price) for order in plan.orders] == [
+        (D(qty), D(price)) for qty, price in zip(quantities, prices)
+    ]

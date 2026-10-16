@@ -98,7 +98,8 @@ def _layered_orders(
 ) -> tuple[OrderPlan, ...]:
     occupied = {o.price for o in existing_orders}
     slots = max(0, len(layers) - len(existing_orders))
-    available = tuple((weight, price) for weight, price in layers if price not in occupied)[:slots]
+    unoccupied = tuple((weight, price) for weight, price in layers if price not in occupied)
+    available = unoccupied[:slots]
     weight_sum = sum((weight for weight, _ in available), Decimal("0"))
     if not available or weight_sum <= 0:
         return ()
@@ -141,9 +142,10 @@ def _layered_orders(
         return orders
 
     # Reference-price sizing can round below one lot even when a discounted
-    # layer is affordable. Try a minimum legal bid at each available price;
+    # layer is affordable. One fallback needs only one remaining slot, so
+    # inspect every unoccupied price, including those outside normal allocation.
     # quote_budget already excludes the engine's fee reserve.
-    for _, price in available:
+    for _, price in unoccupied:
         if price <= 0:
             continue
         qty = ceil_to_multiple(
