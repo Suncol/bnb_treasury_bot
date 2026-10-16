@@ -395,10 +395,16 @@ class Repository:
             parts = reference.split(":")
             owner = None
             if parts[0] == "trade":
-                row = self.db.execute("SELECT order_id FROM fills WHERE symbol=? AND trade_id=?",
+                row = self.db.execute("SELECT data FROM fills WHERE symbol=? AND trade_id=?",
                                       (parts[1], parts[2])).fetchone()
                 if row:
-                    owner = self.order_operation(row[0])
+                    fill = loads(row[0])
+                    owner = self.order_operation(fill.order_id)
+                    if owner is not None and (
+                        not fill.strategy_id or owner.payload.symbol != fill.symbol
+                        or owner.payload.side != fill.side
+                    ):
+                        owner = None
             elif parts[0] == "transfer":
                 row = self.db.execute("SELECT data FROM operations WHERE kind='TRANSFER' AND exchange_id=?",
                                       (parts[1],)).fetchone()
