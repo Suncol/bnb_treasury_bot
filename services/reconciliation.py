@@ -433,6 +433,7 @@ class Reconciler:
             if checkpoint is not None else None
         )
         boundary = repo.load("spot_acceptance")
+        epoch = boundary["epoch"] if boundary else 0
         # Check both boundaries: a legacy checkpoint may precede acceptance.
         # Upgrading a local-only bound must not reopen its ambiguous interval.
         account_valid = all(
@@ -440,28 +441,30 @@ class Reconciler:
             and (previous is None or all(
                 (getattr(previous, wallet + "_event_upper_bound") is None
                  or getattr(account, wallet + "_event_upper_bound") is not None)
-                and repo.account_event_boundary(account, wallet) >= repo.account_event_boundary(previous, wallet)
+                and repo.account_event_boundary(account, wallet) >= repo.account_event_boundary(
+                    previous, wallet, settlement_epoch=epoch)
                 for wallet in ("futures", "spot")
             ))
             for previous in (quote_before, boundary["account"] if boundary else None)
         )
         strict = strict_at_start or repo.settlement_window_open()
-        window_before = quote_before
+        window_before, window_epoch = quote_before, epoch
         if strict:
-            anchors = [op.balance_before for op in repo.operations(active_only=True)
+            anchors = [(op.balance_before, op.settlement_epoch) for op in repo.operations(active_only=True)
                        if op.balance_before is not None and op.balance_before.ts is not None]
             if quote_before is not None:
-                anchors.append(quote_before)
+                anchors.append((quote_before, epoch))
             if anchors:
-                window_before = min(anchors, key=lambda a: utc(a.ts))
+                window_before, window_epoch = min(anchors, key=lambda a: utc(a[0].ts))
         observations = [
-            (op.balance_before, op.payload.asset) for op in pending_transfers
+            (op.balance_before, op.payload.asset, op.settlement_epoch) for op in pending_transfers
             if op.status == OperationStatus.CONFIRMED and op.balance_before is not None
             and op.balance_before.ts is not None
         ]
         if strict and account.contract_total_margin_balance is not None:
             observations.extend(
-                (before, cfg.quote_asset) for before in (quote_before, window_before)
+                (before, cfg.quote_asset, before_epoch)
+                for before, before_epoch in ((quote_before, epoch), (window_before, window_epoch))
                 if before is not None and account.contract_margin_asset == cfg.quote_asset
             )
         coverage = (
@@ -505,7 +508,7 @@ class Reconciler:
             policy = None
             if strict and quote_before is not None and account.contract_total_margin_balance is not None:
                 quote_settled, anchor, evidence = futures_settlement_evidence(
-                    repo, quote_before, account, cfg.quote_asset, samples=samples
+                    repo, quote_before, account, cfg.quote_asset, samples=samples, settlement_epoch=epoch
                 )
                 if not quote_settled:
                     futures_issues["quote"] = evidence
@@ -516,7 +519,8 @@ class Reconciler:
                     spot_before = {"account": anchor, "cursor": anchor.wallet_event_cursor}
                 if quote_settled and policy is None and window_before is not quote_before:
                     window_valid, _, window_evidence = futures_settlement_evidence(
-                        repo, window_before, account, cfg.quote_asset, samples=samples)
+                        repo, window_before, account, cfg.quote_asset, samples=samples,
+                        settlement_epoch=window_epoch)
                     window_policy = settlement_policy_issue(window_evidence)
                     if not window_valid or window_policy is not None:
                         futures_issues["window"] = window_evidence if not window_valid else window_policy
@@ -655,11 +659,11 @@ class Reconciler:
         repo = self.repository
         now = utc(self.clock() if self.clock else account.ts)
         windows = []
-        for before, asset in observations:
+        for before, asset, epoch in observations:
             lower = futures_evidence_time(before, asset)
             upper = futures_evidence_time(account, asset)
             if (
-                lower <= repo.account_event_boundary(before, "futures")
+                lower <= repo.account_event_boundary(before, "futures", settlement_epoch=epoch)
                 and lower < upper <= repo.account_event_boundary(account, "futures")
             ):
                 windows.append((utc(before.ts) - timedelta(seconds=1), upper))
@@ -923,7 +927,7 @@ class Reconciler:
             issues[op.client_id] = {"reason": "Missing pre-transfer futures baseline"}
             return False
         valid, _, evidence = futures_settlement_evidence(
-            repo, before, account, p.asset, samples=samples
+            repo, before, account, p.asset, samples=samples, settlement_epoch=op.settlement_epoch
         )
         receipt = repo.transfer_record(op.exchange_id)
         if (

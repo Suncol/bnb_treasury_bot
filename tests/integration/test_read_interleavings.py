@@ -283,7 +283,10 @@ def test_first_server_observation_cannot_retreat_past_old_sell(sdk, tmp_path, le
     runner.tick()
     buys = [op for op in ex.writes if op.kind == OperationKind.ORDER]
     assert len(buys) == 1
-    assert repo.account_event_boundary(repo.load('spot_acceptance')['account'], 'spot') >= repo.account_event_boundary(accepted['account'], 'spot')
+    current = repo.load('spot_acceptance')
+    assert repo.account_event_boundary(
+        current['account'], 'spot', settlement_epoch=current['epoch']) >= repo.account_event_boundary(
+        accepted['account'], 'spot', settlement_epoch=accepted['epoch'])
     ex.now += timedelta(seconds=11)
     runner.tick()
     assert len([op for op in ex.writes if op.kind == OperationKind.ORDER]) == 1

@@ -10,7 +10,10 @@ from storage.repository import Repository
 from tests.helpers import D, make_account, make_engine_inputs, make_strategy_config
 
 
-@pytest.mark.parametrize('case', ['late', 'historical', 'future', 'missing_cursor', 'earlier_server_bound'])
+@pytest.mark.parametrize('case', [
+    'accepted', 'late', 'historical', 'future', 'missing_cursor', 'earlier_server_bound',
+    'earlier_epoch', 'unknown_epoch',
+])
 def test_acceptance_does_not_exempt_new_or_earlier_foreign_policy_windows(tmp_path, case):
     repo = Repository(tmp_path / 'foreign-boundary.db')
     original = make_account()
@@ -42,10 +45,15 @@ def test_acceptance_does_not_exempt_new_or_earlier_foreign_policy_windows(tmp_pa
         # A later idle acceptance cannot erase currency conversion requirements
         # from a historical margin interval that began before that acceptance.
         before = replace(before, ts=original.ts - timedelta(seconds=2))
-    valid, _, evidence = futures_settlement_evidence(repo, before, after, 'USDT')
+    epoch = repo.settlement_epoch()
+    if case == 'earlier_epoch':
+        epoch -= 1
+    elif case == 'unknown_epoch':
+        epoch = None
+    valid, _, evidence = futures_settlement_evidence(repo, before, after, 'USDT', settlement_epoch=epoch)
     assert valid, evidence
-    assert evidence['foreign_transfer_assets'] == ('USDC',)
-    assert settlement_policy_issue(evidence) is not None
+    assert evidence['foreign_transfer_assets'] == (() if case == 'accepted' else ('USDC',))
+    assert (settlement_policy_issue(evidence) is None) == (case == 'accepted')
     repo.close()
 
 

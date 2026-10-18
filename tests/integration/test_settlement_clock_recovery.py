@@ -92,7 +92,8 @@ def test_retiring_first_intent_does_not_reopen_original_acquisition(sdk, tmp_pat
     assert repo.operation(first.client_id).balance_pending is False
     if legacy:
         legacy_observations(repo)
-    original_boundary = repo.account_event_boundary(repo.load('spot_acceptance')['account'], 'spot')
+    original_boundary = repo.account_event_boundary(
+        repo.load('spot_acceptance')['account'], 'spot', settlement_epoch=acceptance['epoch'])
     assert original_boundary > start + timedelta(seconds=2.5)
     if restart:
         path, cfg = repo.path, runner.cfg
@@ -105,7 +106,8 @@ def test_retiring_first_intent_does_not_reopen_original_acquisition(sdk, tmp_pat
     assert repo.operation(first.client_id).balance_pending is False
     assert first.client_id not in {op.client_id for op in repo.operations(active_only=True)}
     assert second.client_id in {op.client_id for op in repo.operations(active_only=True)}
-    retired_boundary = repo.account_event_boundary(repo.load('spot_acceptance')['account'], 'spot')
+    retired_boundary = repo.account_event_boundary(
+        repo.load('spot_acceptance')['account'], 'spot', settlement_epoch=acceptance['epoch'])
     assert retired_boundary == original_boundary
     assert repo.load('spot_acceptance')['epoch'] == acceptance['epoch']
     if restart:

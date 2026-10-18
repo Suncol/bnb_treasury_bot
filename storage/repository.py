@@ -106,6 +106,10 @@ class Repository:
                 "CREATE INDEX IF NOT EXISTS operations_exchange ON operations(kind,exchange_id)",
                 "CREATE INDEX IF NOT EXISTS operations_scope ON operations(scope,status)",
                 "CREATE INDEX IF NOT EXISTS operations_scope_created ON operations(scope,created DESC)",
+                "CREATE INDEX IF NOT EXISTS operations_observation ON operations("
+                "COALESCE(json_extract(data,'$.fields.settlement_epoch'),0),"
+                "julianday(json_extract(data,'$.fields.balance_before.fields.ts.value')),"
+                "created,client_id) WHERE kind!='CANCEL'",
                 "CREATE INDEX IF NOT EXISTS fills_time ON fills(ts,trade_id)",
                 "CREATE INDEX IF NOT EXISTS fills_order ON fills(symbol,order_id)",
                 "CREATE INDEX IF NOT EXISTS transfers_time ON transfers(ts,transfer_id)",
@@ -339,12 +343,12 @@ class Repository:
     def settlement_epoch(self):
         return (self.load("spot_acceptance") or {}).get("epoch", 0)
 
-    def account_event_boundary(self, account, wallet):
+    def account_event_boundary(self, account, wallet, *, settlement_epoch=None):
         """Upper bound in the receipt clock domain, never event coverage.
 
         Legacy local bounds include the full permitted clock skew. Missing read
-        completion can only be bounded by an original intent with this baseline,
-        regardless of whether it later failed or retired.
+        completion can only be bounded by an original intent with this baseline
+        in its known acceptance generation, even if it later failed or retired.
         Today's server clock cannot reconstruct a historical clock offset.
         """
         bound = getattr(account, wallet + "_event_upper_bound")
@@ -354,14 +358,22 @@ class Repository:
         if end is not None:
             return utc(end) + timedelta(seconds=1)
         start = utc(account.ts)
-        bounds = [
-            utc(op.created_at) for op in self.operations()
-            if op.kind != OperationKind.CANCEL
-            and op.balance_before is not None
-            and replace(account, wallet_event_cursor=op.balance_before.wallet_event_cursor) == op.balance_before
-            and utc(op.created_at) >= start
-        ]
-        return min(bounds, default=start) + timedelta(seconds=1)
+        if settlement_epoch is not None:
+            # The index narrows by generation and normalized observation time.
+            # Exact account equality still checks all financial/version fields;
+            # SQLite time precision and a wallet cursor cannot prove identity.
+            for (data,) in self.db.execute(
+                "SELECT data FROM operations WHERE kind!='CANCEL' "
+                "AND COALESCE(json_extract(data,'$.fields.settlement_epoch'),0)=? "
+                "AND julianday(json_extract(data,'$.fields.balance_before.fields.ts.value'))=julianday(?) "
+                "AND created>=? ORDER BY created,client_id",
+                (settlement_epoch, start.isoformat(), start.timestamp()),
+            ):
+                op = loads(data)
+                if (op.balance_before is not None
+                    and replace(account, wallet_event_cursor=op.balance_before.wallet_event_cursor) == op.balance_before):
+                    return utc(op.created_at) + timedelta(seconds=1)
+        return start + timedelta(seconds=1)
 
     def accept_inventory_observation(self, account):
         """Atomically accept both accounts outside all journaled responsibility.
@@ -397,21 +409,23 @@ class Repository:
                 self.db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
                                 (key, dumps(value)))
 
-    def unaccepted_income(self, records, *, before=None):
+    def unaccepted_income(self, records, *, before=None, settlement_epoch=None, ambiguous_only=False):
         """Exclude only the known history prefix of an applicable acceptance.
 
         This scopes policy/ambiguity checks, never signed balance evidence.
-        Historical baselines preceding acceptance must still see that history.
+        Historical baselines without this generation must still see that history.
+        Ambiguity checks only need receipts through the acceptance boundary.
         """
         boundary = self.load("spot_acceptance")
         if boundary is None:
-            return tuple(records)
-        end = self.account_event_boundary(boundary["account"], "futures")
+            return () if ambiguous_only else tuple(records)
+        end = self.account_event_boundary(boundary["account"], "futures", settlement_epoch=boundary["epoch"])
         if before is not None and (
-            utc(before.ts) < utc(boundary["account"].ts)
+            settlement_epoch != boundary["epoch"]
+            or utc(before.ts) < utc(boundary["account"].ts)
             or before.wallet_event_cursor is None
             or before.wallet_event_cursor < boundary["cursor"]
-            or self.account_event_boundary(before, "futures") < end
+            or self.account_event_boundary(before, "futures", settlement_epoch=settlement_epoch) < end
         ):
             return tuple(records)
         remaining = []
@@ -421,16 +435,13 @@ class Repository:
                                       (record.income_type, record.transaction_id)).fetchone()
                 if row is not None and row[0] <= boundary.get("income_cursor", 0):
                     continue
-            remaining.append(record)
+            if not ambiguous_only or utc(record.ts) <= end:
+                remaining.append(record)
         return tuple(remaining)
 
     def ambiguous_income(self, records):
-        boundary = self.load("spot_acceptance")
-        if boundary is None:
-            return ()
-        end = self.account_event_boundary(boundary["account"], "futures")
         return tuple((r.income_type, r.transaction_id)
-                     for r in self.unaccepted_income(records) if utc(r.ts) <= end)
+                     for r in self.unaccepted_income(records, ambiguous_only=True))
 
     def ambiguous_wallet_events(self, cursor, through):
         boundary = self.load("spot_acceptance")
@@ -439,7 +450,8 @@ class Repository:
         ambiguous = []
         for reference, in self.db.execute(
             "SELECT reference FROM wallet_events WHERE id>? AND id<=? AND ts<=? ORDER BY id",
-            (cursor, through, self.account_event_boundary(boundary["account"], "spot").timestamp()),
+            (cursor, through, self.account_event_boundary(
+                boundary["account"], "spot", settlement_epoch=boundary["epoch"]).timestamp()),
         ):
             parts = reference.split(":")
             owner = None

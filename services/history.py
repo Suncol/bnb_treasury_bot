@@ -105,19 +105,19 @@ def settlement_policy_issue(evidence):
     return None
 
 
-def futures_settlement_evidence(repository, before, account, asset, *, samples=()):
+def futures_settlement_evidence(repository, before, account, asset, *, samples=(), settlement_epoch=None):
     """The same signed-flow and wallet proof serves transfers and margin history."""
-    evidence = _settlement_evidence(repository, before, account, asset, before)
+    evidence = _settlement_evidence(repository, before, account, asset, before, settlement_epoch)
     if evidence[0]:
         return evidence
     for anchor in settlement_baselines(repository, samples, before, account, asset):
-        evidence = _settlement_evidence(repository, before, account, asset, anchor)
+        evidence = _settlement_evidence(repository, before, account, asset, anchor, settlement_epoch)
         if evidence[0]:
             return evidence
     return evidence
 
 
-def _settlement_evidence(repository, before, account, asset, anchor):
+def _settlement_evidence(repository, before, account, asset, anchor, settlement_epoch):
     field = "contract_bnb" if asset == "BNB" else "contract_quote_balance"
     version = "contract_bnb_updated_at" if asset == "BNB" else "contract_quote_updated_at"
     lower = futures_evidence_time(before, asset)
@@ -169,7 +169,8 @@ def _settlement_evidence(repository, before, account, asset, anchor):
         if r.income_type == "TRANSFER" and r.asset not in {asset, "BNB"}
         and foreign_since < utc(r.ts) <= repository.account_event_boundary(account, "futures")
     )
-    foreign_assets.update(r.asset for r in repository.unaccepted_income(foreign_income, before=before))
+    foreign_assets.update(r.asset for r in repository.unaccepted_income(
+        foreign_income, before=before, settlement_epoch=settlement_epoch))
     wallet_flows = transfer_flows(
         t.amount if t.to_account == "USDⓈ-M Futures" else -t.amount
         for t in transfers
@@ -190,11 +191,12 @@ def _settlement_evidence(repository, before, account, asset, anchor):
     valid = (
         not ambiguous and previous is not None and actual is not None
         and previous.is_finite() and actual.is_finite()
-        and lower <= repository.account_event_boundary(before, "futures")
+        and lower <= repository.account_event_boundary(before, "futures", settlement_epoch=settlement_epoch)
         and lower <= upper <= repository.account_event_boundary(account, "futures")
         and (getattr(account, version) is None or lower == upper or bool(income))
         and anchor_lower <= lower
-        and anchor_lower <= repository.account_event_boundary(anchor, "futures")
+        and anchor_lower <= repository.account_event_boundary(
+            anchor, "futures", settlement_epoch=settlement_epoch if anchor is before else None)
         and anchor_wallet is not None and anchor_wallet.is_finite()
         and anchor_wallet + sum(
             (r.amount for r in covered_income if utc(r.ts) <= lower), ZERO
