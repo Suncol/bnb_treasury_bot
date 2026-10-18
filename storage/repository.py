@@ -343,7 +343,8 @@ class Repository:
         """Upper bound in the receipt clock domain, never event coverage.
 
         Legacy local bounds include the full permitted clock skew. Missing read
-        completion can only be bounded by an original intent with this baseline.
+        completion can only be bounded by an original intent with this baseline,
+        regardless of whether it later failed or retired.
         Today's server clock cannot reconstruct a historical clock offset.
         """
         bound = getattr(account, wallet + "_event_upper_bound")
@@ -354,8 +355,8 @@ class Repository:
             return utc(end) + timedelta(seconds=1)
         start = utc(account.ts)
         bounds = [
-            utc(op.created_at) for op in self.operations(active_only=True)
-            if op.kind != OperationKind.CANCEL and op.status != OperationStatus.FAILED
+            utc(op.created_at) for op in self.operations()
+            if op.kind != OperationKind.CANCEL
             and op.balance_before is not None
             and replace(account, wallet_event_cursor=op.balance_before.wallet_event_cursor) == op.balance_before
             and utc(op.created_at) >= start
@@ -396,20 +397,40 @@ class Repository:
                 self.db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
                                 (key, dumps(value)))
 
+    def unaccepted_income(self, records, *, before=None):
+        """Exclude only the known history prefix of an applicable acceptance.
+
+        This scopes policy/ambiguity checks, never signed balance evidence.
+        Historical baselines preceding acceptance must still see that history.
+        """
+        boundary = self.load("spot_acceptance")
+        if boundary is None:
+            return tuple(records)
+        end = self.account_event_boundary(boundary["account"], "futures")
+        if before is not None and (
+            utc(before.ts) < utc(boundary["account"].ts)
+            or before.wallet_event_cursor is None
+            or before.wallet_event_cursor < boundary["cursor"]
+            or self.account_event_boundary(before, "futures") < end
+        ):
+            return tuple(records)
+        remaining = []
+        for record in records:
+            if utc(record.ts) <= end:
+                row = self.db.execute("SELECT rowid FROM futures_income WHERE income_type=? AND transaction_id=?",
+                                      (record.income_type, record.transaction_id)).fetchone()
+                if row is not None and row[0] <= boundary.get("income_cursor", 0):
+                    continue
+            remaining.append(record)
+        return tuple(remaining)
+
     def ambiguous_income(self, records):
         boundary = self.load("spot_acceptance")
         if boundary is None:
             return ()
-        ambiguous = []
         end = self.account_event_boundary(boundary["account"], "futures")
-        for record in records:
-            if utc(record.ts) > end:
-                continue
-            row = self.db.execute("SELECT rowid FROM futures_income WHERE income_type=? AND transaction_id=?",
-                                  (record.income_type, record.transaction_id)).fetchone()
-            if row is not None and row[0] > boundary.get("income_cursor", 0):
-                ambiguous.append((record.income_type, record.transaction_id))
-        return tuple(ambiguous)
+        return tuple((r.income_type, r.transaction_id)
+                     for r in self.unaccepted_income(records) if utc(r.ts) <= end)
 
     def ambiguous_wallet_events(self, cursor, through):
         boundary = self.load("spot_acceptance")

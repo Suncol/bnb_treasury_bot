@@ -1,13 +1,44 @@
 from dataclasses import replace
+from datetime import timedelta
 import sqlite3
 
 import pytest
 
-from core.models import FuturesIncome
+from core.models import FuturesIncome, Operation, OperationKind, OperationStatus, OrderPlan
+from core.time_utils import utc
 from services.executor import Executor
 from storage.repository import Repository
 from tests.recovery_helpers import funded, initialize, transfer
-from tests.helpers import D, make_strategy_config
+from tests.helpers import D, make_account, make_strategy_config
+
+
+@pytest.mark.parametrize('terminal', ['retired', 'failed', 'not_sent'])
+def test_original_intent_keeps_legacy_acquisition_bound_after_terminal_result(tmp_path, terminal):
+    path = tmp_path / 'legacy-bound.db'
+    repo = Repository(path)
+    before = replace(make_account(), wallet_event_cursor=0)
+    repo.initialize_spot_checkpoint(before, {'reason': 'quiescent fixture'})
+    repo.accept_inventory_observation(before)
+    op = Operation('original', OperationKind.ORDER, 'order:BNBUSDT',
+                   OrderPlan('BNBUSDT', 'BUY', 'LIMIT_MAKER', D('1'), D('598'), 'GTC', True),
+                   before.ts + timedelta(seconds=3), balance_before=before,
+                   settlement_epoch=repo.settlement_epoch())
+    repo.record_intent(op, repo.runtime())
+    expected = utc(op.created_at) + timedelta(seconds=1)
+    for wallet in ('spot', 'futures'):
+        assert repo.account_event_boundary(before, wallet) == expected
+    repo.update_operation(replace(op, status=(OperationStatus.CONFIRMED if terminal == 'retired'
+                                              else OperationStatus.FAILED),
+                                  not_sent=terminal == 'not_sent'))
+    if terminal == 'retired':
+        repo.retire_order(op.client_id)
+    assert not repo.operations(active_only=True)
+    repo.close()
+    repo = Repository(path)
+    assert repo.operation(op.client_id).balance_before == before
+    for wallet in ('spot', 'futures'):
+        assert repo.account_event_boundary(before, wallet) == expected
+    repo.close()
 
 
 def test_transfer_status_receipt_and_wallet_event_commit_atomically(tmp_path):

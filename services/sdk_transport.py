@@ -349,6 +349,7 @@ class SDKTransport:
             and bool(params.get("order_id") or params.get("orig_client_order_id"))
         )
         cost = request_cost(scope, endpoint, params)
+        clock_read = endpoint in {"time", "check_server_time"}
         try:
             if scope == "futures" and endpoint != "exchange_information":
                 self.ensure_request_allowed(scope=scope, request_weight=cost)
@@ -372,7 +373,11 @@ class SDKTransport:
                 orders_only=exc.orders_only,
             ) from exc
         try:
+            # Checkpoints, metadata and budget-lock waits precede the actual
+            # time request; none of their latency measures server clock skew.
+            before = millis(self.clock()) if clock_read else None
             response = method(**params)
+            after = millis(self.clock()) if clock_read else None
             weights = {
                 k.lower(): v
                 for k, v in getattr(response, "headers", {}).items()
@@ -392,7 +397,6 @@ class SDKTransport:
                     self._observe_order_counts(scope, weights, data, observation)
                 else:
                     self._observe_request_budget(scope, weights, data, observation=observation)
-            return data
         except SDKError as exc:
             status = next(
                 (
@@ -438,6 +442,10 @@ class SDKTransport:
         finally:
             with self._budget_lock:
                 self._finish_weight_reservation(observation)
+        if clock_read and (after < before or abs(int(data["serverTime"]) - (before + after) // 2) > 1000):
+            raise ExchangeError("System clock differs from Binance; synchronize it before trading",
+                                endpoint=endpoint)
+        return data
 
     def _cached(self, key, seconds, fetch):
         cached = self.cache.get(key)

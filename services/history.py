@@ -164,11 +164,12 @@ def _settlement_evidence(repository, before, account, asset, anchor):
     foreign_since = (utc(before.futures_event_upper_bound)
                      if before.futures_event_upper_bound is not None
                      else utc(before.ts) - timedelta(seconds=1))
-    foreign_assets.update(
-        r.asset for r in records
+    foreign_income = (
+        r for r in records
         if r.income_type == "TRANSFER" and r.asset not in {asset, "BNB"}
         and foreign_since < utc(r.ts) <= repository.account_event_boundary(account, "futures")
     )
+    foreign_assets.update(r.asset for r in repository.unaccepted_income(foreign_income, before=before))
     wallet_flows = transfer_flows(
         t.amount if t.to_account == "USDⓈ-M Futures" else -t.amount
         for t in transfers

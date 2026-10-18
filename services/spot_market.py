@@ -12,7 +12,7 @@ from binance_sdk_spot.spot import Spot
 from core.models import MarketSnapshot, SymbolFilters
 from core.time_utils import fresh, utc
 from .exchange_adapter import ExchangeError
-from .sdk_transport import BinanceAPIError, SDKTransport, millis, timestamp
+from .sdk_transport import BinanceAPIError, SDKTransport, timestamp
 from .price_refresh import PriceRefresh
 
 D = Decimal
@@ -75,14 +75,7 @@ class SpotMarketData(SDKTransport):
         return self._order_count()
 
     def check_clock(self):
-        def check():
-            before = millis(self.clock())
-            server = self._call(self.spot.time)["serverTime"]
-            after = millis(self.clock())
-            if abs(int(server) - (before + after) // 2) > 1000:
-                raise ExchangeError("System clock differs from Binance; synchronize it before trading")
-            return True
-        self._cached("clock", 1800, check)
+        self._cached("clock", 1800, lambda: self._call(self.spot.time))
 
     def fetch_symbol_filters(self, symbol):
         def metadata():

@@ -10,6 +10,45 @@ from storage.repository import Repository
 from tests.helpers import D, make_account, make_engine_inputs, make_strategy_config
 
 
+@pytest.mark.parametrize('case', ['late', 'historical', 'future', 'missing_cursor', 'earlier_server_bound'])
+def test_acceptance_does_not_exempt_new_or_earlier_foreign_policy_windows(tmp_path, case):
+    repo = Repository(tmp_path / 'foreign-boundary.db')
+    original = make_account()
+    before = replace(original, wallet_event_cursor=0,
+                     contract_quote_balance=D('10000'), contract_total_margin_balance=D('10000'),
+                     contract_quote_updated_at=original.ts - timedelta(minutes=1),
+                     contract_margin_asset='USDT')
+    receipt = FuturesIncome('TRANSFER', 'usdc', 'USDC', D('3000'),
+                            original.ts + timedelta(seconds=2) if case == 'future'
+                            else original.ts - timedelta(milliseconds=500))
+    if case == 'earlier_server_bound':
+        before = replace(before, futures_event_upper_bound=original.ts)
+        receipt = replace(receipt, ts=original.ts + timedelta(milliseconds=250))
+    accepted = (replace(before, futures_event_upper_bound=original.ts + timedelta(milliseconds=500))
+                if case == 'earlier_server_bound' else before)
+    repo.initialize_spot_checkpoint(accepted, {'reason': 'quiescent fixture'})
+    if case != 'late':
+        repo.save_futures_income((receipt,))
+    repo.accept_inventory_observation(accepted)
+    if case == 'late':
+        repo.save_futures_income((receipt,))
+    if case == 'missing_cursor':
+        accepted = repo.load('spot_acceptance')
+        accepted.pop('income_cursor')
+        repo.save('spot_acceptance', accepted)
+    after = replace(before, ts=original.ts + timedelta(seconds=5),
+                    futures_event_upper_bound=original.ts + timedelta(seconds=5))
+    if case == 'historical':
+        # A later idle acceptance cannot erase currency conversion requirements
+        # from a historical margin interval that began before that acceptance.
+        before = replace(before, ts=original.ts - timedelta(seconds=2))
+    valid, _, evidence = futures_settlement_evidence(repo, before, after, 'USDT')
+    assert valid, evidence
+    assert evidence['foreign_transfer_assets'] == ('USDC',)
+    assert settlement_policy_issue(evidence) is not None
+    repo.close()
+
+
 @pytest.mark.parametrize('legacy', [False, True])
 @pytest.mark.parametrize('skew_ms', [-1000, -500, 0, 500, 1000])
 def test_foreign_income_uses_the_original_futures_clock_boundary(tmp_path, legacy, skew_ms):

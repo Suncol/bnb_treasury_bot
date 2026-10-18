@@ -100,14 +100,7 @@ class BinanceAdapter(SpotMarketData):
         self.live = live
 
     def _server_time(self, method):
-        if self.read_checkpoint is not None:
-            self.read_checkpoint()
-        before = millis(self.clock())
-        server = self._call(method, checkpoint=False)["serverTime"]
-        after = millis(self.clock())
-        if after < before or abs(int(server) - (before + after) // 2) > 1000:
-            raise ExchangeError("System clock differs from Binance; synchronize it before trading")
-        return timestamp(server)
+        return timestamp(self._call(method)["serverTime"])
 
     def transfer_clock_ready(self, account):
         # A transfer income has no cross-API identity exemption. Its timestamp
