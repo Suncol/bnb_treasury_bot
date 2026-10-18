@@ -342,8 +342,8 @@ class Repository:
     def accept_inventory_observation(self, account):
         """Atomically accept both accounts outside all journaled responsibility.
 
-        Repeated observations with identical financial content do not create
-        another generation. The timestamp/cursors record a replay boundary,
+        Every acceptance creates a generation, including timestamp ties and
+        unchanged balances. The timestamp/cursors record a replay boundary,
         never exchange-side proof of coverage for an individual operation.
         """
         with self.db:
@@ -356,12 +356,12 @@ class Repository:
             changed = previous is None or (
                 replace(self.load("spot_checkpoint")["account"], ts=account.ts) != account
             )
+            acceptance = {"account": account, "cursor": cursor,
+                          "income_cursor": self.db.execute("SELECT COALESCE(MAX(rowid),0) FROM futures_income").fetchone()[0],
+                          "epoch": self.settlement_epoch() + 1}
+            self.db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
+                            ("spot_acceptance", dumps(acceptance)))
             if changed:
-                acceptance = {"account": account, "cursor": cursor,
-                              "income_cursor": self.db.execute("SELECT COALESCE(MAX(rowid),0) FROM futures_income").fetchone()[0],
-                              "epoch": self.settlement_epoch() + 1}
-                self.db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
-                                ("spot_acceptance", dumps(acceptance)))
                 self.db.execute("INSERT INTO events(ts,kind,data) VALUES (?,?,?)",
                                 (utc(account.ts).timestamp(), "EXTERNAL_INVENTORY_ACCEPTED", dumps(acceptance)))
             for key, value in (("spot_checkpoint", {"account": account, "cursor": cursor}),

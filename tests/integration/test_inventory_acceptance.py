@@ -24,7 +24,7 @@ def test_idle_external_spot_balance_becomes_new_baseline_and_next_order_settles(
     assert repo.load("spot_checkpoint")["account"] == account
     assert repo.budget_used(exchange.now, "USDT") == 0
     op = seed_bid(exchange, repo)
-    assert op.settlement_epoch == 1
+    assert op.settlement_epoch == repo.settlement_epoch()
     exchange.fill(op.exchange_id, D("1"))
     runner.reconciler.refresh(exchange.now)
     assert not repo.operation(op.client_id).unresolved
@@ -99,8 +99,8 @@ def test_new_window_does_not_replay_ambiguous_old_external_fill(tmp_path):
     exchange, repo, runner = setup(tmp_path, FakeExchange(make_account(spot_usd=D("5000"))))
     exchange.account = replace(exchange.account, spot_usd=D("5100"))
     runner.reconciler.refresh(exchange.now)
-    accepted = repo.load("spot_acceptance")
     op = seed_bid(exchange, repo)
+    accepted = repo.load("spot_acceptance")
     exchange.fills.append(Fill("BNBUSDT", "old", "external", exchange.now, D("1"), quote_qty=D("600")))
     assert runner.reconciler.refresh(exchange.now)[2].unresolved
     assert repo.load("spot_settlement_issue")["ambiguous_receipts"]

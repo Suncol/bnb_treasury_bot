@@ -187,7 +187,7 @@ def test_clock_rollback_during_request_does_not_lower_order_count(sdk):
 
 @pytest.mark.parametrize('kind,older,newer,expected', [
     ('ORDERS', 90, 1, 1), ('ORDERS', 1, 90, 90),
-    ('REQUEST_WEIGHT', 90, 1, 90), ('REQUEST_WEIGHT', 1, 90, 90),
+    ('REQUEST_WEIGHT', 90, 1, 90), ('REQUEST_WEIGHT', 1, 90, 94),
 ])
 def test_reordered_sdk_responses_respect_each_quota_semantics(sdk, kind, older, newer, expected):
     adapter, _, responses = sdk
@@ -211,7 +211,7 @@ def test_reordered_sdk_responses_respect_each_quota_semantics(sdk, kind, older, 
             release.set()
         pending.result(timeout=3)
     assert adapter.weight_usage['spot', header][0] == expected
-    if expected == 90:
+    if expected >= 90:
         with pytest.raises(RequestDeferred):
             adapter.ensure_request_allowed(new_order=True)
     else:

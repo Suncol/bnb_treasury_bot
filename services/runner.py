@@ -517,6 +517,13 @@ class Runner:
                 last_inventory_attempt_at=now
                 if inventory
                 else runtime.last_inventory_attempt_at,
+                resume_replanning=runtime.resume_replanning or (
+                    inventory and verified and self.execute_enabled
+                    and plan.state_decision.confirmed_state in {
+                        ReplenishmentState.WATCH, ReplenishmentState.ACCUMULATE,
+                    }
+                    and bool(plan.buy_plan.orders) and not runtime.resume_replenishment
+                ),
                 funding_exhausted_at=None
                 if (inventory and verified and runtime.funding_exhausted_at is not None
                     and utc(now) > utc(runtime.funding_exhausted_at))

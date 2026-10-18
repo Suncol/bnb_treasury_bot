@@ -152,7 +152,6 @@ class BinanceAdapter(SpotMarketData):
         if (
             D(margin_quote["walletBalance"]) != D(quote["balance"])
             or margin_quote.get("updateTime") != quote.get("updateTime")
-            or D(margin_quote["maxWithdrawAmount"]) != D(quote["maxWithdrawAmount"])
         ):
             raise AccountObservationInconsistent(
                 "Futures balance and margin observations disagree",
@@ -176,7 +175,9 @@ class BinanceAdapter(SpotMarketData):
         return AccountSnapshot(
             started,
             D(assets.get("BNB", {}).get("balance", "0")),
-            D(quote["maxWithdrawAmount"]),
+            # Risk capacity can change between reads even when wallet/version
+            # agree. Use the later asset observation for every transfer gate.
+            D(margin_quote["maxWithdrawAmount"]),
             D(quote["availableBalance"]),
             D(bnb["free"]) + D(bnb["locked"]),
             D(usd["free"]) + D(usd["locked"]),

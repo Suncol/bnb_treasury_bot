@@ -43,20 +43,18 @@ def observe(runner, current):
 
 
 def test_withdrawal_limit_disagreement_cannot_return_the_earlier_high_limit(observed_account):
-    from services.exchange_adapter import AccountObservationInconsistent
-
     adapter, repo, runner, current, calls, responses = observed_account
     balance = responses['GET', '/fapi/v3/balance'][1][1]
     margin = responses['GET', '/fapi/v3/account'][1]['assets'][0]
     balance['maxWithdrawAmount'] = '50000'
     margin['maxWithdrawAmount'] = '4000'
-    with pytest.raises(AccountObservationInconsistent):
-        adapter.fetch_account_snapshot()
+    assert adapter.fetch_account_snapshot().contract_max_withdraw_amount == 4000
     for _ in range(3):
-        assert observe(runner, current) is None
+        assert observe(runner, current).inventory_valid
         assert repo.runtime().run_mode == RunMode.AUTO
         assert repo.runtime().api_errors == 0
-        current[0] = repo.runtime().read_retry_at
+        assert runner.cached_inputs.account.contract_max_withdraw_amount == 4000
+        current[0] += timedelta(seconds=30)
     margin['maxWithdrawAmount'] = '50000'
     plan = observe(runner, current)
     assert plan.inventory_valid
@@ -65,7 +63,51 @@ def test_withdrawal_limit_disagreement_cannot_return_the_earlier_high_limit(obse
     assert all(call['method'] == 'GET' for call in calls)
 
 
-def test_real_sdk_final_preflight_vetoes_a_consistent_lower_limit(sdk, tmp_path):
+def test_dynamic_withdrawal_limit_does_not_block_existing_bnb_return(observed_account):
+    from tests.helpers import D
+
+    adapter, repo, runner, current, calls, responses = observed_account
+    runner.execute_enabled = False
+    responses['GET', '/fapi/v3/balance'][1][0]['balance'] = '24'
+    responses['GET', '/fapi/v3/balance'][1][1]['maxWithdrawAmount'] = '50000'
+    responses['GET', '/fapi/v3/account'][1]['assets'][0]['maxWithdrawAmount'] = '49999.99'
+    responses['GET', '/api/v3/account'][1]['balances'][0]['free'] = '8.5'
+    plan = observe(runner, current)
+    assert plan.inventory_valid
+    assert plan.bnb_transfer_plan.amount == D('8')
+    assert runner.cached_inputs.account.contract_max_withdraw_amount == D('49999.99')
+    assert not repo.operations()
+
+
+def test_dynamic_withdrawal_limit_keeps_a_normal_maker_order(observed_account):
+    from core.models import OrderPlan
+    from tests.helpers import D
+
+    adapter, repo, runner, current, calls, responses = observed_account
+    responses['GET', '/fapi/v3/balance'][1][0]['balance'] = '27'
+    balances = responses['GET', '/api/v3/account'][1]['balances']
+    balances[1].update(free='5000', locked='0')
+    repo.save('runtime', replace(repo.runtime(), state=ReplenishmentState.ACCUMULATE))
+    responses['POST', '/api/v3/order'] = (200, {'orderId': 123, 'status': 'NEW'})
+    op = runner.executor.execute(
+        OrderPlan('BNBUSDT', 'BUY', 'LIMIT_MAKER', D('1'), D('598'), 'GTC', True),
+        NOW, ReplenishmentState.ACCUMULATE,
+    )
+    row = {'symbol': 'BNBUSDT', 'orderId': 123, 'clientOrderId': op.client_id,
+           'price': '598', 'origQty': '1', 'executedQty': '0', 'time': millis(NOW),
+           'side': 'BUY', 'status': 'NEW', 'timeInForce': 'GTC'}
+    responses['GET', '/api/v3/openOrders'] = (200, [row])
+    responses['GET', '/api/v3/order'] = (200, row)
+    balances[1].update(free='4402', locked='598')
+    responses['GET', '/fapi/v3/account'][1]['assets'][0]['maxWithdrawAmount'] = '4567.88'
+    plan = runner.run_once(market=replace(make_market(), ts=current[0]), inventory_cycle=False)
+    assert plan.inventory_valid and not plan.cancellations
+    assert repo.tracked_order(op.client_id).is_open
+    assert not repo.cancel_operation('BNBUSDT', '123')
+    assert [call['method'] for call in calls if call['method'] != 'GET'] == ['POST']
+
+
+def test_real_sdk_final_preflight_vetoes_the_latest_lower_limit(sdk, tmp_path):
     adapter, calls, responses = sdk
     account = funding_account_responses(sdk)
     filter_responses(responses)
@@ -76,7 +118,7 @@ def test_real_sdk_final_preflight_vetoes_a_consistent_lower_limit(sdk, tmp_path)
     def lower_limit_after_planning(request):
         maximum = '50000' if not observations else '4000'
         observations.append(maximum)
-        balance_response[1][1]['maxWithdrawAmount'] = maximum
+        balance_response[1][1]['maxWithdrawAmount'] = '50000'
         account_asset['maxWithdrawAmount'] = maximum
         return balance_response
 

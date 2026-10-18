@@ -30,7 +30,9 @@ NOW = datetime(2026, 3, 31, tzinfo=timezone.utc)
 @pytest.fixture
 def sdk(monkeypatch):
     calls = []
-    responses = {}
+    responses = {('GET', '/fapi/v1/exchangeInfo'): (200, {'rateLimits': [
+        {'rateLimitType': 'REQUEST_WEIGHT', 'interval': 'MINUTE', 'intervalNum': 1, 'limit': 2400},
+    ]})}
 
     def request(self, **kwargs):
         calls.append(kwargs)
@@ -521,7 +523,7 @@ def test_matching_engine_reason_in_server_error_never_proves_rejection(sdk, tmp_
 
 
 @pytest.mark.parametrize("case", ["cancel", "transfer", "sell", "fok", "maker_reason_on_limit", "other_endpoint", "401", "403", "500", "wrong_code", "changed_reason"])
-def test_order_rejection_allowlist_requires_complete_protocol_match(sdk, tmp_path, case):
+def test_order_rejection_allowlist_requires_complete_protocol_match(sdk, tmp_path, monkeypatch, case):
     adapter, calls, responses = sdk
     message = "Account has insufficient balance for requested action."
     code, status, method, path = -2010, 400, "POST", "/api/v3/order"
@@ -538,6 +540,11 @@ def test_order_rejection_allowlist_requires_complete_protocol_match(sdk, tmp_pat
     elif case == "maker_reason_on_limit":
         message = "Order would immediately match and take."
     elif case == "other_endpoint":
+        from services.sdk_transport import REQUEST_COSTS
+
+        # This wrapper still sends the same one-weight request; isolate the
+        # rejection allowlist from the separate unknown-cost admission gate.
+        monkeypatch.setitem(REQUEST_COSTS['spot'], 'unknown_mutation_endpoint', 1)
         new_order = adapter.spot.new_order
 
         def unknown_mutation_endpoint(**params):
@@ -1222,7 +1229,8 @@ def test_sdk_income_paginates_same_millisecond_without_joining_transfer_ids(sdk)
     rows = adapter.fetch_futures_income(NOW - timedelta(seconds=1), NOW)
     assert len(rows) == 1001
     assert sum(r.amount for r in rows) == D("-0.00001001")
-    assert len(calls) == 2
+    assert sum('/fapi/v1/income' in call['url'] for call in calls) == 2
+    assert sum('/fapi/v1/exchangeInfo' in call['url'] for call in calls) == 1
 
 
 def test_sdk_income_rejects_stalled_pagination_and_expired_evidence(sdk):

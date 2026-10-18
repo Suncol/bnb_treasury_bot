@@ -12,6 +12,7 @@ from core.models import (
     OperationStatus,
     OrderPlan,
 )
+from core.time_utils import utc
 from storage.codec import dumps
 from storage.repository import Repository
 from tests.helpers import D, make_account, make_engine_inputs
@@ -77,7 +78,7 @@ def test_hot_operations_and_empty_fill_updates_do_not_scan_cold_history(
 
 def test_legacy_migration_preserves_fill_rowids_and_pending_intents(tmp_path):
     path = tmp_path / "old.db"
-    now = make_engine_inputs().now
+    now = utc(make_engine_inputs().now)
     fill = Fill("BNBUSDT", "old-fill", "order", now, D("1"), quote_qty=D("600"))
     operation = Operation(
         "pending",

@@ -62,6 +62,11 @@ def slow_income_setup(tmp_path, *, with_bid=False, contract_bnb="27", spot_bnb="
     queries, pages, account_reads = [], [], []
 
     class FuturesPages:
+        def exchange_information(self):
+            return SimpleNamespace(data=lambda: {'rateLimits': [
+                {'rateLimitType': 'REQUEST_WEIGHT', 'interval': 'MINUTE', 'intervalNum': 1, 'limit': 2400},
+            ]}, headers={})
+
         def get_income_history(self, **params):
             pages.append((params["start_time"], params["end_time"], params["page"]))
             rows = [{"incomeType": row.income_type, "tranId": row.transaction_id,
@@ -597,7 +602,15 @@ def test_same_batch_cannot_reuse_scan_after_rollback_or_failed_proof(tmp_path, i
             first, _ = runner.reconciler.prepare_execution(exchange.now)
             assert runner.executor.income_audited(exchange.now, account=first)
             if invalidate == "rollback":
+                resume_at = exchange.now
+                checkpoint = repo.load("spot_checkpoint")
                 exchange.now -= timedelta(seconds=1)
+                with pytest.raises(ExecutionBlocked):
+                    runner.reconciler.prepare_execution(exchange.now)
+                assert repo.load("spot_checkpoint") == checkpoint
+                assert len(queries) == 1 and len(pages) == 3
+                assert not runner.executor.income_audited(exchange.now)
+                exchange.now = resume_at
             else:
                 original = exchange.account
                 exchange.account = replace(original, spot_usd=original.spot_usd + D("1"))

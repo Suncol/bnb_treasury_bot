@@ -70,11 +70,11 @@ def test_idle_legacy_source_errors_clear_only_after_valid_current_observation(tm
     assert not reconciler.refresh(ex.now)[2].unresolved
     assert not reconciliation_status(repo).blocked
     assert repo.runtime() == runtime and repo.settlement_epoch() == 1
-    for _ in range(2):
+    for epoch in (2, 3):
         repo, reconciler = reopen(repo, ex)
         ex.now += timedelta(seconds=1)
         reconciler.refresh(ex.now)
-        assert repo.settlement_epoch() == 1
+        assert repo.settlement_epoch() == epoch
     assert not ex.writes
     repo.close()
 
@@ -218,6 +218,7 @@ def test_inventory_boundary_crash_matrix_recovers_without_duplicate_writes(tmp_p
     if phase in {'receipt','settlement','close'}:
         op = seed_bid(ex, repo)
         ex.fill(op.exchange_id,D('1'))
+        initial_epoch = op.settlement_epoch
     if phase in trigger:
         repo.db.execute(f"CREATE TRIGGER fail_boundary {trigger[phase]} BEGIN SELECT RAISE(ABORT,'boundary failure'); END")
         repo.db.commit()
@@ -230,7 +231,11 @@ def test_inventory_boundary_crash_matrix_recovers_without_duplicate_writes(tmp_p
             assert repo.settlement_window_open()
         else:
             assert not repo.operations() and not ex.writes
-        assert repo.settlement_epoch() == initial_epoch
+        if phase == 'intent':
+            # Preparation accepts another observation before the intent fails.
+            assert repo.settlement_epoch() > initial_epoch
+        else:
+            assert repo.settlement_epoch() == initial_epoch
     else:
         op=runner.executor.execute(OrderPlan('BNBUSDT','BUY','LIMIT_MAKER',D('1'),D('598'),'GTC',True),ex.now,ReplenishmentState.ACCUMULATE)
         assert op.status == OperationStatus.UNKNOWN and len(ex.writes)==1

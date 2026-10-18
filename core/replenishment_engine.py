@@ -4,7 +4,7 @@ from dataclasses import replace
 from decimal import Decimal
 
 from .crash_guard import update_crash_guard, valid_market
-from .math_utils import floor_to_multiple, non_negative
+from .math_utils import ceil_to_multiple, floor_to_multiple, non_negative
 from .models import (
     Alert,
     AssetTransferPlan,
@@ -31,6 +31,23 @@ from .time_utils import fresh, utc
 from .validation import valid_account_snapshot
 
 ZERO = Decimal("0")
+
+
+def _minimum_bnb_transfer(filters):
+    return ceil_to_multiple(max(filters.min_transfer_bnb, filters.qty_step), filters.qty_step)
+
+
+def _target_tolerance(inputs, cfg):
+    """Only settled, free dust may extend safe completion by less than one lot."""
+    minimum = _minimum_bnb_transfer(inputs.filters)
+    a, p = inputs.account, inputs.pending
+    spot = non_negative(a.spot_bnb - cfg.thresholds.b_spot_reserve)
+    residual = cfg.thresholds.b_target - a.contract_bnb - spot
+    if (a.contract_bnb >= cfg.thresholds.b_alert
+            and not a.reserved_spot_bnb and not p.open_buy_remaining_qty
+            and 0 < spot < minimum and 0 <= residual < inputs.filters.qty_step):
+        return minimum + inputs.filters.qty_step
+    return minimum
 
 
 def _to_state_inputs(inputs: EngineInputs) -> StateInputs:
@@ -70,11 +87,11 @@ def _plan_bnb_transfer(
     amount = floor_to_multiple(
         min(available, non_negative(target - a.contract_bnb)), inputs.filters.qty_step
     )
-    minimum = inputs.filters.min_transfer_bnb
+    minimum = _minimum_bnb_transfer(inputs.filters)
     if (
         state != ReplenishmentState.URGENT
         and a.contract_bnb >= cfg.thresholds.b_alert
-        and target - a.contract_bnb - amount >= max(minimum, inputs.filters.qty_step)
+        and target - a.contract_bnb - amount >= minimum
     ):
         minimum = max(minimum, cfg.execution.watch_batch_transfer_bnb)
     if amount > 0 and amount >= minimum and a.contract_bnb < cfg.thresholds.b_high:
@@ -173,14 +190,15 @@ def _alerts(inputs, cfg, decision, transfer, gates, guard) -> tuple[Alert, ...]:
         and not inputs.pending.unresolved
         and valid_account_snapshot(inputs.account, inputs.now, cfg)
         and inputs.account.contract_bnb <= cfg.thresholds.b_low
-        and decision.delta_bnb == 0
-        and inputs.account.spot_bnb - inputs.account.reserved_spot_bnb
-        <= cfg.thresholds.b_spot_reserve
+        and decision.delta_bnb < inputs.filters.qty_step
+        and non_negative(inputs.account.spot_bnb - inputs.account.reserved_spot_bnb
+                         - cfg.thresholds.b_spot_reserve) < _minimum_bnb_transfer(inputs.filters)
     ):
         add(
             "DANGER",
             "INVENTORY_UNAVAILABLE",
-            "Total exposure covers target but frozen inventory or open orders cannot replenish futures now",
+            "Remaining demand is below one buy step and free BNB is below the executable transfer minimum; "
+            "reconcile frozen inventory/open orders or replenish manually",
         )
     if inputs.budget_used_24h >= cfg.risk.u_budget_24h:
         add("WARNING", "BUDGET_EXHAUSTED", "Rolling 24h transfer budget is exhausted")
@@ -251,7 +269,7 @@ def build_cycle_plan(
     if inventory_valid:
         decision = evaluate_state(
             _to_state_inputs(inputs), cfg,
-            target_tolerance=max(inputs.filters.min_transfer_bnb, inputs.filters.qty_step),
+            target_tolerance=_target_tolerance(inputs, cfg),
         )
     else:
         # Invalid inputs cannot become tomorrow's trusted strategy state. Avoid

@@ -431,6 +431,10 @@ class Reconciler:
             replace(checkpoint["account"], wallet_event_cursor=checkpoint["cursor"])
             if checkpoint is not None else None
         )
+        boundary = repo.load("spot_acceptance")
+        account_valid = valid_account_snapshot(account, checked_at, cfg, previous=quote_before) and (
+            boundary is None or utc(account.ts) >= utc(boundary["account"].ts)
+        )  # Legacy checkpoints may already precede the accepted replay boundary.
         strict = strict_at_start or repo.settlement_window_open()
         window_before = quote_before
         if strict:
@@ -455,7 +459,7 @@ class Reconciler:
                 observations, account,
                 force=force_income and not self.executor.income_audited(checked_at),
             )
-            if strict and valid_account_snapshot(account, checked_at, cfg) else None
+            if strict and account_valid else None
         )
         after = self._read(exchange.fetch_open_orders, cfg.symbol)
         def order_view(rows):
@@ -478,7 +482,7 @@ class Reconciler:
             for t in repo.pending_transfer_records()
         )
         spot_settled = False
-        observation_valid = consistent and valid_account_snapshot(
+        observation_valid = consistent and account_valid and valid_account_snapshot(
             account, self.clock() if self.clock else now, cfg
         ) and (account.contract_total_margin_balance is None
                or account.contract_margin_asset == cfg.quote_asset)
