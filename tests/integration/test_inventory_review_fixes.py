@@ -44,8 +44,8 @@ def test_foreign_symbol_late_receipt_cannot_cover_new_debit(tmp_path, same_order
 def test_retired_order_recovers_late_terminal_fill_by_original_identity(tmp_path, restart):
     ex, repo, runner = margin_setup(tmp_path, spot_usd='5000')
     # Model only open orders freezing cash; terminal queries remain available.
-    ex.fetch_account_snapshot = lambda: replace(ex.account, ts=ex.now,
-        contract_total_margin_balance=ex.account.contract_quote_balance, contract_margin_asset='USDT',
+    read = ex.fetch_account_snapshot
+    ex.fetch_account_snapshot = lambda: replace(read(),
         reserved_spot_usd=sum((o.remaining_qty * o.price for o in ex.orders.values() if o.is_open), D('0')))
     op = seed_bid(ex, repo, qty='2')
     ex.fill(op.exchange_id, D('1'))

@@ -11,6 +11,7 @@ from .executor import ExecutionBlocked, Executor
 from .evidence_queries import evidence_queries
 from .qualification import reconciliation_status
 from .history import (
+    futures_evidence_time,
     futures_settlement_evidence,
     INCOME_RECHECK_INTERVAL,
     settlement_policy_issue,
@@ -432,9 +433,18 @@ class Reconciler:
             if checkpoint is not None else None
         )
         boundary = repo.load("spot_acceptance")
-        account_valid = valid_account_snapshot(account, checked_at, cfg, previous=quote_before) and (
-            boundary is None or valid_account_snapshot(account, checked_at, cfg, previous=boundary["account"])
-        )  # Legacy checkpoints may already precede the accepted replay boundary.
+        # Check both boundaries: a legacy checkpoint may precede acceptance.
+        # Upgrading a local-only bound must not reopen its ambiguous interval.
+        account_valid = all(
+            valid_account_snapshot(account, checked_at, cfg, previous=previous)
+            and (previous is None or all(
+                (getattr(previous, wallet + "_event_upper_bound") is None
+                 or getattr(account, wallet + "_event_upper_bound") is not None)
+                and repo.account_event_boundary(account, wallet) >= repo.account_event_boundary(previous, wallet)
+                for wallet in ("futures", "spot")
+            ))
+            for previous in (quote_before, boundary["account"] if boundary else None)
+        )
         strict = strict_at_start or repo.settlement_window_open()
         window_before = quote_before
         if strict:
@@ -646,19 +656,17 @@ class Reconciler:
         now = utc(self.clock() if self.clock else account.ts)
         windows = []
         for before, asset in observations:
-            version = "contract_bnb_updated_at" if asset == "BNB" else "contract_quote_updated_at"
-            lower = utc(getattr(before, version) or before.ts)
-            upper = utc(getattr(account, version) or account.ts)
+            lower = futures_evidence_time(before, asset)
+            upper = futures_evidence_time(account, asset)
             if (
-                lower <= repo.account_observation_end(before, "futures") + timedelta(seconds=1)
-                and lower < upper <= repo.account_observation_end(account, "futures") + timedelta(seconds=1)
+                lower <= repo.account_event_boundary(before, "futures")
+                and lower < upper <= repo.account_event_boundary(account, "futures")
             ):
                 windows.append((utc(before.ts) - timedelta(seconds=1), upper))
         for key, issue in (repo.load("futures_settlement_issue") or {}).items():
             if key != "margin" and "since" in issue:
-                version = "contract_bnb_updated_at" if issue.get("asset") == "BNB" else "contract_quote_updated_at"
-                upper = utc(getattr(account, version) or account.ts)
-                if utc(issue["since"]) <= upper <= repo.account_observation_end(account, "futures") + timedelta(seconds=1):
+                upper = futures_evidence_time(account, issue.get("asset"))
+                if utc(issue["since"]) <= upper <= repo.account_event_boundary(account, "futures"):
                     windows.append((utc(issue["since"]), upper))
         if not windows:
             token = self.executor.begin_income_scan(now)

@@ -99,19 +99,21 @@ class BinanceAdapter(SpotMarketData):
                          min_transfer_bnb=min_transfer_bnb, min_transfer_usd=min_transfer_usd)
         self.live = live
 
-    def _check_clock(self):
-        def check():
-            for method in (self.spot.time, self.futures.check_server_time):
-                before = millis(self.clock())
-                server = self._call(method)["serverTime"]
-                after = millis(self.clock())
-                if abs(int(server) - (before + after) // 2) > 1000:
-                    raise ExchangeError(
-                        "System clock differs from Binance; synchronize it before trading"
-                    )
-            return True
+    def _server_time(self, method):
+        if self.read_checkpoint is not None:
+            self.read_checkpoint()
+        before = millis(self.clock())
+        server = self._call(method, checkpoint=False)["serverTime"]
+        after = millis(self.clock())
+        if after < before or abs(int(server) - (before + after) // 2) > 1000:
+            raise ExchangeError("System clock differs from Binance; synchronize it before trading")
+        return timestamp(server)
 
-        self._cached("clock", 1800, check)
+    def transfer_clock_ready(self, account):
+        # A transfer income has no cross-API identity exemption. Its timestamp
+        # must be strictly beyond the accepted snapshot's server millisecond.
+        bound = account.futures_event_upper_bound
+        return bound is not None and self._server_time(self.futures.check_server_time) > utc(bound)
 
     def account_identity(self):
         account = self._call(self.spot.get_account, recv_window=5000)
@@ -126,13 +128,12 @@ class BinanceAdapter(SpotMarketData):
         }
 
     def fetch_account_snapshot(self):
-        self._check_clock()
         started = self.clock()
         futures = self._call(self.futures.futures_account_balance_v3, recv_window=5000)
         margin = self._call(self.futures.account_information_v3, recv_window=5000)
+        futures_event_upper_bound = self._server_time(self.futures.check_server_time)
         futures_observed_until = self.clock()
         spot = self._call(self.spot.get_account, recv_window=5000)
-        spot_observed_until = self.clock()
         assets = {a["asset"]: a for a in futures}
         balances = {a["asset"]: a for a in spot["balances"]}
         quote = assets.get(self.cfg.quote_asset)
@@ -159,6 +160,8 @@ class BinanceAdapter(SpotMarketData):
                 "Futures balance and margin observations disagree",
                 endpoint="futures_account_observation",
             )
+        spot_event_upper_bound = self._server_time(self.spot.time)
+        spot_observed_until = self.clock()
         mode = self._cached("futures_margin_mode", 300, lambda: self._call(
             self.futures.get_current_multi_assets_mode, recv_window=5000
         ))
@@ -196,6 +199,8 @@ class BinanceAdapter(SpotMarketData):
             contract_margin_asset=margin_asset,
             futures_observed_until=futures_observed_until,
             spot_observed_until=spot_observed_until,
+            futures_event_upper_bound=futures_event_upper_bound,
+            spot_event_upper_bound=spot_event_upper_bound,
         )
 
     def _filter_overrides(self, symbol):

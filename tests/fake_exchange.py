@@ -51,7 +51,8 @@ class FakeExchange:
             ),
             D("0"),
         )
-        return replace(self.account, ts=self.now, reserved_spot_usd=frozen)
+        return replace(self.account, ts=self.now, reserved_spot_usd=frozen,
+                       futures_event_upper_bound=self.now, spot_event_upper_bound=self.now)
 
     def fetch_market_snapshot(self, symbol):
         return replace(make_market(), ts=self.now)

@@ -5,9 +5,32 @@ import pytest
 
 from core.models import FuturesIncome, OperationStatus, TransferRecord
 from core.replenishment_engine import build_cycle_plan
-from services.history import futures_settlement_evidence, historical_metrics
+from services.history import futures_settlement_evidence, historical_metrics, settlement_policy_issue
 from storage.repository import Repository
 from tests.helpers import D, make_account, make_engine_inputs, make_strategy_config
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+@pytest.mark.parametrize('skew_ms', [-1000, -500, 0, 500, 1000])
+def test_foreign_income_uses_the_original_futures_clock_boundary(tmp_path, legacy, skew_ms):
+    repo = Repository(tmp_path / 'foreign.db')
+    original = make_account()
+    skew = timedelta(milliseconds=skew_ms)
+    before = replace(original, wallet_event_cursor=0,
+                     futures_event_upper_bound=None if legacy else original.ts + skew,
+                     contract_quote_balance=D('10000'), contract_total_margin_balance=D('10000'),
+                     contract_quote_updated_at=original.ts - timedelta(minutes=1),
+                     contract_margin_asset='USDT')
+    repo.save_futures_income((FuturesIncome(
+        'TRANSFER', 'external-usdc', 'USDC', D('3000'),
+        original.ts + timedelta(milliseconds=250) + skew),))
+    after = replace(before, ts=original.ts + timedelta(seconds=1),
+                    futures_event_upper_bound=original.ts + timedelta(seconds=1) + skew)
+    valid, _, evidence = futures_settlement_evidence(repo, before, after, 'USDT')
+    assert valid, evidence
+    assert evidence['foreign_transfer_assets'] == ('USDC',)
+    assert settlement_policy_issue(evidence) is not None
+    repo.close()
 
 
 @pytest.mark.parametrize("quote_asset", ["USDT", "USDC"])

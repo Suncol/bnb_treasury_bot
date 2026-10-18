@@ -17,6 +17,12 @@ OPERATING_INCOME_TYPES = frozenset({
 })
 
 
+def futures_evidence_time(account, asset):
+    """Asset version, or the observation's server time when no version exists."""
+    field = "contract_bnb_updated_at" if asset == "BNB" else "contract_quote_updated_at"
+    return utc(getattr(account, field) or account.futures_event_upper_bound or account.ts)
+
+
 def margin_baseline(samples, now, *, warmup=False):
     boundary = utc(now) - timedelta(hours=24)
     eligible = [s for s in samples if (
@@ -56,9 +62,8 @@ def covered_transfers(repository, before, account, asset):
             if reference.startswith("transfer:")
         )
     # Legacy in-flight operations retain their original timestamp boundary.
-    version = "contract_bnb_updated_at" if asset == "BNB" else "contract_quote_updated_at"
-    lower = utc(getattr(before, version) or before.ts)
-    upper = utc(getattr(account, version) or account.ts)
+    lower = futures_evidence_time(before, asset)
+    upper = futures_evidence_time(account, asset)
     return tuple(
         t for t in repository.transfers_since(utc(before.ts) - timedelta(seconds=1))
         if t.status == OperationStatus.CONFIRMED
@@ -68,8 +73,7 @@ def covered_transfers(repository, before, account, asset):
 
 def settlement_baselines(repository, samples, before, account, asset):
     """Try the nearest retained checkpoint only after the original proof fails."""
-    version = "contract_bnb_updated_at" if asset == "BNB" else "contract_quote_updated_at"
-    lower = utc(getattr(before, version) or before.ts)
+    lower = futures_evidence_time(before, asset)
     boundary = repository.load("spot_acceptance")
     if boundary is not None:
         samples = tuple(s for s in samples
@@ -86,7 +90,7 @@ def settlement_baselines(repository, samples, before, account, asset):
             if s.wallet_event_cursor is not None
             and 0 <= s.wallet_event_cursor <= before.wallet_event_cursor
             and utc(s.ts) <= utc(before.ts)
-            and utc(getattr(s, version) or s.ts) < lower
+            and futures_evidence_time(s, asset) < lower
             and s.contract_quote_balance is not None
         )
     return ()
@@ -116,10 +120,10 @@ def futures_settlement_evidence(repository, before, account, asset, *, samples=(
 def _settlement_evidence(repository, before, account, asset, anchor):
     field = "contract_bnb" if asset == "BNB" else "contract_quote_balance"
     version = "contract_bnb_updated_at" if asset == "BNB" else "contract_quote_updated_at"
-    lower = utc(getattr(before, version) or before.ts)
-    upper = utc(getattr(account, version) or account.ts)
+    lower = futures_evidence_time(before, asset)
+    upper = futures_evidence_time(account, asset)
     previous, actual = getattr(before, field), getattr(account, field)
-    anchor_lower = utc(getattr(anchor, version) or anchor.ts)
+    anchor_lower = futures_evidence_time(anchor, asset)
     anchor_wallet = getattr(anchor, field)
     since = utc(anchor.ts) - timedelta(seconds=1)
     records = repository.futures_income_since(since)
@@ -155,10 +159,15 @@ def _settlement_evidence(repository, before, account, asset, anchor):
         foreign_proven = foreign_proven and matched
         if matched:
             foreign_assets.discard(foreign_asset)
+    # Keep the original strategy interval, not the earlier replay anchor or an
+    # asset's stale updateTime. Legacy local starts require the earliest offset.
+    foreign_since = (utc(before.futures_event_upper_bound)
+                     if before.futures_event_upper_bound is not None
+                     else utc(before.ts) - timedelta(seconds=1))
     foreign_assets.update(
         r.asset for r in records
         if r.income_type == "TRANSFER" and r.asset not in {asset, "BNB"}
-        and utc(before.ts) < utc(r.ts) <= repository.account_observation_end(account, "futures")
+        and foreign_since < utc(r.ts) <= repository.account_event_boundary(account, "futures")
     )
     wallet_flows = transfer_flows(
         t.amount if t.to_account == "USDⓈ-M Futures" else -t.amount
@@ -180,11 +189,11 @@ def _settlement_evidence(repository, before, account, asset, anchor):
     valid = (
         not ambiguous and previous is not None and actual is not None
         and previous.is_finite() and actual.is_finite()
-        and lower <= repository.account_observation_end(before, "futures") + timedelta(seconds=1)
-        and lower <= upper <= repository.account_observation_end(account, "futures") + timedelta(seconds=1)
+        and lower <= repository.account_event_boundary(before, "futures")
+        and lower <= upper <= repository.account_event_boundary(account, "futures")
         and (getattr(account, version) is None or lower == upper or bool(income))
         and anchor_lower <= lower
-        and anchor_lower <= repository.account_observation_end(anchor, "futures") + timedelta(seconds=1)
+        and anchor_lower <= repository.account_event_boundary(anchor, "futures")
         and anchor_wallet is not None and anchor_wallet.is_finite()
         and anchor_wallet + sum(
             (r.amount for r in covered_income if utc(r.ts) <= lower), ZERO

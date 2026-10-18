@@ -227,8 +227,14 @@ class Runner:
             self.cached_inputs = None
             self.last_reconciled_at = None
             self._priority_market = self._local_market(market)
-            self._priority_checkpoint()
-            return None
+            try:
+                self._priority_checkpoint()
+            except (ExchangeError, TimeoutError, ConnectionError) as protection_error:
+                # Only the local wait is benign. A protection read still uses
+                # the normal failure/retry boundary below.
+                exc = protection_error
+            else:
+                return None
         if isinstance(exc, sqlite3.Error) or (
             isinstance(exc, OSError) and exc.errno in {5, 28, 30}
         ):

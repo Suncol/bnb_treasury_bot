@@ -243,6 +243,9 @@ class Executor:
                     self._require_unchanged_demand(original, account, orders, inputs)
                     if inputs is None and set(orders) != set(known_orders):
                         raise ExecutionBlocked("Refreshed orders lack candidate context; replan the candidate")
+            if kind == OperationKind.TRANSFER:
+                self._require_transfer_clock(account)
+                now = self.clock() if self.clock else now
             self._require_current_constraints(
                 runtime, account, self.clock() if self.clock else now, inputs,
                 needs_market=not (kind == OperationKind.TRANSFER and payload.asset == "BNB"),
@@ -303,6 +306,7 @@ class Executor:
         account, orders = self._reconciliation().prepare_execution(
             self.clock() if self.clock else now
         )
+        self._require_transfer_clock(account)
         now = self.clock() if self.clock else now
         self._require_current_constraints(runtime, account, now, inputs)
         decision = evaluate_transfer_gate(
@@ -316,6 +320,14 @@ class Executor:
                                    decision=decision)
         self._require_unchanged_demand(original, account, orders, inputs)
         return account, now
+
+    def _require_transfer_clock(self, account):
+        checker = getattr(self.exchange, "transfer_clock_ready", None)
+        if checker is not None and (
+            not checker(account) or not self.execution_qualified(
+                self.clock() if self.clock else account.ts, account=account)
+        ):
+            raise ExecutionBlocked("Transfer must follow the verified account's server time boundary")
 
     def _require_current_constraints(self, runtime, account, now, inputs, *, needs_market=True):
         if not valid_account_snapshot(account, now, self.cfg):

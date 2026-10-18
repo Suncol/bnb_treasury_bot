@@ -31,6 +31,9 @@ def restore(tmp_path, case):
     exchange = FakeExchange(state['account'])
     for field, value in state.items():
         setattr(exchange, field, value)
+    # These recovery cases start after the old local-only observation's full
+    # clock allowance; preserve all archived baselines and receipt timestamps.
+    exchange.now += timedelta(seconds=1)
     repo = Repository(path)
     return exchange, repo, Reconciler(exchange, repo, make_strategy_config(), clock=lambda: exchange.now)
 

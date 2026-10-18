@@ -10,6 +10,9 @@ def valid_account_snapshot(account, now, cfg, *, previous=None):
         return False
     futures_end = utc(account.futures_observed_until or account.ts)
     spot_end = utc(account.spot_observed_until or account.ts)
+    futures_bound = (utc(account.futures_event_upper_bound)
+                     if account.futures_event_upper_bound is not None
+                     else futures_end + timedelta(seconds=1))
     amounts = (
         account.contract_bnb,
         account.contract_max_withdraw_amount,
@@ -26,8 +29,11 @@ def valid_account_snapshot(account, now, cfg, *, previous=None):
     return (
         fresh(account.ts, now, cfg.risk.max_account_age_seconds)
         and utc(account.ts) <= futures_end <= spot_end <= utc(now)
+        and all(bound is None or utc(account.ts) - timedelta(seconds=1) <= utc(bound) <= end + timedelta(seconds=1)
+                for bound, end in ((account.futures_event_upper_bound, futures_end),
+                                   (account.spot_event_upper_bound, spot_end)))
         and all(
-            version is None or utc(version) <= futures_end + timedelta(seconds=1)
+            version is None or utc(version) <= futures_bound
             for version in (account.contract_bnb_updated_at, account.contract_quote_updated_at)
         )
         and all(x.is_finite() and x >= 0 for x in amounts)

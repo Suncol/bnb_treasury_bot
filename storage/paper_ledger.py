@@ -184,6 +184,7 @@ class PaperLedger:
             contract_bnb_updated_at=state["contract_bnb_updated_at"],
             contract_quote_updated_at=state["contract_quote_updated_at"],
             contract_margin_asset=self.cfg.quote_asset,
+            futures_event_upper_bound=utc(now), spot_event_upper_bound=utc(now),
         )
 
     @staticmethod

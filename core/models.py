@@ -162,6 +162,9 @@ class AccountSnapshot:
     # Acquisition bounds, not event-completeness watermarks. Age still uses ts.
     futures_observed_until: datetime | None = None
     spot_observed_until: datetime | None = None
+    # Server time read after each wallet; separate clock domains from local TTL.
+    futures_event_upper_bound: datetime | None = None
+    spot_event_upper_bound: datetime | None = None
 
 
 @dataclass(frozen=True)

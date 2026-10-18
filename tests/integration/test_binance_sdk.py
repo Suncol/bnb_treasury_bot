@@ -32,7 +32,7 @@ def sdk(monkeypatch):
     calls = []
     responses = {('GET', '/fapi/v1/exchangeInfo'): (200, {'rateLimits': [
         {'rateLimitType': 'REQUEST_WEIGHT', 'interval': 'MINUTE', 'intervalNum': 1, 'limit': 2400},
-    ]})}
+    ]}), ('GET', '/fapi/v1/time'): (200, {'serverTime': millis(NOW) + 1})}
 
     def request(self, **kwargs):
         calls.append(kwargs)
@@ -168,10 +168,8 @@ def test_sdk_unknown_order_remains_unknown_and_transfer_never_sends_fake_client_
 
 def account_responses(sdk):
     adapter, calls, responses = sdk
-    responses["GET", "/api/v3/time"] = responses["GET", "/fapi/v1/time"] = (
-        200,
-        {"serverTime": millis(NOW)},
-    )
+    responses["GET", "/api/v3/time"] = responses["GET", "/fapi/v1/time"] = lambda _: (
+        200, {"serverTime": millis(adapter.clock())})
     responses["GET", "/fapi/v3/balance"] = (
         200,
         [
@@ -207,6 +205,13 @@ def account_responses(sdk):
 def funding_account_responses(sdk):
     """A real SDK account/history observation for Executor's mandatory preflight."""
     adapter, calls, responses = account_responses(sdk)
+    last_time = [millis(adapter.clock())]
+
+    def server_time(_):
+        last_time[0] = max(last_time[0] + 1, millis(adapter.clock()))
+        return 200, {'serverTime': last_time[0]}
+
+    responses['GET', '/fapi/v1/time'] = server_time
     responses["GET", "/fapi/v3/balance"][1][0]["balance"] = "24"
     quote = responses["GET", "/fapi/v3/balance"][1][1]
     quote.update(balance="50000", maxWithdrawAmount="50000")
@@ -270,12 +275,12 @@ def test_non_usdt_quote_cannot_be_subtracted_from_usdt_aggregate_margin(sdk):
     assert account.contract_max_withdraw_amount == D("4567.89")
 
 
-def test_clock_skew_blocks_signed_reads_before_any_trade(sdk):
-    adapter, calls, responses = sdk
+def test_clock_skew_blocks_account_qualification_before_any_trade(sdk):
+    adapter, calls, responses = account_responses(sdk)
     responses["GET", "/api/v3/time"] = (200, {"serverTime": millis(NOW) + 2000})
     with pytest.raises(ExchangeError, match="clock"):
         adapter.fetch_account_snapshot()
-    assert len(calls) == 1
+    assert not any(c['method'] != 'GET' for c in calls)
 
 
 def test_transfer_history_is_paginated_and_confirmed_by_id(sdk):

@@ -339,16 +339,19 @@ class Repository:
     def settlement_epoch(self):
         return (self.load("spot_acceptance") or {}).get("epoch", 0)
 
-    def account_observation_end(self, account, wallet):
-        """Recover only acquisition timing, never financial event coverage.
+    def account_event_boundary(self, account, wallet):
+        """Upper bound in the receipt clock domain, never event coverage.
 
-        Old snapshots omitted read completion. An active intent holding this
-        exact baseline proves it had been acquired by the intent's timestamp.
-        Keep that bound derived from the original journal; do not rewrite it.
+        Legacy local bounds include the full permitted clock skew. Missing read
+        completion can only be bounded by an original intent with this baseline.
+        Today's server clock cannot reconstruct a historical clock offset.
         """
+        bound = getattr(account, wallet + "_event_upper_bound")
+        if bound is not None:
+            return utc(bound)
         end = getattr(account, wallet + "_observed_until")
         if end is not None:
-            return utc(end)
+            return utc(end) + timedelta(seconds=1)
         start = utc(account.ts)
         bounds = [
             utc(op.created_at) for op in self.operations(active_only=True)
@@ -357,7 +360,7 @@ class Repository:
             and replace(account, wallet_event_cursor=op.balance_before.wallet_event_cursor) == op.balance_before
             and utc(op.created_at) >= start
         ]
-        return min(bounds, default=start)
+        return min(bounds, default=start) + timedelta(seconds=1)
 
     def accept_inventory_observation(self, account):
         """Atomically accept both accounts outside all journaled responsibility.
@@ -376,7 +379,9 @@ class Repository:
             changed = previous is None or (
                 replace(self.load("spot_checkpoint")["account"], ts=account.ts,
                         futures_observed_until=account.futures_observed_until,
-                        spot_observed_until=account.spot_observed_until) != account
+                        spot_observed_until=account.spot_observed_until,
+                        futures_event_upper_bound=account.futures_event_upper_bound,
+                        spot_event_upper_bound=account.spot_event_upper_bound) != account
             )
             acceptance = {"account": account, "cursor": cursor,
                           "income_cursor": self.db.execute("SELECT COALESCE(MAX(rowid),0) FROM futures_income").fetchone()[0],
@@ -396,7 +401,7 @@ class Repository:
         if boundary is None:
             return ()
         ambiguous = []
-        end = self.account_observation_end(boundary["account"], "futures")
+        end = self.account_event_boundary(boundary["account"], "futures")
         for record in records:
             if utc(record.ts) > end:
                 continue
@@ -413,7 +418,7 @@ class Repository:
         ambiguous = []
         for reference, in self.db.execute(
             "SELECT reference FROM wallet_events WHERE id>? AND id<=? AND ts<=? ORDER BY id",
-            (cursor, through, self.account_observation_end(boundary["account"], "spot").timestamp()),
+            (cursor, through, self.account_event_boundary(boundary["account"], "spot").timestamp()),
         ):
             parts = reference.split(":")
             owner = None
