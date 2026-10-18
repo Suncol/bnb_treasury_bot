@@ -5,11 +5,7 @@ import time
 from threading import Lock, Thread
 
 from core.time_utils import fresh
-from .exchange_adapter import ExchangeError
-
-
-class PriceRefreshPending(ExchangeError):
-    """Initial public observation is in flight; no execution may use it yet."""
+from .exchange_adapter import ExchangeError, MarketDataPending
 
 
 class PriceRefresh:
@@ -38,7 +34,7 @@ class PriceRefresh:
         self.kick()
         with self._lock:
             if self._value is None:
-                raise PriceRefreshPending("Public price observation is pending")
+                raise MarketDataPending("Public price observation is pending")
             # Cache hits keep the acquisition timestamp, including after expiry.
             # The planner and execution gates still enforce the original TTL.
             return self._value
@@ -46,7 +42,7 @@ class PriceRefresh:
     def kick(self):
         with self._lock:
             if self._closed:
-                raise PriceRefreshPending("Public price refresher is closed")
+                raise MarketDataPending("Public price refresher is closed")
             if self._error is not None:
                 error, self._error = self._error, None
                 raise error  # Hand off once, on the controller's failure boundary.

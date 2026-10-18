@@ -15,7 +15,7 @@ from core.crash_guard import latch_guard_trigger
 from core.models import CrashGuardState, MarketSnapshot
 
 from .sdk_transport import SDKTransport, sdk_data
-from .exchange_adapter import ExchangeError
+from .exchange_adapter import ExchangeError, MarketDataPending
 from .market_data import MarketWindows
 from .market_depth import DepthSnapshots
 
@@ -308,7 +308,7 @@ class MarketStream:
             raise ExchangeError("Market stream worker exited")
         with self._lock:
             if self._latest is None:
-                raise ExchangeError("No current market stream snapshot")
+                raise MarketDataPending("No current market stream snapshot")
             return self._latest
 
     def pending_risk(self):

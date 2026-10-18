@@ -26,7 +26,8 @@ class ScheduledExchange(FakeExchange):
 
     def fetch_account_snapshot(self):
         account = super().fetch_account_snapshot()
-        return replace(account, ts=account.ts - self.account_age)
+        return replace(account, ts=account.ts - self.account_age,
+                       futures_observed_until=account.ts, spot_observed_until=account.ts)
 
     def fetch_symbol_filters(self, symbol):
         observed = self.now

@@ -433,7 +433,7 @@ class Reconciler:
         )
         boundary = repo.load("spot_acceptance")
         account_valid = valid_account_snapshot(account, checked_at, cfg, previous=quote_before) and (
-            boundary is None or utc(account.ts) >= utc(boundary["account"].ts)
+            boundary is None or valid_account_snapshot(account, checked_at, cfg, previous=boundary["account"])
         )  # Legacy checkpoints may already precede the accepted replay boundary.
         strict = strict_at_start or repo.settlement_window_open()
         window_before = quote_before
@@ -650,15 +650,15 @@ class Reconciler:
             lower = utc(getattr(before, version) or before.ts)
             upper = utc(getattr(account, version) or account.ts)
             if (
-                lower <= utc(before.ts) + timedelta(seconds=1)
-                and lower < upper <= utc(account.ts) + timedelta(seconds=1)
+                lower <= repo.account_observation_end(before, "futures") + timedelta(seconds=1)
+                and lower < upper <= repo.account_observation_end(account, "futures") + timedelta(seconds=1)
             ):
                 windows.append((utc(before.ts) - timedelta(seconds=1), upper))
         for key, issue in (repo.load("futures_settlement_issue") or {}).items():
             if key != "margin" and "since" in issue:
                 version = "contract_bnb_updated_at" if issue.get("asset") == "BNB" else "contract_quote_updated_at"
                 upper = utc(getattr(account, version) or account.ts)
-                if utc(issue["since"]) <= upper <= utc(account.ts) + timedelta(seconds=1):
+                if utc(issue["since"]) <= upper <= repo.account_observation_end(account, "futures") + timedelta(seconds=1):
                     windows.append((utc(issue["since"]), upper))
         if not windows:
             token = self.executor.begin_income_scan(now)

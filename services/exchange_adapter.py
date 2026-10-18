@@ -50,6 +50,10 @@ class AccountObservationInconsistent(ExchangeError):
     """
 
 
+class MarketDataPending(ExchangeError):
+    """Local market observation is not ready; no API failure has occurred."""
+
+
 class RequestNotSent(RequestDeferred):
     """Final transport preflight proved this SDK mutation was never invoked.
 

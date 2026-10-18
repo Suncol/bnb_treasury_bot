@@ -10,8 +10,7 @@ from binance_common.errors import TooManyRequestsError
 
 from core.models import AssetTransferPlan, GateStatus, Operation, OperationKind, OperationStatus
 from core.time_utils import fresh
-from services.exchange_adapter import RequestDeferred
-from services.price_refresh import PriceRefreshPending
+from services.exchange_adapter import MarketDataPending, RequestDeferred
 from services.runner import Runner
 from services.sdk_transport import millis
 from services.spot_market import SpotMarketData
@@ -89,7 +88,7 @@ def complete(s):
 def seed(s):
     try:
         s.market.fetch_symbol_filters(s.cfg.symbol)
-    except PriceRefreshPending:
+    except MarketDataPending:
         pass
     complete(s)
     assert s.runner.tick().gates.data_gate == GateStatus.OPEN
@@ -201,7 +200,7 @@ def test_rule_change_discards_old_inflight_result(controller):
     assert s.client.started.wait(1)
     s.client.rule = dict(s.client.rule, multiplierUp='1.05')
     s.market.cache.pop('filters:'+s.cfg.symbol)
-    with pytest.raises(PriceRefreshPending):
+    with pytest.raises(MarketDataPending):
         s.market.fetch_symbol_filters(s.cfg.symbol)
     s.client.release.set()
     complete(s)
@@ -217,7 +216,7 @@ def test_future_cache_is_not_reused_after_clock_rollback(controller):
     seed(s)
     s.ex.now -= timedelta(seconds=1)
     s.client.block = True
-    with pytest.raises(PriceRefreshPending):
+    with pytest.raises(MarketDataPending):
         s.market.fetch_symbol_filters(s.cfg.symbol)
     assert not s.refresh._value
 
@@ -225,7 +224,7 @@ def test_future_cache_is_not_reused_after_clock_rollback(controller):
 def test_shutdown_does_not_wait_for_stuck_request_or_publish_late_result(controller):
     s = controller
     s.client.block = True
-    with pytest.raises(PriceRefreshPending):
+    with pytest.raises(MarketDataPending):
         s.market.fetch_symbol_filters(s.cfg.symbol)
     assert s.client.started.wait(1)
     start = time.monotonic()
@@ -277,7 +276,7 @@ def test_explicit_invalidation_discards_late_result_even_for_same_rules(controll
     s.refresh.kick()
     assert s.client.started.wait(1)
     s.market.invalidate_filters(s.cfg.symbol)
-    with pytest.raises(PriceRefreshPending):
+    with pytest.raises(MarketDataPending):
         s.market.fetch_symbol_filters(s.cfg.symbol)
     s.client.release.set()
     complete(s)

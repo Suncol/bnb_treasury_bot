@@ -130,7 +130,9 @@ class BinanceAdapter(SpotMarketData):
         started = self.clock()
         futures = self._call(self.futures.futures_account_balance_v3, recv_window=5000)
         margin = self._call(self.futures.account_information_v3, recv_window=5000)
+        futures_observed_until = self.clock()
         spot = self._call(self.spot.get_account, recv_window=5000)
+        spot_observed_until = self.clock()
         assets = {a["asset"]: a for a in futures}
         balances = {a["asset"]: a for a in spot["balances"]}
         quote = assets.get(self.cfg.quote_asset)
@@ -192,6 +194,8 @@ class BinanceAdapter(SpotMarketData):
             if margin_quote.get("updateTime")
             else None,
             contract_margin_asset=margin_asset,
+            futures_observed_until=futures_observed_until,
+            spot_observed_until=spot_observed_until,
         )
 
     def _filter_overrides(self, symbol):

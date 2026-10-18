@@ -189,6 +189,7 @@ class Executor:
             )
             if existing is not None:
                 return self._recover_cancel(existing, now)
+        previous_runtime = self.repository.runtime()
         if kind == OperationKind.ORDER:
             refresher = getattr(self.exchange, "refresh_order_budget", None)
             if refresher is not None:
@@ -205,9 +206,8 @@ class Executor:
                 if kind == OperationKind.ORDER and exc.orders_only:
                     raise ExecutionBlocked(str(exc)) from exc
                 raise
-        previous_runtime = (
-            self.repository.runtime() if kind == OperationKind.CANCEL else self._require_reconciled(preparing=True)
-        )
+        if kind != OperationKind.CANCEL:
+            self._require_reconciled(preparing=True)
         if (kind == OperationKind.TRANSFER and payload.to_account == "SPOT"
                 and previous_runtime.funding_exhausted_at is not None):
             raise ExecutionBlocked("Funding must wait for a later valid inventory cycle")
@@ -327,7 +327,10 @@ class Executor:
         ):
             raise ExecutionBlocked("Execution is blocked by the current run mode")
         guard_fields = ("active", "episode_id", "keep_price_ceiling", "filled_bnb")
-        if any(getattr(runtime.guard, field) != getattr(current.guard, field)
+        # Runner supplies the guard used by the final plan (which may itself
+        # enter/exit protection). Direct calls bind before any quota/read callback.
+        planned_guard = inputs.crash_guard if inputs is not None else runtime.guard
+        if any(getattr(planned_guard, field) != getattr(current.guard, field)
                for field in guard_fields):
             raise ExecutionBlocked("Risk protection changed during execution preparation")
         if inputs is not None and (

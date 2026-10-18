@@ -159,6 +159,9 @@ class AccountSnapshot:
     contract_margin_asset: str | None = None
     # Confirmed wallet events covered by this reconciled observation.
     wallet_event_cursor: int | None = None
+    # Acquisition bounds, not event-completeness watermarks. Age still uses ts.
+    futures_observed_until: datetime | None = None
+    spot_observed_until: datetime | None = None
 
 
 @dataclass(frozen=True)

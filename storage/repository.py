@@ -339,6 +339,26 @@ class Repository:
     def settlement_epoch(self):
         return (self.load("spot_acceptance") or {}).get("epoch", 0)
 
+    def account_observation_end(self, account, wallet):
+        """Recover only acquisition timing, never financial event coverage.
+
+        Old snapshots omitted read completion. An active intent holding this
+        exact baseline proves it had been acquired by the intent's timestamp.
+        Keep that bound derived from the original journal; do not rewrite it.
+        """
+        end = getattr(account, wallet + "_observed_until")
+        if end is not None:
+            return utc(end)
+        start = utc(account.ts)
+        bounds = [
+            utc(op.created_at) for op in self.operations(active_only=True)
+            if op.kind != OperationKind.CANCEL and op.status != OperationStatus.FAILED
+            and op.balance_before is not None
+            and replace(account, wallet_event_cursor=op.balance_before.wallet_event_cursor) == op.balance_before
+            and utc(op.created_at) >= start
+        ]
+        return min(bounds, default=start)
+
     def accept_inventory_observation(self, account):
         """Atomically accept both accounts outside all journaled responsibility.
 
@@ -354,7 +374,9 @@ class Repository:
                 raise ValueError("Wallet evidence changed during inventory acceptance")
             previous = self.load("spot_acceptance")
             changed = previous is None or (
-                replace(self.load("spot_checkpoint")["account"], ts=account.ts) != account
+                replace(self.load("spot_checkpoint")["account"], ts=account.ts,
+                        futures_observed_until=account.futures_observed_until,
+                        spot_observed_until=account.spot_observed_until) != account
             )
             acceptance = {"account": account, "cursor": cursor,
                           "income_cursor": self.db.execute("SELECT COALESCE(MAX(rowid),0) FROM futures_income").fetchone()[0],
@@ -374,8 +396,9 @@ class Repository:
         if boundary is None:
             return ()
         ambiguous = []
+        end = self.account_observation_end(boundary["account"], "futures")
         for record in records:
-            if utc(record.ts) > utc(boundary["account"].ts):
+            if utc(record.ts) > end:
                 continue
             row = self.db.execute("SELECT rowid FROM futures_income WHERE income_type=? AND transaction_id=?",
                                   (record.income_type, record.transaction_id)).fetchone()
@@ -390,7 +413,7 @@ class Repository:
         ambiguous = []
         for reference, in self.db.execute(
             "SELECT reference FROM wallet_events WHERE id>? AND id<=? AND ts<=? ORDER BY id",
-            (cursor, through, utc(boundary["account"].ts).timestamp()),
+            (cursor, through, self.account_observation_end(boundary["account"], "spot").timestamp()),
         ):
             parts = reference.split(":")
             owner = None

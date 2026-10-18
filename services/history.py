@@ -158,7 +158,7 @@ def _settlement_evidence(repository, before, account, asset, anchor):
     foreign_assets.update(
         r.asset for r in records
         if r.income_type == "TRANSFER" and r.asset not in {asset, "BNB"}
-        and utc(before.ts) < utc(r.ts) <= utc(account.ts)
+        and utc(before.ts) < utc(r.ts) <= repository.account_observation_end(account, "futures")
     )
     wallet_flows = transfer_flows(
         t.amount if t.to_account == "USDⓈ-M Futures" else -t.amount
@@ -180,11 +180,11 @@ def _settlement_evidence(repository, before, account, asset, anchor):
     valid = (
         not ambiguous and previous is not None and actual is not None
         and previous.is_finite() and actual.is_finite()
-        and lower <= utc(before.ts) + timedelta(seconds=1)
-        and lower <= upper <= utc(account.ts) + timedelta(seconds=1)
+        and lower <= repository.account_observation_end(before, "futures") + timedelta(seconds=1)
+        and lower <= upper <= repository.account_observation_end(account, "futures") + timedelta(seconds=1)
         and (getattr(account, version) is None or lower == upper or bool(income))
         and anchor_lower <= lower
-        and anchor_lower <= utc(anchor.ts) + timedelta(seconds=1)
+        and anchor_lower <= repository.account_observation_end(anchor, "futures") + timedelta(seconds=1)
         and anchor_wallet is not None and anchor_wallet.is_finite()
         and anchor_wallet + sum(
             (r.amount for r in covered_income if utc(r.ts) <= lower), ZERO

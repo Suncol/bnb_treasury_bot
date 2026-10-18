@@ -24,13 +24,12 @@ from core.replenishment_engine import build_cycle_plan
 from core.time_utils import age_seconds, fresh, utc
 from core.validation import valid_account_snapshot
 
-from .exchange_adapter import AccountObservationInconsistent, ExchangeError, RequestDeferred
+from .exchange_adapter import AccountObservationInconsistent, ExchangeError, MarketDataPending, RequestDeferred
 from .executor import ExecutionBlocked, MAX_CANCEL_ATTEMPTS
 from .market_data import MarketWindows
 from .reconciliation import Reconciler
 from .qualification import reconciliation_status
 from .read_backoff import clear_read_backoff, record_read_failure, retry_deadline
-from .price_refresh import PriceRefreshPending
 
 
 class Runner:
@@ -222,7 +221,7 @@ class Runner:
                 return self._failed_read(exc, market)
 
     def _failed_read(self, exc, market=None):
-        if isinstance(exc, PriceRefreshPending):
+        if isinstance(exc, MarketDataPending):
             # Expected startup/rule-change wait: retain durable intents and run
             # local protection, but never plan from partially refreshed inputs.
             self.cached_inputs = None
@@ -903,7 +902,7 @@ class Runner:
                     self.clock(),
                     plan.state_decision.confirmed_state,
                     account=inputs.account,
-                    inputs=inputs,
+                    inputs=replace(inputs, crash_guard=plan.crash_guard),
                     starts_slice=hasattr(action, "qty")
                     and plan.slice_state.active
                     and submitted_qty == action.qty,

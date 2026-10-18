@@ -12,7 +12,7 @@ from binance_sdk_spot.spot import Spot
 from core.models import MarketSnapshot, SymbolFilters
 from core.time_utils import fresh, utc
 from .exchange_adapter import ExchangeError
-from .sdk_transport import SDKTransport, millis, timestamp
+from .sdk_transport import BinanceAPIError, SDKTransport, millis, timestamp
 from .price_refresh import PriceRefresh
 
 D = Decimal
@@ -234,7 +234,12 @@ class SpotMarketData(SDKTransport):
 
     def _percentage_bounds(self, symbol, percentage, floor, ceiling, client, *, checkpoint):
         observed_at = self.clock()
-        reference = self._call(client.reference_price, checkpoint=checkpoint, symbol=symbol)
+        try:
+            reference = self._call(client.reference_price, checkpoint=checkpoint, symbol=symbol)
+        except BinanceAPIError as exc:
+            if (exc.endpoint, exc.http_status, exc.code) != ("reference_price", 400, -2043):
+                raise
+            reference = {}  # Documented absence; use the same fallback as null.
         for rule in percentage:
             if reference.get("referencePrice") is not None:
                 anchor = D(reference["referencePrice"])
