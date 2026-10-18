@@ -1,0 +1,45 @@
+{
+  "date": "2026-10-16",
+  "source_worktree": "/home/suncong/.codex/worktrees/p1-review-fixes/bnb_treasury_bot",
+  "source_branch": "codex/p1-review-fixes",
+  "source_head": "80dbda4bed2c5a76fd042b9bc89f96aec8055e44",
+  "preserved_main": "07b98c19fb7d4b1f72475b4b8f2bb09b81198c9e",
+  "result": "No branch-only commits or tracked edits; all five untracked files exactly match a main ancestor.",
+  "files": [
+    {
+      "path": "GLOSSARY.md",
+      "bytes": 2074,
+      "sha256": "cb83de0775365fa25b49cb5ade328fd709a83ef5606adbf9ebbf5713fa293d7e",
+      "matching_commit": "b8b6b4ebdd0520cc1f583d9830e8c479ef2f21a0",
+      "git_blob": "06aa5a49518ac1f4f95f11398ed4a4afa9dec970"
+    },
+    {
+      "path": "docs/adr/0001-local-depth-book.md",
+      "bytes": 1139,
+      "sha256": "36080ea98f836497b8e719d449cf2e61dcdf6db806ede9dfe2b0f09a898334ec",
+      "matching_commit": "b8b6b4ebdd0520cc1f583d9830e8c479ef2f21a0",
+      "git_blob": "663a6f4815d0b99ef849df20e2c36efd4aa0b3c0"
+    },
+    {
+      "path": "docs/adr/0002-funded-continuation-exhaustion.md",
+      "bytes": 1092,
+      "sha256": "cd89f7f7fc318750e4b893a14b99a34303f1c70784fb7d3358d33a071a8f65e4",
+      "matching_commit": "b8b6b4ebdd0520cc1f583d9830e8c479ef2f21a0",
+      "git_blob": "ae1317e9ea01f3d67c7cc9222a63a5aa031d6972"
+    },
+    {
+      "path": "docs/adr/0003-income-audit-and-account-freshness.md",
+      "bytes": 1330,
+      "sha256": "3aba434d5ac2b664739f3ecccead3ee7666e53705ad7e74861ac910ef23333db",
+      "matching_commit": "b8b6b4ebdd0520cc1f583d9830e8c479ef2f21a0",
+      "git_blob": "0b8372e58212bcb82fc866ecffe188d9760cf402"
+    },
+    {
+      "path": "docs/tickets/2026-10-15-p1-review-80dbda4.md",
+      "bytes": 26165,
+      "sha256": "c2caecd4bce99ce6628a1654b5c106500d5e7bac20ef155d4a0853aa34c66c05",
+      "matching_commit": "b8b6b4ebdd0520cc1f583d9830e8c479ef2f21a0",
+      "git_blob": "6d643861dfbdf3c0fba3e7f444fa46619d65ec9f"
+    }
+  ]
+}

@@ -1,0 +1,127 @@
+{
+  "operation": "cleanup_merged_local_p1_branches",
+  "record_date": "2026-10-16",
+  "recorded_at_utc": "2026-10-16T06:04:04.904153+00:00",
+  "main_before": "07b98c19fb7d4b1f72475b4b8f2bb09b81198c9e",
+  "main_after": "07b98c19fb7d4b1f72475b4b8f2bb09b81198c9e",
+  "origin_main_local_before": "07b98c19fb7d4b1f72475b4b8f2bb09b81198c9e",
+  "origin_main_local_after": "07b98c19fb7d4b1f72475b4b8f2bb09b81198c9e",
+  "main_tree_before_and_after": "151fe1e729cc3fb450e8e9530592dcfd3d2d4d55",
+  "branches": [
+    {
+      "branch": "codex/p1-01-unsent",
+      "commit": "723e0e2277162a9ff78121f3e28010d39ea1d568",
+      "is_ancestor_of_main": true,
+      "commits_not_in_main": 0,
+      "registered_worktree": null,
+      "unmerged_commits": [],
+      "action": "delete",
+      "result": "deleted_with_git_branch_d"
+    },
+    {
+      "branch": "codex/p1-02-rejections",
+      "commit": "2c47af17918a2e3dc6be37bafbd790d1059d1869",
+      "is_ancestor_of_main": true,
+      "commits_not_in_main": 0,
+      "registered_worktree": null,
+      "unmerged_commits": [],
+      "action": "delete",
+      "result": "deleted_with_git_branch_d"
+    },
+    {
+      "branch": "codex/p1-03-continuation",
+      "commit": "fefd89acccd35c6c6fc9b69fb9adb9282c8f8694",
+      "is_ancestor_of_main": true,
+      "commits_not_in_main": 0,
+      "registered_worktree": null,
+      "unmerged_commits": [],
+      "action": "delete",
+      "result": "deleted_with_git_branch_d"
+    },
+    {
+      "branch": "codex/p1-04-observation",
+      "commit": "b540e839ed01e2eb25aafe13856c7910343aee41",
+      "is_ancestor_of_main": true,
+      "commits_not_in_main": 0,
+      "registered_worktree": null,
+      "unmerged_commits": [],
+      "action": "delete",
+      "result": "deleted_with_git_branch_d"
+    },
+    {
+      "branch": "codex/p1-05-income-audit",
+      "commit": "d9500d802b2d2111173535c7547e0063d96bbdd6",
+      "is_ancestor_of_main": true,
+      "commits_not_in_main": 0,
+      "registered_worktree": null,
+      "unmerged_commits": [],
+      "action": "delete",
+      "result": "deleted_with_git_branch_d"
+    },
+    {
+      "branch": "codex/p1-06-depth-book",
+      "commit": "30de3ffb358f205e70230ac63664ed4fcc62f997",
+      "is_ancestor_of_main": true,
+      "commits_not_in_main": 0,
+      "registered_worktree": null,
+      "unmerged_commits": [],
+      "action": "delete",
+      "result": "deleted_with_git_branch_d"
+    },
+    {
+      "branch": "codex/p1-07-preflight",
+      "commit": "33dfedc3a749c1236e816e32f6221c16820616b6",
+      "is_ancestor_of_main": true,
+      "commits_not_in_main": 0,
+      "registered_worktree": null,
+      "unmerged_commits": [],
+      "action": "delete",
+      "result": "deleted_with_git_branch_d"
+    },
+    {
+      "branch": "codex/p1-final-review-fixes",
+      "commit": "06a23a4d4e7e1ffcdcdfe1949cb15834aaadccd1",
+      "is_ancestor_of_main": true,
+      "commits_not_in_main": 0,
+      "registered_worktree": null,
+      "unmerged_commits": [],
+      "action": "delete",
+      "result": "deleted_with_git_branch_d"
+    }
+  ],
+  "unmerged_branches_preserved": [],
+  "worktrees_before_and_after": "worktree /home/suncong/bnb_treasury_bot\nHEAD 07b98c19fb7d4b1f72475b4b8f2bb09b81198c9e\nbranch refs/heads/main",
+  "remaining_local_branches": [
+    "main"
+  ],
+  "other_refs_unchanged": true,
+  "stash_unchanged": true,
+  "main_tracked_worktree_and_index_clean": true,
+  "worktree_or_file_deletions_this_operation": [],
+  "protected_record_files_sha256": {
+    "validation/main-07b98c1-pytest.txt": "32a2a4fc83e582feef2f434c8a72f32bcb94275491a5ad736ccd3fabab2427a0",
+    "drafts/02-fixed-inventory-thresholds.md": "ec44f7bbd84ca5dd370809bec644fb446f15e92d90473beaa556f2d285f1c9a7",
+    "drafts/README.md": "06e10e2ad22e3ab6efc217b4f7fbb3869ef1df07e34ec5a35e460013df13a30d",
+    "drafts/05-safe-legacy-upgrade-and-recovery.md": "1383d6142c0d80886ccc0d2900fffc151f0646c84f38357ff0822aa9bdd815d3",
+    "drafts/01-separate-execution-qualification.md": "cc04b95279cae0fc0d162729c05214c84f0508096d37d27c9532bdc9d7ea2790",
+    "drafts/04-idle-futures-observation-without-global-audit.md": "04419fad69ad2728ada95643238cba638e5ba4edcdc8fe6d3ba64e0f41b6affc",
+    "drafts/06-bounded-evidence-queries.md": "becace8a71d9c8ca99e4ec6d0ee4d517d92583e9f6f36674724009f51caa1160",
+    "drafts/03-idle-spot-balances-and-strict-window.md": "fa3c3869330487b52d62da24aba45712cb17ee7daa5db2c85c7da3f8374891be",
+    "archives/p1-review-fixes-80dbda4/GLOSSARY.md": "cb83de0775365fa25b49cb5ade328fd709a83ef5606adbf9ebbf5713fa293d7e",
+    "archives/p1-review-fixes-80dbda4/manifest.json": "72e112c52975a11bb2214b31f90db3efcbab4a2ded99f628c41b4556e7211485",
+    "archives/p1-review-fixes-80dbda4/docs/tickets/2026-10-15-p1-review-80dbda4.md": "c2caecd4bce99ce6628a1654b5c106500d5e7bac20ef155d4a0853aa34c66c05",
+    "archives/p1-review-fixes-80dbda4/docs/adr/0002-funded-continuation-exhaustion.md": "cd89f7f7fc318750e4b893a14b99a34303f1c70784fb7d3358d33a071a8f65e4",
+    "archives/p1-review-fixes-80dbda4/docs/adr/0003-income-audit-and-account-freshness.md": "3aba434d5ac2b664739f3ecccead3ee7666e53705ad7e74861ac910ef23333db",
+    "archives/p1-review-fixes-80dbda4/docs/adr/0001-local-depth-book.md": "36080ea98f836497b8e719d449cf2e61dcdf6db806ede9dfe2b0f09a898334ec"
+  },
+  "ticket_statuses": {
+    "01-separate-execution-qualification.md": "done",
+    "02-fixed-inventory-thresholds.md": "done",
+    "03-idle-spot-balances-and-strict-window.md": "done",
+    "04-idle-futures-observation-without-global-audit.md": "done",
+    "05-safe-legacy-upgrade-and-recovery.md": "done",
+    "06-bounded-evidence-queries.md": "done"
+  },
+  "existing_acceptance_result": "1121 passed in 333.56s (0:05:33)",
+  "tests_rerun": false
+}
