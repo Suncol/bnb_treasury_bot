@@ -148,12 +148,23 @@ class Reconciler:
                     return
                 continue
             try:
+                checker = getattr(self.exchange, "ensure_request_allowed", None)
+                if order_id is not None and checker is not None:
+                    # A first, already-bound cancellation can skip its optional
+                    # query when GET + DELETE would consume the last capacity.
+                    checker(protective=True, scope="spot", request_weight=5)
                 identity = (
                     {"order_id": order_id} if order_id else {"client_id": op.client_id}
                 )
-                order = self.exchange.fetch_order(p.symbol, **identity)
+                order = self.exchange.fetch_order(p.symbol, **identity, protective=True)
             except RequestDeferred:
-                raise
+                if (order_id is None or checker is None
+                        or repo.cancel_operation(p.symbol, order_id) is not None):
+                    raise
+                # Recheck for the cheaper DELETE; real bans/full budgets still
+                # fail here. UNKNOWN retries above always require a verified GET.
+                checker(protective=True, scope="spot", request_weight=1)
+                order = None
             except Exception:
                 order = None
             if order is not None:

@@ -20,7 +20,7 @@ from core.validation import valid_account_snapshot
 from .qualification import reconciliation_status
 
 from .exchange_adapter import (
-    ExchangeError, RequestNotSent, RequestRejected, order_matches_operation,
+    ExchangeError, RequestDeferred, RequestNotSent, RequestRejected, order_matches_operation,
 )
 
 MAX_CANCEL_ATTEMPTS = 5
@@ -189,11 +189,22 @@ class Executor:
             )
             if existing is not None:
                 return self._recover_cancel(existing, now)
+        if kind == OperationKind.ORDER:
+            refresher = getattr(self.exchange, "refresh_order_budget", None)
+            if refresher is not None:
+                # Quota reads may be slow or run protective checkpoints. Finish
+                # them before account qualification and before creating an intent.
+                refresher()
         checker = getattr(self.exchange, "ensure_request_allowed", None)
         if checker is not None:
-            checker(
-                protective=kind == OperationKind.CANCEL
-            )  # No unsent UNKNOWN intent.
+            try:
+                checker(protective=kind == OperationKind.CANCEL,
+                        new_order=kind == OperationKind.ORDER,
+                        scope="spot" if kind == OperationKind.CANCEL else None)  # No unsent UNKNOWN intent.
+            except RequestDeferred as exc:
+                if kind == OperationKind.ORDER and exc.orders_only:
+                    raise ExecutionBlocked(str(exc)) from exc
+                raise
         previous_runtime = (
             self.repository.runtime() if kind == OperationKind.CANCEL else self._require_reconciled(preparing=True)
         )
@@ -342,7 +353,7 @@ class Executor:
             return op
         checker = getattr(self.exchange, "ensure_request_allowed", None)
         if checker is not None:
-            checker(protective=True)
+            checker(protective=True, scope="spot")
         # Throttle queries too, including missing/stale terminal evidence. Never
         # turn a missing order or an unverified owner into a new cancel attempt.
         op = replace(op, cancel_retry_at=now + timedelta(seconds=5))
@@ -352,7 +363,7 @@ class Executor:
             return op
         try:
             order = self.exchange.fetch_order(
-                op.payload.symbol, order_id=op.payload.order_id
+                op.payload.symbol, order_id=op.payload.order_id, protective=True,
             )
         except Exception as exc:
             checked_at = self.clock() if self.clock else now
@@ -409,9 +420,10 @@ class Executor:
             )
         except RequestNotSent as exc:
             not_sent = True
-            cooldown = (self.clock() if self.clock else now) + timedelta(
-                seconds=max(1, float(exc.retry_after or 1))
-            )
+            if not exc.orders_only:
+                cooldown = (self.clock() if self.clock else now) + timedelta(
+                    seconds=max(1, float(exc.retry_after or 1))
+                )
             # Never infer that a durable PENDING/UNKNOWN from an earlier
             # attempt was unsent. Only this call's newly created intent can
             # become terminal; recovered cancels keep their original evidence.

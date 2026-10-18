@@ -73,8 +73,10 @@ class PaperExchange:
     def read_checkpoint(self, value):
         self.market.read_checkpoint = value
 
-    def ensure_request_allowed(self, *, protective=False, scope=None):
-        self.market.ensure_request_allowed(protective=protective, scope=scope)
+    def ensure_request_allowed(self, *, protective=False, scope=None, new_order=False,
+                               request_weight=0):
+        self.market.ensure_request_allowed(protective=protective, scope=scope,
+                                           new_order=new_order, request_weight=request_weight)
         # Never invent future receipts to disambiguate an unadvanced test/system clock.
         if not protective:
             state = self.ledger.state()
@@ -118,7 +120,7 @@ class PaperExchange:
         with self.repository.local_access():
             return tuple(r["order"] for r in self.ledger.orders(active=True) if r["order"].symbol == symbol)
 
-    def fetch_order(self, symbol, *, client_id=None, order_id=None):
+    def fetch_order(self, symbol, *, client_id=None, order_id=None, protective=False):
         with self.repository.local_access():
             record = self.ledger.order(order_id=order_id, client_id=client_id)
             return record["order"] if record and record["order"].symbol == symbol else None

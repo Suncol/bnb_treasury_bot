@@ -14,6 +14,9 @@ from core.time_utils import utc
 from .exchange_adapter import ExchangeError, RequestDeferred, RequestNotSent
 
 D = Decimal
+ORDER_REFRESH_SECONDS = 30
+BUDGET_PERIODS = {"SECOND": (1, "s"), "MINUTE": (60, "m"),
+                  "HOUR": (3600, "h"), "DAY": (86400, "d")}
 
 
 def millis(value):
@@ -54,45 +57,90 @@ class SDKTransport:
         self.weight_usage = {}
         self.read_checkpoint = None
         self._budget_lock = RLock()
+        self._budget_request_id = 0
+        self._order_observation_ids = {}
+        self._order_refresh_busy = False
+        self._order_refresh_after = 0.0
 
-    def ensure_request_allowed(self, *, protective=False, scope=None):
+    def ensure_request_allowed(self, *, protective=False, scope=None,
+                               new_order=False, request_weight=0):
         with self._budget_lock:
-            return self._ensure_request_allowed(protective=protective, scope=scope)
+            return self._ensure_request_allowed(
+                protective=protective, scope=scope, new_order=new_order,
+                request_weight=request_weight,
+            )
 
-    def _ensure_request_allowed(self, *, protective=False, scope=None):
+    def _ensure_request_allowed(self, *, protective=False, scope=None,
+                                new_order=False, request_weight=0):
         now = self.clock()
         if self.request_not_before is not None and now < self.request_not_before:
             raise RequestDeferred(
                 "Exchange request cooldown",
                 retry_after=(self.request_not_before - now).total_seconds(),
             )
-        if not protective:
-            for (service, header), (used, expires) in self.weight_usage.items():
-                limit = self.weight_limits.get((service, header))
-                if (
-                    (scope is None or service == scope)
-                    and limit
-                    and now < expires
-                    and used >= limit * D("0.9")
-                ):
-                    raise RequestDeferred(
-                        "Request budget reserved for protection",
-                        endpoint=service,
-                        retry_after=(expires - now).total_seconds(),
-                        request_weights=self.request_weights,
-                    )
+        # Check general capacity first: an ORDERS-only veto must never hide a
+        # weight cooldown. No new order may borrow the protection reserve.
+        protective = protective and not new_order
+        budgets = sorted(self.weight_usage.items(), key=lambda item:
+                         item[0][1].startswith("x-mbx-order-count-"))
+        for (service, header), (used, expires) in budgets:
+            orders_only = header.startswith("x-mbx-order-count-")
+            limit = self.weight_limits.get((service, header))
+            if (scope is not None and service != scope or not limit
+                    or now >= expires or orders_only and not new_order):
+                continue
+            ceiling = limit if protective else limit * D("0.9")
+            exhausted = used >= ceiling or not orders_only and used + request_weight > ceiling
+            if exhausted:
+                raise RequestDeferred(
+                    "New order quota reserved" if orders_only else
+                    "Request budget reserved for protection",
+                    endpoint=service,
+                    retry_after=(expires - now).total_seconds(),
+                    request_weights=self.request_weights,
+                    orders_only=orders_only,
+                )
 
-    def _observe_request_budget(self, scope, headers, data):
+    def _refresh_order_budget(self, method):
+        """Bounded read before financial preparation; never called by submit."""
         with self._budget_lock:
-            self._observe_budget(scope, headers, data)
+            try:
+                self._ensure_request_allowed(new_order=True)
+            except RequestDeferred as exc:
+                if not exc.orders_only:
+                    raise
+                if exc.endpoint != "spot":
+                    return
+            else:
+                return
+            if self._order_refresh_busy or time.monotonic() < self._order_refresh_after:
+                return
+            # The count API costs 40 and cannot use the protection reserve.
+            self._ensure_request_allowed(scope="spot", request_weight=40)
+            self._order_refresh_busy = True
+            self._order_refresh_after = time.monotonic() + ORDER_REFRESH_SECONDS
+        try:
+            self._call(method, recv_window=5000)
+        finally:
+            with self._budget_lock:
+                # A slow priority checkpoint may precede the HTTP call. Space
+                # subsequent attempts from completion as well as entry.
+                self._order_refresh_after = time.monotonic() + ORDER_REFRESH_SECONDS
+                self._order_refresh_busy = False
 
-    def _observe_budget(self, scope, headers, data):
-        periods = {
-            "SECOND": (1, "s"),
-            "MINUTE": (60, "m"),
-            "HOUR": (3600, "h"),
-            "DAY": (86400, "d"),
-        }
+    def _budget_observation(self):
+        # Called under _budget_lock at dispatch, before entering the SDK.
+        self._budget_request_id += 1
+        return self._budget_request_id, utc(self.clock())
+
+    def _observe_request_budget(self, scope, headers, data, *, observation=None,
+                                order_limits=None):
+        with self._budget_lock:
+            self._observe_budget(scope, headers, data,
+                                 observation or self._budget_observation(), order_limits)
+
+    def _observe_budget(self, scope, headers, data, observation, order_limits=None):
+        periods = BUDGET_PERIODS
         if isinstance(data, dict):
             for rule in data.get("rateLimits", []) or []:
                 kind, interval = rule.get("rateLimitType"), rule.get("interval")
@@ -106,7 +154,8 @@ class SDKTransport:
                 self.weight_limits[
                     scope, prefix + str(rule["intervalNum"]) + periods[interval][1]
                 ] = int(rule["limit"])
-        now = self.clock()
+        now = utc(self.clock())
+        request_id, requested_at = observation
         for header, value in headers.items():
             if not header.startswith(("x-mbx-used-weight-", "x-mbx-order-count-")):
                 continue
@@ -121,17 +170,61 @@ class SDKTransport:
                     continue
             except (ValueError, KeyError):
                 continue
-            end = (int(now.timestamp()) // seconds + 1) * seconds + 1
+            window = int(now.timestamp()) // seconds
+            end = (window + 1) * seconds + 1
             expires = datetime.fromtimestamp(end, timezone.utc)
-            previous = self.weight_usage.get((scope, header))
-            if previous is not None and previous[1] == expires:
+            key = scope, header
+            previous = self.weight_usage.get(key)
+            if header.startswith("x-mbx-order-count-"):
+                # A delayed ORDERS reading must not be assigned a new window,
+                # or used after clock rollback. Weight observations retain the
+                # existing conservative maximum even when their age is unclear.
+                if requested_at > now or int(requested_at.timestamp()) // seconds != window:
+                    continue
+                # ORDERS can fall after fills. Dispatch order prevents a late
+                # response from an older request overwriting a newer reading.
+                if request_id < self._order_observation_ids.get(key, 0):
+                    continue
+                self._order_observation_ids[key] = request_id
+                if order_limits is not None and header in order_limits:
+                    self.weight_limits[key] = order_limits[header]
+            elif previous is not None and previous[1] == expires:
                 used = max(used, previous[0])
-            self.weight_usage[scope, header] = (
+            self.weight_usage[key] = (
                 used,
                 expires,
             )
 
-    def _call(self, method, *, checkpoint=True, **params):
+    def _observe_order_counts(self, scope, headers, data, observation):
+        # Only the documented count endpoint may supply body-based observations.
+        # Validate the entire response before publishing any decreased counter.
+        if not isinstance(data, list) or not data:
+            raise ExchangeError("Missing unfilled order counts")
+        counts, limits = {}, {}
+        for row in data:
+            if not isinstance(row, dict):
+                raise ExchangeError("Invalid unfilled order count row")
+            interval = row.get("interval")
+            number, limit, count = (row.get(field) for field in ("intervalNum", "limit", "count"))
+            if (row.get("rateLimitType") != "ORDERS" or interval not in BUDGET_PERIODS
+                    or any(type(value) is not int for value in (number, limit, count))
+                    or number <= 0 or limit <= 0 or count < 0):
+                raise ExchangeError("Invalid unfilled order count")
+            header = f"x-mbx-order-count-{number}{BUDGET_PERIODS[interval][1]}"
+            if header in counts:
+                raise ExchangeError("Duplicate unfilled order count interval")
+            counts[header], limits[header] = count, limit
+        # Conflicting observations in one response cannot lower each other.
+        for header, value in headers.items():
+            if header.startswith("x-mbx-order-count-"):
+                used = int(value)
+                if used < 0:
+                    raise ExchangeError("Invalid unfilled order count header")
+                counts[header] = max(counts.get(header, 0), used)
+        self._observe_request_budget(scope, counts, {}, observation=observation,
+                                     order_limits=limits)
+
+    def _call(self, method, *, checkpoint=True, protective=False, **params):
         endpoint = getattr(method, "__name__", type(method).__name__)
         mutation = endpoint in {"new_order", "delete_order", "user_universal_transfer"}
         if checkpoint and not mutation and self.read_checkpoint is not None:
@@ -144,8 +237,19 @@ class SDKTransport:
             if owner is not None and owner is getattr(self, "wallet", None)
             else "spot"
         )
+        # Protection is explicit and restricted to one addressed order read,
+        # plus cancellation itself. It cannot leak into unrelated SDK calls.
+        protective = endpoint == "delete_order" or (
+            protective and endpoint == "get_order" and bool(params.get("symbol"))
+            and bool(params.get("order_id") or params.get("orig_client_order_id"))
+        )
         try:
-            self.ensure_request_allowed(protective=endpoint == "delete_order", scope=scope)
+            with self._budget_lock:
+                self.ensure_request_allowed(
+                    protective=protective, scope=scope, new_order=endpoint == "new_order",
+                    request_weight={"get_order": 4, "rate_limit_order": 40}.get(endpoint, 1),
+                )
+                observation = self._budget_observation()
         except RequestDeferred as exc:
             if not mutation:
                 raise
@@ -155,6 +259,7 @@ class SDKTransport:
             raise RequestNotSent(
                 str(exc), endpoint=endpoint, retry_after=exc.retry_after,
                 request_weights=exc.request_weights,
+                orders_only=exc.orders_only,
             ) from exc
         try:
             response = method(**params)
@@ -168,7 +273,14 @@ class SDKTransport:
             data = sdk_data(response.data())
             with self._budget_lock:
                 self.request_weights = weights
-                self._observe_request_budget(scope, weights, data)
+                if scope == "spot" and endpoint == "rate_limit_order":
+                    # Keep observed request weight even when the count body is invalid.
+                    weight_headers = {k: v for k, v in weights.items()
+                                      if not k.startswith("x-mbx-order-count-")}
+                    self._observe_request_budget(scope, weight_headers, {}, observation=observation)
+                    self._observe_order_counts(scope, weights, data, observation)
+                else:
+                    self._observe_request_budget(scope, weights, data, observation=observation)
             return data
         except SDKError as exc:
             status = next(

@@ -196,6 +196,9 @@ class BinanceAdapter(SpotMarketData):
     def _filter_overrides(self, symbol):
         return self._call(self.spot.my_filters, symbol=symbol, recv_window=5000)
 
+    def refresh_order_budget(self):
+        self._refresh_order_budget(self.spot.rate_limit_order)
+
     def _open_order_count(self):
         return len(self._call(self.spot.get_open_orders, recv_window=5000))
 
@@ -243,7 +246,7 @@ class BinanceAdapter(SpotMarketData):
             )
         )
 
-    def fetch_order(self, symbol, *, client_id=None, order_id=None):
+    def fetch_order(self, symbol, *, client_id=None, order_id=None, protective=False):
         params = {
             "symbol": symbol,
             **(
@@ -254,7 +257,8 @@ class BinanceAdapter(SpotMarketData):
         }
         try:
             return self._order(
-                self._call(self.spot.get_order, **params, recv_window=5000)
+                self._call(self.spot.get_order, **params, recv_window=5000,
+                           protective=protective)
             )
         except BinanceAPIError as exc:
             if exc.code == -2013:

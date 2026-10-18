@@ -37,6 +37,11 @@ class ExchangeError(Exception):
 class RequestDeferred(ExchangeError):
     """Local throttle: no network request was sent."""
 
+    def __init__(self, *args, orders_only=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Local ORDERS capacity is not a server ban or a reason to stop reads.
+        self.orders_only = orders_only
+
 
 class AccountObservationInconsistent(ExchangeError):
     """Successful account reads describe different observations; read again.
@@ -89,7 +94,8 @@ class ExchangeAdapter(Protocol):
     def fetch_symbol_filters(self, symbol: str) -> SymbolFilters: ...
     def fetch_open_orders(self, symbol: str) -> tuple[OrderView, ...]: ...
     def fetch_order(
-        self, symbol: str, *, client_id: str | None = None, order_id: str | None = None
+        self, symbol: str, *, client_id: str | None = None, order_id: str | None = None,
+        protective: bool = False,
     ) -> OrderView | None: ...
     def fetch_recent_fills(
         self, symbol: str, since: datetime, until: datetime

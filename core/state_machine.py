@@ -127,7 +127,7 @@ def evaluate_state(inputs: StateInputs, cfg: StrategyConfig, *,
 
     if (
         inputs.previous_state == ReplenishmentState.URGENT
-        and raw_candidate_state != ReplenishmentState.URGENT
+        and raw_candidate_state == ReplenishmentState.ACCUMULATE
         and inputs.contract_bnb < (cfg.thresholds.b_low + Decimal("1"))
     ):
         candidate_state = ReplenishmentState.URGENT

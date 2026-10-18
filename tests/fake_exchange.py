@@ -64,7 +64,7 @@ class FakeExchange:
             o for o in self.orders.values() if o.symbol == symbol and o.is_open
         )
 
-    def fetch_order(self, symbol, *, client_id=None, order_id=None):
+    def fetch_order(self, symbol, *, client_id=None, order_id=None, protective=False):
         return next(
             (
                 o
